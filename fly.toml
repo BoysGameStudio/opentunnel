@@ -30,6 +30,14 @@ kill_timeout = "15s"
   # Forwarded visitors and control between machines, on the private network only: the server binds it to
   # FLY_PRIVATE_IP (6PN), and no [[services]] entry exposes it. Requires the INTERNAL_TOKEN secret.
   INTERNAL_LISTEN = "[::]:9000"
+  # Prometheus metrics for Fly's scraper ([metrics] below); no [[services]] entry exposes the port.
+  METRICS_LISTEN = "[::]:9091"
+  LOG_FORMAT = "json"
+
+# Scraped every 15 s into Fly's managed Prometheus (fly-metrics.net); see docs/server.md, "Observability".
+[metrics]
+  port = 9091
+  path = "/metrics"
 
 [[files]]
   guest_path = "/etc/opentunnel/origin-cert.pem"

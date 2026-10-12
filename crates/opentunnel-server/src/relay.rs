@@ -142,9 +142,16 @@ pub enum Origin<'a> {
 pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<'_>) -> Result<()> {
     let started = service.now();
     let Some(id) = tunnel_id(&accepted.sni, &service.domain) else {
+        crate::metrics::visitor("rejected_unknown_tunnel");
         bail!("SNI is not an OpenTunnel hostname");
     };
-    let route = service.route(&id, &accepted.sni).await?;
+    let route = match service.route(&id, &accepted.sni).await {
+        Ok(route) => route,
+        Err(error) => {
+            crate::metrics::visitor("error");
+            return Err(error);
+        }
+    };
     let (bridge, conn, tunnel_id, finish, mut abort, inbound, bytes_out) = match route {
         Route::Bridge {
             bridge,
@@ -179,7 +186,10 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
                     .forward(accepted, &id, &route, service.timeouts())
                     .await
                 {
-                    None => return Ok(()),
+                    None => {
+                        crate::metrics::visitor("forwarded_out");
+                        return Ok(());
+                    }
                     Some(returned) => accepted = returned,
                 }
             }
@@ -187,7 +197,10 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
                 && let Some(fallback) = fallback
             {
                 match fallback.forward(accepted) {
-                    None => return Ok(()),
+                    None => {
+                        crate::metrics::visitor("legacy_relay");
+                        return Ok(());
+                    }
                     Some(returned) => {
                         return reject(service, &id, tunnel_exists, outcome, started, returned)
                             .await;
@@ -210,6 +223,11 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
         bridge.channels.lock().expect("channels lock").remove(&conn);
         return Ok(());
     }
+    crate::metrics::visitor(match origin {
+        Origin::Public { .. } => "served_local",
+        Origin::Forwarded => "forwarded_in",
+    });
+    let carried = std::time::Instant::now();
     let peer = peer.to_string();
     let _ = bridge
         .tx
@@ -274,6 +292,11 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
     }
     bridge.channels.lock().expect("channels lock").remove(&conn);
     finish.finish(Outcome::Closed, false);
+    crate::metrics::visitor_finished(
+        carried.elapsed(),
+        bytes_in + uploaded.load(Ordering::Relaxed),
+        bytes_out.load(Ordering::Relaxed),
+    );
     service.analytics.publish(
         "connection.closed",
         serde_json::json!({
@@ -295,6 +318,7 @@ async fn reject(
     started: u64,
     accepted: Accepted,
 ) -> Result<()> {
+    crate::metrics::visitor(crate::metrics::rejected_outcome(tunnel_exists, outcome));
     if tunnel_exists {
         service.analytics.publish(
             "connection.closed",

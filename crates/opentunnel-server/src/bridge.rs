@@ -263,6 +263,7 @@ async fn attach(
         .await
     {
         Ok(Attach::Attached { session, routes }) => {
+            crate::metrics::bridge_attach("ok");
             send(
                 bridge,
                 ServerControl::Attached {
@@ -277,11 +278,13 @@ async fn attach(
             true
         }
         Ok(Attach::Error(code, reason)) => {
+            crate::metrics::bridge_attach(code);
             send(bridge, ServerControl::AttachError { code }.message()).await;
             bridge.close(1008, reason);
             false
         }
         Err(error) => {
+            crate::metrics::bridge_attach("error");
             warn!(%error, tunnel = %tunnel_id, "attach failed");
             bridge.close(1011, "internal error");
             false

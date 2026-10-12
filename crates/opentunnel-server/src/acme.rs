@@ -255,7 +255,11 @@ impl Acme {
         let mut records: Vec<TxtRecord> = Vec::new();
         let result = async {
             for (name, value) in &wanted {
-                records.push(dns.create_txt(name, value).await?);
+                records.push(
+                    dns.create_txt(name, value)
+                        .await
+                        .context("creating the DNS challenge record")?,
+                );
             }
             wait_for_propagation(&self.http, &records, self.config.dns_propagation_timeout).await;
             for (url, challenge, _, _) in &pending {

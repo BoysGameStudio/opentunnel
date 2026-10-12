@@ -161,6 +161,7 @@ impl Jobs {
         let certificate_id = job.certificate_id.clone();
         let kind = job.kind;
         let owner = &self.owner;
+        let started = std::time::Instant::now();
         let issue = self
             .issuer
             .issue(&job.identifiers, &job.csr, async |challenge: Challenge| {
@@ -210,6 +211,7 @@ impl Jobs {
         let now = service.now();
         match result {
             Ok(issued) => {
+                crate::metrics::acme_attempt(kind.as_str(), "success", started.elapsed());
                 match (&job.kind, &job.tunnel_id) {
                     (JobKind::Server, _) => {
                         if let Some(server) = &self.server {
@@ -239,9 +241,26 @@ impl Jobs {
             }
             Err(error) => {
                 let reason = format!("{error:#}");
-                warn!(certificate = %job.certificate_id, attempt = job.attempts + 1, %reason, "certificate issuance attempt failed");
+                let error_class = crate::metrics::error_class(&error);
+                let status = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<crate::acme::Problem>())
+                    .map(|problem| problem.status);
+                // The reason includes the ACME problem document (or the start of the response body).
+                warn!(
+                    certificate = %job.certificate_id,
+                    tunnel = job.tunnel_id.as_deref(),
+                    kind = kind.as_str(),
+                    attempt = job.attempts + 1,
+                    error_class,
+                    status,
+                    error = %reason,
+                    "certificate issuance attempt failed"
+                );
+                crate::metrics::acme_failure(kind.as_str(), error_class);
                 let attempts = job.attempts + 1;
                 if reason.contains(PERSIST_FAILED) {
+                    crate::metrics::acme_attempt(kind.as_str(), "abandoned", started.elapsed());
                     // The tunnel was deleted or issued another certificate meanwhile.
                     return service
                         .store
@@ -258,13 +277,26 @@ impl Jobs {
                     now,
                     retry::jitter(),
                 ) {
-                    info!(certificate = %job.certificate_id, attempt = attempts, ?class, in_ms = at - now, "retrying certificate issuance");
+                    crate::metrics::acme_attempt(kind.as_str(), "retry", started.elapsed());
+                    info!(certificate = %job.certificate_id, attempt = attempts, ?class, error_class, in_ms = at - now, "retrying certificate issuance");
                     return service
                         .store
                         .retry_job(&job.certificate_id, owner, attempts, at, reason, now)
                         .await
                         .map(drop);
                 }
+                crate::metrics::acme_attempt(kind.as_str(), "failed", started.elapsed());
+                error!(
+                    certificate = %job.certificate_id,
+                    tunnel = job.tunnel_id.as_deref(),
+                    kind = kind.as_str(),
+                    attempt = attempts,
+                    ?class,
+                    error_class,
+                    status,
+                    error = %reason,
+                    "certificate issuance gave up"
+                );
                 if let (JobKind::Issue | JobKind::Renew, Some(tunnel)) = (&job.kind, &job.tunnel_id)
                 {
                     let state = CertificateState::Failed {

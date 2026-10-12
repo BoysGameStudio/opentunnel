@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
-use tracing::warn;
+use tracing::debug;
 
 use crate::analytics;
 use crate::crypto::{hash_token, slug, token};
@@ -510,7 +510,7 @@ impl App {
             let upgraded = match upgrade.await {
                 Ok(upgraded) => upgraded,
                 Err(error) => {
-                    warn!(%error, "bridge upgrade failed");
+                    debug!(%error, "bridge upgrade failed");
                     return;
                 }
             };

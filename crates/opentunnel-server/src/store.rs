@@ -134,7 +134,7 @@ pub enum JobKind {
 }
 
 impl JobKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Issue => "issue",
             Self::Renew => "renew",
@@ -286,12 +286,15 @@ fn db(error: sqlx::Error) -> anyhow::Error {
     anyhow::Error::new(error).context("storage unavailable")
 }
 
-/// Runs one storage operation with the statement timeout.
-async fn timed<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
-    match tokio::time::timeout(QUERY_TIMEOUT, future).await {
+/// Runs one storage operation with the statement timeout, recording its duration and failure as `operation`.
+async fn timed<T>(operation: &'static str, future: impl Future<Output = Result<T>>) -> Result<T> {
+    let started = std::time::Instant::now();
+    let result = match tokio::time::timeout(QUERY_TIMEOUT, future).await {
         Ok(result) => result,
         Err(_) => Err(anyhow!("storage timed out").context("storage unavailable")),
-    }
+    };
+    crate::metrics::db_operation(operation, started.elapsed(), result.is_ok());
+    result
 }
 
 fn record_flags(record: &StoredTunnel) -> (bool, bool) {
@@ -374,7 +377,7 @@ impl Store {
 
     /// Creates the tables unless the database is already at this version. Safe to run from several servers.
     pub async fn migrate(&self) -> Result<()> {
-        timed(async {
+        timed("migrate", async {
             let version: Option<i64> =
                 match sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
                     .fetch_one(&self.pool)
@@ -410,12 +413,17 @@ impl Store {
         .await
     }
 
+    /// Open connections in the pool, and how many of them are idle.
+    pub fn pool_connections(&self) -> (u32, usize) {
+        (self.pool.size(), self.pool.num_idle())
+    }
+
     pub async fn close(&self) {
         self.pool.close().await;
     }
 
     pub async fn tunnel(&self, id: &str) -> Result<Option<Loaded>> {
-        timed(async {
+        timed("tunnel", async {
             let row: Option<(String, i64)> =
                 sqlx::query_as("SELECT record, revision FROM tunnels WHERE id = ?")
                     .bind(id)
@@ -438,7 +446,7 @@ impl Store {
     pub async fn save_tunnel(&self, record: &StoredTunnel, revision: u64, now: u64) -> Result<u64> {
         let json = serde_json::to_string(record)?;
         let (deleted, issuing) = record_flags(record);
-        timed(async {
+        timed("save_tunnel", async {
             if revision == 0 {
                 let inserted = sqlx::query(
                     "INSERT INTO tunnels (id, record, revision, deleted, issuing, updated_at, local_update)
@@ -484,7 +492,7 @@ impl Store {
     pub async fn put_tunnel(&self, record: &StoredTunnel, now: u64) -> Result<()> {
         let json = serde_json::to_string(record)?;
         let (deleted, issuing) = record_flags(record);
-        timed(async {
+        timed("put_tunnel", async {
             sqlx::query(
                 "INSERT INTO tunnels (id, record, revision, deleted, issuing, updated_at, local_update)
                  VALUES (?, ?, 1, ?, ?, ?, 1)
@@ -506,7 +514,7 @@ impl Store {
     }
 
     pub async fn alarm(&self, id: &str) -> Result<Option<u64>> {
-        timed(async {
+        timed("alarm", async {
             let alarm: Option<Option<i64>> =
                 sqlx::query_scalar("SELECT alarm_at FROM tunnels WHERE id = ?")
                     .bind(id)
@@ -519,7 +527,7 @@ impl Store {
     }
 
     pub async fn set_alarm(&self, id: &str, at: Option<u64>) -> Result<()> {
-        timed(async {
+        timed("set_alarm", async {
             sqlx::query("UPDATE tunnels SET alarm_at = ? WHERE id = ?")
                 .bind(at.map(|at| at as i64))
                 .bind(id)
@@ -534,7 +542,7 @@ impl Store {
     /// Clears and returns the alarms due at `now`, like a Durable Object alarm firing once. Each alarm is
     /// cleared only if it is still the one that was read, so concurrent callers never both take it.
     pub async fn take_due_alarms(&self, now: u64) -> Result<Vec<String>> {
-        timed(async {
+        timed("take_due_alarms", async {
             let due: Vec<(String, i64)> = sqlx::query_as(
                 "SELECT id, alarm_at FROM tunnels WHERE alarm_at IS NOT NULL AND alarm_at <= ?
                  ORDER BY alarm_at LIMIT 500",
@@ -562,7 +570,7 @@ impl Store {
     }
 
     pub async fn next_alarm(&self) -> Result<Option<u64>> {
-        timed(async {
+        timed("next_alarm", async {
             let next: Option<i64> = sqlx::query_scalar("SELECT MIN(alarm_at) FROM tunnels")
                 .fetch_one(&self.pool)
                 .await
@@ -574,7 +582,7 @@ impl Store {
 
     /// Records whose certificate is issuing or renewing, for resuming issuance that has no job.
     pub async fn issuing_tunnels(&self) -> Result<Vec<StoredTunnel>> {
-        timed(async {
+        timed("issuing_tunnels", async {
             let rows: Vec<String> =
                 sqlx::query_scalar("SELECT record FROM tunnels WHERE issuing = 1 AND deleted = 0")
                     .fetch_all(&self.pool)
@@ -599,7 +607,12 @@ impl Store {
         let json = serde_json::to_string(&record)?;
         let mut attempt = 0;
         loop {
-            match timed(self.try_import(&record, &json, alarm, force, now)).await {
+            match timed(
+                "import_tunnel",
+                self.try_import(&record, &json, alarm, force, now),
+            )
+            .await
+            {
                 Err(error) if attempt < 5 && retryable(&error) => {
                     attempt += 1;
                     tokio::time::sleep(Duration::from_millis(20 * attempt)).await;
@@ -673,7 +686,7 @@ impl Store {
     }
 
     pub async fn export_tunnels(&self) -> Result<Vec<(StoredTunnel, Option<u64>)>> {
-        timed(async {
+        timed("export_tunnels", async {
             let rows: Vec<(String, Option<i64>)> =
                 sqlx::query_as("SELECT record, alarm_at FROM tunnels ORDER BY id")
                     .fetch_all(&self.pool)
@@ -694,7 +707,7 @@ impl Store {
     /// Adds an issuance job unless one exists for the certificate ID. Returns whether it was added.
     pub async fn add_job(&self, job: Job, run_at: u64) -> Result<bool> {
         let identifiers = serde_json::to_string(&job.identifiers)?;
-        timed(async {
+        timed("add_job", async {
             let added = sqlx::query(
                 "INSERT INTO jobs (certificate_id, tunnel_id, kind, identifiers, csr, status, attempts, run_at,
                                    created_at, updated_at)
@@ -733,7 +746,7 @@ impl Store {
     }
 
     async fn job_status(&self, certificate_id: &str) -> Result<Option<String>> {
-        timed(async {
+        timed("job_status", async {
             sqlx::query_scalar("SELECT status FROM jobs WHERE certificate_id = ?")
                 .bind(certificate_id)
                 .fetch_optional(&self.pool)
@@ -744,7 +757,7 @@ impl Store {
     }
 
     pub async fn counts(&self) -> Result<serde_json::Value> {
-        timed(async {
+        timed("counts", async {
             let mut counts = serde_json::Map::new();
             for (name, sql) in [
                 ("tunnels", "SELECT COUNT(*) FROM tunnels WHERE deleted = 0"),
@@ -777,9 +790,26 @@ impl Store {
         .await
     }
 
+    /// Pending jobs, and jobs that failed since `since`, for the metrics.
+    pub async fn job_counts(&self, since: u64) -> Result<(u64, u64)> {
+        timed("job_counts", async {
+            let (pending, failed): (i64, i64) = sqlx::query_as(
+                "SELECT
+                   (SELECT COUNT(*) FROM jobs WHERE status = 'pending'),
+                   (SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND updated_at >= ?)",
+            )
+            .bind(since as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db)?;
+            Ok((pending.max(0) as u64, failed.max(0) as u64))
+        })
+        .await
+    }
+
     /// Pending jobs due at `now` that nobody else holds, without taking them.
     pub async fn due_job_ids(&self, owner: &str, now: u64, limit: usize) -> Result<Vec<String>> {
-        timed(async {
+        timed("due_job_ids", async {
             sqlx::query_scalar(
                 "SELECT certificate_id FROM jobs
                  WHERE status = 'pending' AND run_at <= ?
@@ -805,7 +835,7 @@ impl Store {
         owner: &str,
         now: u64,
     ) -> Result<Option<Job>> {
-        timed(async {
+        timed("claim_job", async {
             let claimed = sqlx::query(
                 "UPDATE jobs SET lease_owner = ?, lease_until = ?
                  WHERE certificate_id = ? AND status = 'pending' AND run_at <= ?
@@ -850,7 +880,7 @@ impl Store {
 
     /// Extends a lease `owner` still holds. Returns false once it lost it.
     pub async fn extend_lease(&self, certificate_id: &str, owner: &str, now: u64) -> Result<bool> {
-        timed(async {
+        timed("extend_lease", async {
             let extended = sqlx::query(
                 "UPDATE jobs SET lease_until = ? WHERE certificate_id = ? AND lease_owner = ? AND status = 'pending'",
             )
@@ -867,7 +897,7 @@ impl Store {
 
     /// Gives up every lease `owner` holds, on shutdown, so a restarted server resumes the jobs at once.
     pub async fn release_leases(&self, owner: &str) -> Result<()> {
-        timed(async {
+        timed("release_leases", async {
             sqlx::query(
                 "UPDATE jobs SET lease_owner = NULL, lease_until = NULL WHERE lease_owner = ?",
             )
@@ -889,7 +919,7 @@ impl Store {
         error: Option<String>,
         now: u64,
     ) -> Result<bool> {
-        timed(async {
+        timed("finish_job", async {
             let finished = sqlx::query(
                 "UPDATE jobs SET status = ?, last_error = ?, updated_at = ?, lease_owner = NULL, lease_until = NULL
                  WHERE certificate_id = ? AND lease_owner = ?",
@@ -917,7 +947,7 @@ impl Store {
         error: String,
         now: u64,
     ) -> Result<bool> {
-        timed(async {
+        timed("retry_job", async {
             let retried = sqlx::query(
                 "UPDATE jobs SET attempts = ?, run_at = ?, last_error = ?, updated_at = ?, lease_owner = NULL,
                    lease_until = NULL
@@ -939,7 +969,7 @@ impl Store {
 
     /// Failed first-issuance jobs that last changed at or after `since`.
     pub async fn failed_issue_jobs(&self, since: u64) -> Result<Vec<FailedJob>> {
-        timed(async {
+        timed("failed_issue_jobs", async {
             let rows: Vec<FailedJobRow> = sqlx::query_as(
                 "SELECT certificate_id, tunnel_id, last_error, created_at, updated_at FROM jobs
                  WHERE status = 'failed' AND kind = 'issue' AND updated_at >= ?",
@@ -967,7 +997,7 @@ impl Store {
     /// Queues a failed job again as if it were new, keeping its last error. Only one caller wins. Returns
     /// whether this one did.
     pub async fn requeue_failed_job(&self, certificate_id: &str, now: u64) -> Result<bool> {
-        timed(async {
+        timed("requeue_failed_job", async {
             let requeued = sqlx::query(
                 "UPDATE jobs SET status = 'pending', attempts = 0, run_at = ?, created_at = ?, updated_at = ?,
                    lease_owner = NULL, lease_until = NULL
@@ -986,7 +1016,7 @@ impl Store {
     }
 
     pub async fn next_job_at(&self) -> Result<Option<u64>> {
-        timed(async {
+        timed("next_job_at", async {
             let next: Option<i64> =
                 sqlx::query_scalar("SELECT MIN(run_at) FROM jobs WHERE status = 'pending'")
                     .fetch_one(&self.pool)
@@ -998,7 +1028,7 @@ impl Store {
     }
 
     pub async fn server_certificate(&self, name: &str) -> Result<Option<ServerCertificate>> {
-        timed(async {
+        timed("server_certificate", async {
             let row: Option<ServerCertificateRow> =
                 sqlx::query_as(
                     "SELECT private_key, csr, certificate, chain, expiry FROM server_certificates WHERE name = ?",
@@ -1027,7 +1057,7 @@ impl Store {
         certificate: ServerCertificate,
         now: u64,
     ) -> Result<ServerCertificate> {
-        timed(async {
+        timed("create_server_certificate", async {
             let inserted = sqlx::query(
                 "INSERT INTO server_certificates (name, private_key, csr, certificate, chain, expiry, updated_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1060,7 +1090,7 @@ impl Store {
         certificate: ServerCertificate,
         now: u64,
     ) -> Result<()> {
-        timed(async {
+        timed("save_server_certificate", async {
             sqlx::query(
                 "UPDATE server_certificates SET certificate = ?, chain = ?, expiry = ?, updated_at = ?
                  WHERE name = ? AND csr = ?",
@@ -1080,7 +1110,7 @@ impl Store {
     }
 
     pub async fn meta(&self, key: &str) -> Result<Option<String>> {
-        timed(async {
+        timed("meta", async {
             sqlx::query_scalar("SELECT value FROM meta WHERE name = ?")
                 .bind(key)
                 .fetch_optional(&self.pool)
@@ -1092,7 +1122,7 @@ impl Store {
 
     /// Sets `key` to `value` only if it is still `expected` (`None`: absent). Returns whether it did.
     pub async fn swap_meta(&self, key: &str, expected: Option<&str>, value: &str) -> Result<bool> {
-        timed(async {
+        timed("swap_meta", async {
             let result = match expected {
                 None => {
                     sqlx::query("INSERT INTO meta (name, value) VALUES (?, ?)")
@@ -1126,7 +1156,7 @@ impl Store {
         if routes.is_empty() {
             return Ok(());
         }
-        timed(async {
+        timed("put_bridge", async {
             let mut query = sqlx::QueryBuilder::new(
                 "INSERT INTO bridges (tunnel_id, route, machine_id, bridge_id, region, address, updated_at) ",
             );
@@ -1156,7 +1186,7 @@ impl Store {
         machine_id: &str,
         bridge_id: u64,
     ) -> Result<()> {
-        timed(async {
+        timed("delete_bridge", async {
             sqlx::query(
                 "DELETE FROM bridges WHERE tunnel_id = ? AND machine_id = ? AND bridge_id = ?",
             )
@@ -1172,7 +1202,7 @@ impl Store {
     }
 
     pub async fn delete_tunnel_bridges(&self, tunnel_id: &str) -> Result<()> {
-        timed(async {
+        timed("delete_tunnel_bridges", async {
             sqlx::query("DELETE FROM bridges WHERE tunnel_id = ?")
                 .bind(tunnel_id)
                 .execute(&self.pool)
@@ -1185,7 +1215,7 @@ impl Store {
 
     /// Removes every row of a machine, at its startup and clean shutdown.
     pub async fn delete_machine_bridges(&self, machine_id: &str) -> Result<u64> {
-        timed(async {
+        timed("delete_machine_bridges", async {
             let deleted = sqlx::query("DELETE FROM bridges WHERE machine_id = ?")
                 .bind(machine_id)
                 .execute(&self.pool)
@@ -1198,7 +1228,7 @@ impl Store {
 
     /// Removes rows nobody refreshed since `before`, left behind by machines that are gone.
     pub async fn delete_expired_bridges(&self, before: u64) -> Result<u64> {
-        timed(async {
+        timed("delete_expired_bridges", async {
             let deleted = sqlx::query("DELETE FROM bridges WHERE updated_at < ?")
                 .bind(before as i64)
                 .execute(&self.pool)
@@ -1211,7 +1241,7 @@ impl Store {
 
     /// The machine's heartbeat: marks its rows current.
     pub async fn refresh_bridges(&self, machine_id: &str, now: u64) -> Result<u64> {
-        timed(async {
+        timed("refresh_bridges", async {
             let refreshed = sqlx::query("UPDATE bridges SET updated_at = ? WHERE machine_id = ?")
                 .bind(now as i64)
                 .bind(machine_id)
@@ -1230,7 +1260,7 @@ impl Store {
         route: Option<&str>,
         since: u64,
     ) -> Result<Vec<BridgeLocation>> {
-        timed(async {
+        timed("bridge_locations", async {
             let rows: Vec<BridgeRow> = sqlx::query_as(
                 "SELECT tunnel_id, route, machine_id, bridge_id, region, address, updated_at FROM bridges
                  WHERE tunnel_id = ? AND (? IS NULL OR route = ?) AND updated_at >= ?
@@ -1250,7 +1280,7 @@ impl Store {
 
     /// Bridges per machine, from rows refreshed since `since`.
     pub async fn machine_bridges(&self, since: u64) -> Result<Vec<MachineBridges>> {
-        timed(async {
+        timed("machine_bridges", async {
             let rows: Vec<(String, String, String, i64, i64, i64, i64)> = sqlx::query_as(
                 "SELECT machine_id, MAX(region), MAX(address), COUNT(DISTINCT tunnel_id, bridge_id),
                    COUNT(DISTINCT tunnel_id), COUNT(*), MAX(updated_at)
@@ -1284,7 +1314,7 @@ impl Store {
     pub async fn deleted_tunnels(&self, ids: &[String]) -> Result<Vec<String>> {
         let mut deleted = Vec::new();
         for chunk in ids.chunks(500) {
-            let found: Vec<String> = timed(async {
+            let found: Vec<String> = timed("deleted_tunnels", async {
                 let mut query =
                     sqlx::QueryBuilder::new("SELECT id FROM tunnels WHERE deleted = 1 AND id IN (");
                 let mut separated = query.separated(", ");
@@ -1339,7 +1369,7 @@ pub async fn test_database_url() -> Option<String> {
             .unwrap_or("x")
     );
     let admin = Store::connect_with(&base, 1).expect("TEST_DATABASE_URL");
-    timed(async {
+    timed("test_database_url", async {
         admin
             .pool
             // The name is generated here from hex digits.

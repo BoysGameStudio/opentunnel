@@ -173,6 +173,15 @@ pub struct Config {
     #[arg(long, env = "HALF_CLOSE_TIMEOUT_MS", default_value_t = 60_000)]
     pub half_close_timeout_ms: u64,
 
+    /// Serves Prometheus metrics at `/metrics`, e.g. `[::]:9091` (Fly's scraper; no `[[services]]` entry exposes
+    /// it). `off` (the default) disables it.
+    #[arg(long, env = "METRICS_LISTEN", default_value = "off")]
+    pub metrics_listen: String,
+
+    /// `json` lines (on Fly) or human-readable `text`.
+    #[arg(long, env = "LOG_FORMAT", value_enum, default_value = "text")]
+    pub log_format: crate::logging::LogFormat,
+
     /// TEMPORARY (migration): the old Worker, e.g. its workers.dev URL. Enables the legacy relay fallback and
     /// the pull-through import.
     #[arg(long, env = "LEGACY_WORKER_URL")]

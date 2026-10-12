@@ -282,6 +282,10 @@ impl Server {
         tasks.push(tokio::spawn(self.jobs.clone().run()));
         tasks.push(tokio::spawn(jobs::run_alarms(service.clone())));
         tasks.push(tokio::spawn(jobs::run_sweeper(service.clone())));
+        tasks.push(tokio::spawn(crate::metrics::run_monitor(
+            service.store.clone(),
+            service.clock.clone(),
+        )));
         tasks.push(tokio::spawn(jobs::run_reconcile(service)));
         Ok(tasks)
     }
@@ -321,6 +325,7 @@ impl Server {
         let accepted = match relay::accept(stream, peer, self.config.proxy_protocol).await {
             Ok(accepted) => accepted,
             Err(error) => {
+                crate::metrics::visitor(crate::metrics::hello_outcome(&error));
                 debug!(%error, %peer, "TCP connection rejected");
                 return;
             }
@@ -336,6 +341,7 @@ impl Server {
             return;
         }
         http::count(&self.app.stats.tunnel_connections);
+        let _open = crate::metrics::visitor_open();
         let origin = relay::Origin::Public {
             cluster: self.cluster.as_ref(),
             fallback: self.fallback.as_ref(),
@@ -389,6 +395,21 @@ impl Server {
         }
     }
 
+    /// What the metrics endpoint samples from the service when scraped.
+    pub fn metrics_sampler(&self) -> crate::metrics::Sampler {
+        let service = self.app.service.clone();
+        Arc::new(move || {
+            let (pool_size, pool_idle) = service.store.pool_connections();
+            crate::metrics::Sample {
+                bridges: service.bridge_count(),
+                pool_size,
+                pool_idle,
+                expiring_certificates: service
+                    .expiring_certificates(service.now() + crate::metrics::EXPIRING_WITHIN_MS),
+            }
+        })
+    }
+
     pub async fn serve_http(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let mut errors = AcceptErrors::new("HTTP accept failed");
         loop {
@@ -430,7 +451,11 @@ impl Server {
             }
         };
         let internal_listener = self.bind_internal().await?;
+        let metrics_listener = crate::metrics::bind(&self.config.metrics_listen).await?;
         self.start_background().await?;
+        if let Some(listener) = metrics_listener {
+            tokio::spawn(crate::metrics::serve(listener, self.metrics_sampler()));
+        }
         let server = Arc::new(self);
         let service = server.app.service.clone();
         let self_jobs = server.jobs.clone();

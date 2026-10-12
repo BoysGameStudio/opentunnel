@@ -1251,6 +1251,7 @@ impl Service {
         }
         bridge.state.lock().expect("bridge lock").detached = true;
         bridge.finish_channels(Outcome::BridgeDisconnected);
+        crate::metrics::bridge_detach(crate::metrics::detach_reason(snapshot.server_close, clean));
         self.publish_disconnected(id, &snapshot, code, clean);
         if let Some(cluster) = self.cluster() {
             cluster.unpublish(id, bridge.id).await;
@@ -1293,6 +1294,7 @@ impl Service {
             };
             bridge.finish_channels(Outcome::BridgeDisconnected);
             bridge.close(1001, "idle timeout");
+            crate::metrics::bridge_detach("idle_retire");
             if let Some(id) = &id {
                 self.publish_disconnected(id, &snapshot, 1001, false);
                 if let Some(cluster) = self.cluster() {
@@ -1473,6 +1475,20 @@ impl Service {
                 bridge.close(1012, reason);
             }
         }
+    }
+
+    /// Ready certificates of tunnels with an attached bridge here that expire before `before` (or have
+    /// expired), for the metrics: a renewal that keeps failing shows up here weeks before visitors notice.
+    pub fn expiring_certificates(&self, before: u64) -> usize {
+        self.entries()
+            .iter()
+            .filter_map(|entry| {
+                let state = entry.state.try_lock().ok()?;
+                state.attached().next()?;
+                let expiry = parse_iso(state.record()?.ready_expiry()?)?;
+                (expiry < before).then_some(())
+            })
+            .count()
     }
 
     pub fn bridge_count(&self) -> usize {

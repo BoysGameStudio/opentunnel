@@ -181,13 +181,16 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `CLUSTER_HEARTBEAT_MS` | `60000` | registry heartbeat; rows older than three are ignored |
 | `CONNECTION_IDLE_TIMEOUT_MS` | `900000` | a tunnel connection with no traffic either way for this long is reset |
 | `HALF_CLOSE_TIMEOUT_MS` | `60000` | once either direction of a tunnel connection has ended, the other is reset after this long without traffic |
+| `METRICS_LISTEN` | `off` | Prometheus metrics at `/metrics` (`[::]:9091` on Fly, unauthenticated, not in `[[services]]`); see [Observability](#observability) |
+| `LOG_FORMAT` | `text` | `json` writes one JSON object per line (`json` on Fly) |
 | `LEGACY_WORKER_URL`, `RELAY_TOKEN`, `LEGACY_EXPORT_TOKEN` | | TEMPORARY, migration only ([cutover.md](cutover.md)) |
 
 Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
 
 ## Operations
 
-- `fly logs -a opentunnel`; `RUST_LOG=opentunnel_server=debug` for per-connection detail.
+- `fly logs -a opentunnel`; `RUST_LOG=opentunnel_server=debug` for per-connection detail. Metrics and
+  JSON logs: [Observability](#observability).
 - `POST /api/admin/stats` (bearer `ADMIN_TOKEN`) returns tunnel, alarm, job,
   attached-bridge and legacy-forward counts. The top-level connection and
   bridge counts are the answering machine's; `machine` has its ID, region and
@@ -205,6 +208,104 @@ Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
   downtime for them). Issuance jobs resume where they stopped, on any machine.
 - The domain certificate is requested on first start and checked hourly;
   until it exists, TLS to the domain fails while tunnel traffic works.
+
+## Observability
+
+### Metrics
+
+Every machine serves Prometheus metrics (OpenMetrics text) at `GET /metrics` on
+`METRICS_LISTEN` (`[::]:9091`). It needs no token: no `[[services]]` entry
+exposes the port, so only Fly's scraper and the private network reach it, and
+nothing in it is secret. `fly.toml`'s `[metrics]` section has Fly scrape it
+every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
+`instance` labels. No metric has a per-tunnel label.
+
+| Metric | Type | Labels | |
+| --- | --- | --- | --- |
+| `opentunnel_process_open_fds`, `opentunnel_process_max_fds` | gauge | | open descriptors and the soft limit |
+| `opentunnel_tokio_tasks` | gauge | | live Tokio tasks (follows connections and bridges) |
+| `opentunnel_process_resident_memory_bytes` | gauge | | from `/proc/self/statm` |
+| `opentunnel_uptime_seconds` | gauge | | |
+| `opentunnel_accept_errors_total` | counter | `error` (`emfile`, `other`) | failed accepts; `emfile` is running out of descriptors |
+| `opentunnel_bridges_attached` | gauge | | |
+| `opentunnel_bridge_attaches_total` | counter | `result` (`ok`, `bad_token`, `cert_not_ready`, `invalid_route`, `route_conflict`, `error`) | |
+| `opentunnel_bridge_detaches_total` | counter | `reason` (`client_close`, `drop`, `idle_retire`, `drain`, `delete`, `server_close`) | attached bridges that ended |
+| `opentunnel_visitor_connections_open` | gauge | | public tunnel connections held here (including forwarded ones) |
+| `opentunnel_visitor_connections_total` | counter | `outcome` (`served_local`, `forwarded_out`, `forwarded_in`, `legacy_relay`, `rejected_unknown_tunnel`, `rejected_unknown_route`, `rejected_no_bridge`, `rejected_cert_not_ready`, `rejected_bad_hello`, `rejected_timeout`, `error`) | a forwarded visitor counts on both machines (`forwarded_out`, `forwarded_in`) |
+| `opentunnel_visitor_bytes_total` | counter | `direction` (`in`, `out`) | counted on the machine with the bridge |
+| `opentunnel_visitor_connection_duration_seconds` | histogram | | connections carried over a bridge here |
+| `opentunnel_cluster_forward_failures_total` | counter | `reason` (`refused`, `connect`, `timeout`, `io`) | |
+| `opentunnel_cluster_registry_lookups_total` | counter | `result` (`hit`, `miss`, `error`) | the route location cache |
+| `opentunnel_db_query_duration_seconds` | histogram | `operation` (the `Store` method) | |
+| `opentunnel_db_errors_total` | counter | `operation` | failed and timed out statements |
+| `opentunnel_db_pool_connections` | gauge | `state` (`idle`, `in_use`) | |
+| `opentunnel_acme_attempts_total` | counter | `kind` (`issue`, `renew`, `server`), `outcome` (`success`, `retry`, `failed`, `abandoned`) | `failed` gave up; `abandoned`: the tunnel no longer wants it |
+| `opentunnel_acme_failures_total` | counter | `kind`, `class` (`network`, `timeout`, `http_5xx`, `http_429`, `bad_body`, `nonce`, `bad_nonce`, `authz_pending`, `dns`, `rejected`, `other`) | every failed attempt |
+| `opentunnel_acme_issuance_duration_seconds` | histogram | `kind`, `outcome` | one attempt |
+| `opentunnel_certificate_jobs` | gauge | `status` (`pending`, `failed`: in the last 24 h) | the whole database, refreshed every minute on every machine (so take `max`, not `sum`) |
+| `opentunnel_certificates_expiring` | gauge | | ready certificates of tunnels with a bridge here that expire within 14 days |
+
+Fly's built-in `fly_instance_*` series (memory, CPU, `fly_instance_filefd_*`)
+sit next to them.
+
+Where to see them: Grafana at [fly-metrics.net](https://fly-metrics.net)
+(Explore, the Prometheus data source), or the Prometheus API:
+
+```bash
+TOKEN=$(fly auth token)   # or a read-only token from `fly tokens create readonly`, sent as `FlyV1 <token>`
+curl -s -G https://api.fly.io/prometheus/anomaly-807/api/v1/query -H "Authorization: FlyV1 $TOKEN" \
+  --data-urlencode 'query=opentunnel_process_open_fds{app="opentunnel"}' | jq '.data.result[] | [.metric.region, .value[1]]'
+```
+
+Queries for the signals of past incidents:
+
+```promql
+# Descriptors as a fraction of the limit, per machine (the fd leak): alert above 0.5
+max by (region) (opentunnel_process_open_fds{app="opentunnel"} / opentunnel_process_max_fds{app="opentunnel"})
+# Tasks and memory growing while bridges and connections do not
+opentunnel_tokio_tasks{app="opentunnel"}
+opentunnel_tokio_tasks{app="opentunnel"} / (opentunnel_bridges_attached{app="opentunnel"} + opentunnel_visitor_connections_open{app="opentunnel"} + 1)
+opentunnel_process_resident_memory_bytes{app="opentunnel"}
+rate(opentunnel_accept_errors_total{app="opentunnel",error="emfile"}[5m]) > 0
+# Certificate attempts failing, by class, and issuance that gave up
+sum by (class) (increase(opentunnel_acme_failures_total{app="opentunnel"}[1h]))
+sum(increase(opentunnel_acme_attempts_total{app="opentunnel",outcome="failed"}[1d]))
+  / sum(increase(opentunnel_acme_attempts_total{app="opentunnel",outcome=~"success|failed"}[1d]))
+max(opentunnel_certificate_jobs{app="opentunnel",status="failed"})
+sum(opentunnel_certificates_expiring{app="opentunnel"}) > 0
+# Visitors turned away, by reason; forwarding between machines failing
+sum by (outcome) (rate(opentunnel_visitor_connections_total{app="opentunnel",outcome=~"rejected.*|error"}[5m]))
+sum by (region, reason) (rate(opentunnel_cluster_forward_failures_total{app="opentunnel"}[5m]))
+# Slow storage, per operation
+histogram_quantile(0.99, sum by (le, operation) (rate(opentunnel_db_query_duration_seconds_bucket{app="opentunnel"}[5m])))
+```
+
+### Logs
+
+On Fly (`LOG_FORMAT=json`) every line on stderr is one JSON object:
+`timestamp`, `level`, `message`, `target`, the event's fields, then `machine`
+and `region`. Fields keep the same names everywhere: `tunnel`, `conn`,
+`route`, `certificate`, `kind`, `attempt`, `error`, `error_class`, `status`.
+Tokens, keys and the database URL are never logged.
+
+- Each failed certificate attempt is a `warn` "certificate issuance attempt
+  failed" with `attempt`, `error_class`, the HTTP `status` of an ACME error
+  and `error` (which includes the ACME problem document or the start of the
+  response body); retries are `info` "retrying certificate issuance", and
+  giving up is an `error` "certificate issuance gave up".
+- Descriptor use crossing 50% and 80% of the limit is a `warn` (repeated every
+  ten minutes while it stays there), with `fds`, `limit` and `tasks`.
+- Failed accepts are logged at most every ten seconds, with `error_class`
+  (`emfile`) and how many were `suppressed`.
+- Per-connection messages are `debug` (`RUST_LOG=opentunnel_server=debug`).
+
+```bash
+fly logs -a opentunnel -r iad --no-tail | sed 's/^[^{]*//' | jq -c 'select(.level != "info")'
+fly logs -a opentunnel | sed 's/^[^{]*//' | jq -c 'select(.message | test("certificate issuance")) | {region, attempt, error_class, status, error}'
+```
+
+(`fly logs` prefixes each line with the time, region and machine; the `sed`
+strips it.)
 
 ## Multiple regions
 

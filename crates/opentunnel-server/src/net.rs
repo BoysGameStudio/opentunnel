@@ -204,11 +204,13 @@ impl AcceptErrors {
 
     pub async fn failed(&mut self, error: io::Error) {
         let exhausted = matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE));
+        crate::metrics::accept_error(&error);
         if self
             .logged_at
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
         {
-            warn!(%error, suppressed = self.suppressed, "{}", self.what);
+            let error_class = if exhausted { "emfile" } else { "other" };
+            warn!(%error, error_class, suppressed = self.suppressed, "{}", self.what);
             self.logged_at = Some(Instant::now());
             self.suppressed = 0;
         } else {

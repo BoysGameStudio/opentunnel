@@ -50,16 +50,13 @@ fn database_url(config: &Config) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,hyper=warn,rustls=warn".into()),
-        )
-        .init();
-    opentunnel_server::install_crypto_provider();
     let cli = Cli::parse();
+    opentunnel_server::logging::init(
+        cli.config.log_format,
+        cli.config.machine_id.as_deref(),
+        &cli.config.region,
+    );
+    opentunnel_server::install_crypto_provider();
     let clock = Clock::system();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {

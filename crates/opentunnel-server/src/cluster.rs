@@ -242,6 +242,7 @@ impl Cluster {
                     .as_ref()
                     .is_none_or(|location| !self.is_down(&location.machine_id))
             {
+                crate::metrics::registry_lookup("hit");
                 return location.clone();
             }
         }
@@ -251,10 +252,12 @@ impl Cluster {
                 .find(|row| !self.is_down(&row.machine_id))
                 .map(Location::from),
             Err(error) => {
+                crate::metrics::registry_lookup("error");
                 debug!(tunnel, %error, "registry lookup failed");
                 return None;
             }
         };
+        crate::metrics::registry_lookup("miss");
         self.locations
             .lock()
             .expect("locations lock")
@@ -287,10 +290,13 @@ impl Cluster {
                     return None;
                 }
                 Ok(None) => {
+                    crate::metrics::forward_failure("refused");
                     debug!(tunnel, route, machine = %location.machine_id, "the machine no longer holds the route");
                 }
                 Err(error) => {
-                    warn!(tunnel, machine = %location.machine_id, address = %location.address, %error, "forwarding failed");
+                    let reason = crate::metrics::forward_error_reason(&error);
+                    crate::metrics::forward_failure(reason);
+                    warn!(tunnel, machine = %location.machine_id, address = %location.address, error = %format!("{error:#}"), error_class = reason, "forwarding failed");
                     self.mark_down(&location.machine_id);
                 }
             }
@@ -570,6 +576,7 @@ async fn internal_connection(
         bail!("forwarded ClientHello is for another tunnel");
     }
     count(&cluster.stats.forwarded_in);
+    let _open = crate::metrics::visitor_open();
     relay::route_tunnel(&service, accepted, Origin::Forwarded).await
 }
 
