@@ -70,7 +70,7 @@ impl Json {
         let has = |key: &str| fields.contains_key(key);
         let (machine, region) = (
             machine.filter(|_| !has("machine")),
-            Some(region).filter(|_| !has("region")),
+            (!has("region")).then_some(region),
         );
         entries.extend(
             fields
