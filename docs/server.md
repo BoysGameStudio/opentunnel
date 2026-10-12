@@ -47,7 +47,7 @@ visitor ──TLS──▶ :443 ─┬─ SNI <route>.<id>.opentunnel.xyz ─▶
 | Hibernating bridge WebSockets and attachments | `bridge.rs` sessions; per-tunnel state in `service.rs` (`Entry`) |
 | Stale bridge retirement on attach and connect | Same rule (`idle_timeout_ms + heartbeat_ms`), plus a sweep every heartbeat |
 | Durable Object alarm (renewal) | `alarm_at` per tunnel in MySQL, fired by `jobs::run_alarms`; same `alarm`, `scheduleRenewal`, `onAttached` logic |
-| `CertificateWorkflow` (ZeroSSL, EAB, DNS-01, retries, `describeError`) | `acme.rs` + `dns.rs` + durable, leased `jobs` rows: three attempts, 15 s then 30 s apart, resumed after restarts |
+| `CertificateWorkflow` (ZeroSSL, EAB, DNS-01, retries, `describeError`) | `acme.rs` + `dns.rs` + durable, leased `jobs` rows resumed after restarts; transient failures retried for a day, others three times (see below) |
 | Workflow instance named after the certificate ID | Job keyed by certificate ID (`ensure_issuance` adds it only if missing) |
 | Cloudflare-managed certificate for `opentunnel.xyz` | `jobs::ServerCertificates`: the same ACME issuance for the domain, renewed 30 days before expiry, hot-swapped |
 | Static assets | `website.rs`: `dist/website` in memory, Cloudflare's HTML handling (`/index.html` → `/`), ETags |
@@ -112,6 +112,22 @@ Nothing assumes a single writer, so two servers on one database stay correct:
   once.
 - Orphaned-issuance reconcile runs on every machine; it only adds jobs keyed
   by certificate ID (insert-if-absent), so concurrent runs add each once.
+- Failed attempts are classified (`retry.rs`). Transient ones (timeouts,
+  resets, 5xx, 429 with `Retry-After`, bodies that are not JSON, no nonce,
+  `badNonce`, an authorization still pending) are retried with exponential
+  backoff and jitter (from `ISSUANCE_RETRY_DELAY_MS`, at most an hour apart)
+  until a day after the job was queued; permanent ones (`rejectedIdentifier`,
+  `badCSR`, missing configuration, ...) fail at once; anything else gets three
+  attempts. The tunnel shows `issuing`/`challenge` until the job ends, so
+  clients keep polling. Within an attempt, nonce requests and POST-as-GET reads
+  are repeated a few times, valid authorizations and already finalized orders
+  of a reused order are skipped, and a challenge record that already exists in
+  Cloudflare is used and deleted like a created one.
+- The reconcile also queues again (a compare-and-set from `failed` to
+  `pending`) first issuance that gave up early on a transient error, when the
+  tunnel is not deleted and still shows that certificate as failed; it shows
+  `issuing` again. The requeued job starts a new retry window, so it is
+  requeued at most once.
 - The legacy pull-through import is the same insert-first import, so two
   machines importing one tunnel at once insert it once.
 - The domain's key is created insert-if-absent and its job is requested with a

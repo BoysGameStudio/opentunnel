@@ -20,6 +20,7 @@ pub mod net;
 pub mod proxy_protocol;
 pub mod record;
 pub mod relay;
+pub mod retry;
 pub mod server;
 pub mod service;
 pub mod sni;

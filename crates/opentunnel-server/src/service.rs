@@ -12,13 +12,14 @@ use opentunnel::protocol::bridge::{HEARTBEAT_MS, IDLE_TIMEOUT_MS};
 use serde_json::json;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::analytics::{self, Analytics, ClientInfo};
 use crate::clock::{Clock, DAY_MS, HOUR_MS, MINUTE_MS, iso, parse_iso};
 use crate::cluster::Cluster;
 use crate::crypto::{token_matches, uuid};
 use crate::record::{Renewal, StoredTunnel, TunnelView};
+use crate::retry;
 use crate::store::{Conflict, Job, JobKind, Store};
 
 /// Renew this long before the current certificate expires.
@@ -30,6 +31,8 @@ pub const RENEWAL_RETRY_MS: u64 = HOUR_MS;
 pub const RENEWAL_STALE_MS: u64 = DAY_MS;
 /// Issuance without a job is resumed only when it started less than this long ago.
 pub const ORPHAN_MAX_AGE_MS: u64 = 2 * DAY_MS;
+/// Issuance that failed transiently is queued again only when it failed less than this long ago.
+pub const RETRY_FAILED_MAX_AGE_MS: u64 = 7 * DAY_MS;
 /// A bridge silent for this long is gone: its client pings every heartbeat and gives up after the idle timeout.
 pub const STALE_BRIDGE_MS: u64 = IDLE_TIMEOUT_MS + HEARTBEAT_MS;
 /// After a failed refresh, cached records are used without asking the database for this long.
@@ -991,6 +994,70 @@ impl Service {
         Ok(resumed)
     }
 
+    /// Queues first issuance again where it gave up early on a transient error (as every job did before
+    /// transient errors were retried for a day) and the tunnel still waits for that certificate. The tunnel shows
+    /// `issuing` again, so clients that poll it see it become ready. A job requeued like this starts a new retry
+    /// window, so it is requeued at most once.
+    pub async fn retry_failed_issuance(&self) -> Result<usize> {
+        let now = self.now();
+        let mut requeued = 0;
+        for job in self
+            .store
+            .failed_issue_jobs(now.saturating_sub(RETRY_FAILED_MAX_AGE_MS))
+            .await?
+        {
+            let gave_up_early =
+                job.updated_at.saturating_sub(job.created_at) < retry::RETRY_WINDOW_MS / 2;
+            if !gave_up_early
+                || !matches!(
+                    retry::classify_reason(&job.last_error),
+                    retry::Class::Transient { .. }
+                )
+            {
+                continue;
+            }
+            let Some(tunnel) = &job.tunnel_id else {
+                continue;
+            };
+            let entry = self.entry(tunnel);
+            let mut state = self.lock_fresh(&entry).await?;
+            let Some(record) = state.record().cloned() else {
+                continue;
+            };
+            let waiting = !record.is_deleted()
+                && record.certificate_id.as_deref() == Some(&job.certificate_id)
+                && record.certificate.as_ref().is_some_and(|certificate| {
+                    certificate.id == job.certificate_id
+                        && matches!(certificate.state, CertificateState::Failed { .. })
+                });
+            if !waiting
+                || !self
+                    .store
+                    .requeue_failed_job(&job.certificate_id, now)
+                    .await?
+            {
+                continue;
+            }
+            info!(tunnel, certificate = %job.certificate_id, reason = %job.last_error, "retrying certificate issuance that failed transiently");
+            let issuing = StoredTunnel {
+                certificate: Some(CertificateInfo {
+                    id: job.certificate_id.clone(),
+                    state: CertificateState::Issuing,
+                }),
+                ..record
+            };
+            // Should this fail, the job still runs and records the certificate when it is ready.
+            if let Err(error) = self.save(&mut state, issuing).await {
+                warn!(tunnel, %error, "failed to show requeued issuance as issuing");
+            }
+            requeued += 1;
+        }
+        if requeued > 0 {
+            self.jobs.notify_one();
+        }
+        Ok(requeued)
+    }
+
     // --- Bridges -----------------------------------------------------------------------------------------
 
     /// Whether the tunnel exists, for the WebSocket upgrade.
@@ -1884,5 +1951,147 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn queues_transiently_failed_issuance_again_once() {
+        let Some(harness) = Harness::new().await else {
+            return;
+        };
+        let store = &harness.service.store;
+        let base = harness.tunnel(T0 + 80 * DAY_MS, None).await;
+        // A failed job and its tunnel, which shows the failure.
+        let failed = async |id: &str, certificate: &str, reason: &str, deleted: bool| {
+            let mut record = base.clone();
+            record.id = id.into();
+            record.certificate_id = Some(certificate.into());
+            record.certificate = Some(CertificateInfo {
+                id: certificate.into(),
+                state: CertificateState::Failed {
+                    reason: reason.into(),
+                },
+            });
+            if deleted {
+                record.deleted_at = Some(iso(T0));
+            }
+            store.put_tunnel(&record, T0).await.unwrap();
+            let job = Job {
+                certificate_id: certificate.into(),
+                tunnel_id: Some(id.into()),
+                kind: JobKind::Issue,
+                identifiers: vec![record.hostname.clone()],
+                csr: "CSR".into(),
+                attempts: 0,
+                created_at: T0 - 2 * MINUTE_MS,
+            };
+            store.add_job(job, T0 - 2 * MINUTE_MS).await.unwrap();
+            store
+                .claim_job(certificate, "old", T0 - MINUTE_MS)
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .finish_job(
+                    certificate,
+                    "old",
+                    "failed",
+                    Some(reason.into()),
+                    T0 - MINUTE_MS,
+                )
+                .await
+                .unwrap();
+        };
+        failed(
+            "noncenonce01",
+            "cert_nonce",
+            "ACME server returned no nonce",
+            false,
+        )
+        .await;
+        failed(
+            "duplicatedns",
+            "cert_dns",
+            "An identical record already exists.",
+            false,
+        )
+        .await;
+        failed(
+            "rejectedname",
+            "cert_rejected",
+            "urn:ietf:params:acme:error:rejectedIdentifier: DNS identifier is invalid | HTTP 400 | {}",
+            false,
+        )
+        .await;
+        failed(
+            "deletedtunnl",
+            "cert_deleted",
+            "ACME server returned no nonce",
+            true,
+        )
+        .await;
+        // The client already bound another certificate.
+        failed(
+            "rebound00000",
+            "cert_old",
+            "ACME server returned no nonce",
+            false,
+        )
+        .await;
+        let mut rebound = store.tunnel("rebound00000").await.unwrap().unwrap().record;
+        rebound.certificate_id = Some("cert_new".into());
+        rebound.certificate = Some(CertificateInfo {
+            id: "cert_new".into(),
+            state: CertificateState::Issuing,
+        });
+        store.put_tunnel(&rebound, T0).await.unwrap();
+
+        harness.advance(MINUTE_MS);
+        assert_eq!(harness.service.retry_failed_issuance().await.unwrap(), 2);
+        for (id, certificate) in [("noncenonce01", "cert_nonce"), ("duplicatedns", "cert_dns")] {
+            assert!(store.job_pending(certificate).await.unwrap());
+            let record = store.tunnel(id).await.unwrap().unwrap().record;
+            assert_eq!(record.certificate.unwrap().state, CertificateState::Issuing);
+        }
+        for certificate in ["cert_rejected", "cert_deleted", "cert_old"] {
+            assert!(!store.job_pending(certificate).await.unwrap());
+        }
+        // Requeued jobs are due now, with a new retry window.
+        let due = store
+            .claim_due_jobs("new", harness.service.now(), 10)
+            .await
+            .unwrap();
+        let mut ids: Vec<_> = due.iter().map(|job| job.certificate_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["cert_dns", "cert_nonce"]);
+        assert!(
+            due.iter()
+                .all(|job| job.attempts == 0 && job.created_at == harness.service.now())
+        );
+        assert_eq!(harness.service.retry_failed_issuance().await.unwrap(), 0);
+
+        // Should one fail again after its whole retry window, it stays failed.
+        harness.advance(retry::RETRY_WINDOW_MS);
+        let now = harness.service.now();
+        store
+            .finish_job(
+                "cert_nonce",
+                "new",
+                "failed",
+                Some("ACME server returned no nonce".into()),
+                now,
+            )
+            .await
+            .unwrap();
+        let mut record = store.tunnel("noncenonce01").await.unwrap().unwrap().record;
+        record.certificate = Some(CertificateInfo {
+            id: "cert_nonce".into(),
+            state: CertificateState::Failed {
+                reason: "ACME server returned no nonce".into(),
+            },
+        });
+        store.put_tunnel(&record, now).await.unwrap();
+        harness.service.invalidate("noncenonce01").await;
+        assert_eq!(harness.service.retry_failed_issuance().await.unwrap(), 0);
+        assert!(!store.job_pending("cert_nonce").await.unwrap());
     }
 }

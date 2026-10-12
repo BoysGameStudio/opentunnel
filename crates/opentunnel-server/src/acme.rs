@@ -1,20 +1,23 @@
 //! A small ACME (RFC 8555) client for DNS-01 issuance with external account binding, as ZeroSSL requires.
 //! One `issue` call is one attempt: a fresh order, its challenges, finalization with the tunnel's CSR, and the
-//! certificate chain. Retries are the job runner's.
+//! certificate chain. Retries of whole attempts are the job runner's (see `retry.rs`); an attempt only repeats
+//! requests that are safe to repeat: getting a nonce, a rejected nonce, and POST-as-GET reads.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, LOCATION};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, LOCATION, RETRY_AFTER};
 use ring::rand::SystemRandom;
 use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::crypto::{base64url, decode_base64url};
 use crate::dns::{DnsProvider, TxtRecord, wait_for_propagation};
+use crate::retry::{Class, classify};
 
 #[derive(Clone)]
 pub struct AcmeConfig {
@@ -89,6 +92,8 @@ struct AcmeChallenge {
     url: String,
     #[serde(default)]
     token: String,
+    #[serde(default)]
+    status: String,
 }
 
 struct Key {
@@ -101,6 +106,40 @@ struct Response {
     headers: HeaderMap,
     body: bytes::Bytes,
 }
+
+/// An ACME error response (RFC 8555 section 6.7), displayed as the Worker's `describeError` did.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct Problem {
+    pub status: u16,
+    /// The problem type URN, empty when the body was not a problem document.
+    pub kind: String,
+    pub retry_after: Option<Duration>,
+    pub message: String,
+}
+
+/// A failure that is expected to clear up by itself, such as a missing nonce or an authorization the CA has
+/// not finished validating.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct Transient {
+    pub message: String,
+    pub retry_after: Option<Duration>,
+}
+
+impl Transient {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+}
+
+/// Requests in one attempt that are safe to repeat are tried this many times.
+const REQUEST_TRIES: u32 = 3;
+/// The pause before repeating such a request, doubled each time.
+const REQUEST_RETRY_PAUSE: Duration = Duration::from_millis(500);
 
 impl Acme {
     pub fn new(config: AcmeConfig, http: reqwest::Client, dns: Option<DnsProvider>) -> Self {
@@ -134,7 +173,8 @@ impl Acme {
             .context("fetching the ACME directory")?
             .error_for_status()?
             .json()
-            .await?;
+            .await
+            .context("reading the ACME directory")?;
         let mut session = Session {
             http: &self.http,
             key: &key,
@@ -166,15 +206,19 @@ impl Acme {
                 Some(&json!({ "identifiers": identifiers_json })),
             )
             .await?;
-        let order_url = header(&response.headers, LOCATION);
-        let order: Order = serde_json::from_slice(&response.body)?;
+        let order_url = header(&response.headers, LOCATION)
+            .ok_or_else(|| anyhow!("ACME order has no location URL"))?;
+        let order: Order = parse(&response.body, "order")?;
 
+        // The CA may hand back an order or authorizations from an earlier attempt: valid ones are skipped.
         let mut pending = Vec::new();
         for url in &order.authorizations {
             let authorization: Authorization =
-                serde_json::from_slice(&session.post(url, None).await?.body)?;
-            if authorization.status == "valid" {
-                continue;
+                parse(&session.get(url).await?.body, "authorization")?;
+            match &authorization.status[..] {
+                "valid" => continue,
+                "pending" => {}
+                status => bail!("ACME authorization ended in {status}"),
             }
             let challenge = authorization
                 .challenges
@@ -200,57 +244,85 @@ impl Acme {
             .await?;
         }
 
+        // A hostname and its wildcard share one record name, and may share a token (so one value).
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        for (_, _, value, hostname) in &pending {
+            let name = format!("_acme-challenge.{}", hostname.trim_start_matches("*."));
+            if !wanted.iter().any(|(n, v)| *n == name && v == value) {
+                wanted.push((name, value.clone()));
+            }
+        }
         let mut records: Vec<TxtRecord> = Vec::new();
         let result = async {
-            for (_, _, value, hostname) in &pending {
-                let hostname = hostname.trim_start_matches("*.");
-                records.push(
-                    dns.create_txt(&format!("_acme-challenge.{hostname}"), value)
-                        .await?,
-                );
+            for (name, value) in &wanted {
+                records.push(dns.create_txt(name, value).await?);
             }
             wait_for_propagation(&self.http, &records, self.config.dns_propagation_timeout).await;
             for (url, challenge, _, _) in &pending {
-                session.post(&challenge.url, Some(&json!({}))).await?;
+                // Answering a challenge the CA is already validating is at best a no-op.
+                if challenge.status.is_empty() || challenge.status == "pending" {
+                    session.post(&challenge.url, Some(&json!({}))).await?;
+                }
                 let mut authorization: Authorization =
-                    serde_json::from_slice(&session.post(url, None).await?.body)?;
+                    parse(&session.get(url).await?.body, "authorization")?;
                 for _ in 0..30 {
                     if authorization.status != "pending" {
                         break;
                     }
                     tokio::time::sleep(self.config.authorization_poll).await;
-                    authorization = serde_json::from_slice(&session.post(url, None).await?.body)?;
+                    authorization = parse(&session.get(url).await?.body, "authorization")?;
                 }
-                if authorization.status != "valid" {
-                    bail!("ACME authorization ended in {}", authorization.status);
+                match &authorization.status[..] {
+                    "valid" => {}
+                    // The next attempt's order picks the same authorization up again.
+                    "pending" => {
+                        return Err(Transient::new("ACME authorization ended in pending").into());
+                    }
+                    status => bail!("ACME authorization ended in {status}"),
                 }
             }
 
-            let finalize = order
-                .finalize
-                .as_deref()
-                .ok_or_else(|| anyhow!("ACME order has no finalize URL"))?;
+            let mut order: Order = parse(&session.get(&order_url).await?.body, "order")?;
+            for _ in 0..30 {
+                if order.status != "pending" {
+                    break;
+                }
+                tokio::time::sleep(self.config.order_poll).await;
+                order = parse(&session.get(&order_url).await?.body, "order")?;
+            }
             let csr = pem_der(csr_pem).ok_or_else(|| anyhow!("CSR is not PEM"))?;
-            session
-                .post(finalize, Some(&json!({ "csr": base64url(&csr) })))
-                .await?;
-            let order_url = order_url.ok_or_else(|| anyhow!("ACME order has no location URL"))?;
-            let mut order: Order =
-                serde_json::from_slice(&session.post(&order_url, None).await?.body)?;
+            // An order an earlier attempt already finalized is not finalized again.
+            if order.status == "ready" {
+                let finalize = order
+                    .finalize
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("ACME order has no finalize URL"))?;
+                session
+                    .post(finalize, Some(&json!({ "csr": base64url(&csr) })))
+                    .await?;
+                order = parse(&session.get(&order_url).await?.body, "order")?;
+            }
             for _ in 0..30 {
                 if order.status != "processing" {
                     break;
                 }
                 tokio::time::sleep(self.config.order_poll).await;
-                order = serde_json::from_slice(&session.post(&order_url, None).await?.body)?;
+                order = parse(&session.get(&order_url).await?.body, "order")?;
             }
             let certificate_url = match (&order.status[..], &order.certificate) {
                 ("valid", Some(url)) => url.clone(),
-                _ => bail!("ACME order ended in {}", order.status),
+                (status @ ("pending" | "processing"), _) => {
+                    return Err(Transient::new(format!("ACME order ended in {status}")).into());
+                }
+                (status, _) => bail!("ACME order ended in {status}"),
             };
-            let response = session.post(&certificate_url, None).await?;
+            let response = session.get(&certificate_url).await?;
             let pem = std::str::from_utf8(&response.body)?;
-            chain_from_pem(pem)
+            let issued = chain_from_pem(pem)?;
+            if !certifies_key(pem, &csr) {
+                bail!("ACME returned a certificate for another key");
+            }
+            Ok(issued)
         }
         .await;
         for record in &records {
@@ -272,23 +344,63 @@ struct Session<'a> {
 }
 
 impl Session<'_> {
+    /// The nonce from the last response, or a new one. ZeroSSL's proxy sometimes answers without one (with an
+    /// error status), so this tries again shortly, with GET (RFC 8555 section 7.2) after the first HEAD.
     async fn fresh_nonce(&mut self) -> Result<String> {
         if let Some(nonce) = self.nonce.take() {
             return Ok(nonce);
         }
-        let response = self
-            .http
-            .head(self.new_nonce)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await?;
-        header(response.headers(), "replay-nonce")
-            .ok_or_else(|| anyhow!("ACME server returned no nonce"))
+        let mut pause = REQUEST_RETRY_PAUSE;
+        let mut last = String::new();
+        for attempt in 1..=REQUEST_TRIES {
+            let request = if attempt == 1 {
+                self.http.head(self.new_nonce)
+            } else {
+                self.http.get(self.new_nonce)
+            };
+            match request.timeout(Duration::from_secs(30)).send().await {
+                Ok(response) => {
+                    if let Some(nonce) = header(response.headers(), "replay-nonce") {
+                        return Ok(nonce);
+                    }
+                    last = format!(" (HTTP {})", response.status().as_u16());
+                }
+                Err(error) => last = format!(": {error}"),
+            }
+            if attempt < REQUEST_TRIES {
+                tokio::time::sleep(pause).await;
+                pause *= 2;
+            }
+        }
+        Err(Transient::new(format!("ACME server returned no nonce{last}")).into())
     }
 
-    /// A signed POST; `None` is POST-as-GET. Retries a rejected nonce, which servers may do at any time.
+    /// A POST-as-GET read, repeated a few times on a transient failure (a 502 from the CA's proxy, a reset
+    /// connection), since reading twice is harmless.
+    async fn get(&mut self, url: &str) -> Result<Response> {
+        let mut pause = REQUEST_RETRY_PAUSE;
+        let mut attempt = 1;
+        loop {
+            match self.post(url, None).await {
+                Err(error)
+                    if attempt < REQUEST_TRIES
+                        && matches!(classify(&error), Class::Transient { .. }) =>
+                {
+                    tokio::time::sleep(pause).await;
+                    pause *= 2;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// A signed POST; `None` is POST-as-GET. Retries a rejected nonce with the one the rejection carries, which
+    /// servers may do at any time.
     async fn post(&mut self, url: &str, payload: Option<&Value>) -> Result<Response> {
-        for attempt in 0.. {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
             let nonce = self.fresh_nonce().await?;
             let body = self.sign(url, &nonce, payload)?;
             let response = self
@@ -303,19 +415,22 @@ impl Session<'_> {
             let status = response.status().as_u16();
             let headers = response.headers().clone();
             self.nonce = header(&headers, "replay-nonce");
-            let body = response.bytes().await?;
+            let body = response
+                .bytes()
+                .await
+                .with_context(|| format!("ACME request to {url} failed"))?;
             if status < 400 {
                 return Ok(Response { headers, body });
             }
             let problem: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let kind = problem["type"].as_str().unwrap_or_default();
-            if kind.ends_with(":badNonce") && attempt < 3 {
+            if kind.ends_with(":badNonce") && attempt <= 3 {
                 continue;
             }
             let detail = problem["detail"].as_str().unwrap_or_default();
             let text = String::from_utf8_lossy(&body);
             // As the Worker's describeError: the message, the HTTP status, and the start of the response body.
-            bail!(
+            let message = format!(
                 "{} | HTTP {status} | {}",
                 if detail.is_empty() {
                     format!("ACME request to {url} failed")
@@ -324,10 +439,17 @@ impl Session<'_> {
                 },
                 text.chars().take(300).collect::<String>()
             );
+            return Err(Problem {
+                status,
+                kind: kind.to_owned(),
+                retry_after: header(&headers, RETRY_AFTER)
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs),
+                message,
+            }
+            .into());
         }
-        unreachable!()
     }
-
     fn sign(&self, url: &str, nonce: &str, payload: Option<&Value>) -> Result<String> {
         let mut protected = json!({ "alg": "ES256", "nonce": nonce, "url": url });
         match &self.kid {
@@ -353,6 +475,39 @@ impl Session<'_> {
             "signature": base64url(signature.as_ref()),
         }))?)
     }
+}
+
+/// Reads a JSON response. A 2xx response that is not the JSON it should be came from a struggling proxy in
+/// front of the CA, so it is transient.
+fn parse<T: DeserializeOwned>(body: &[u8], what: &str) -> Result<T> {
+    serde_json::from_slice(body).map_err(|error| {
+        Transient::new(format!(
+            "ACME {what} response could not be read ({error}): {}",
+            String::from_utf8_lossy(body)
+                .chars()
+                .take(100)
+                .collect::<String>()
+        ))
+        .into()
+    })
+}
+
+/// Whether the leaf of `pem` certifies the public key of the CSR `csr_der`.
+fn certifies_key(pem: &str, csr_der: &[u8]) -> bool {
+    use rustls_pki_types::CertificateDer;
+    use rustls_pki_types::pem::PemObject;
+    use x509_parser::certification_request::X509CertificationRequest;
+    use x509_parser::prelude::FromDer;
+    let Some(Ok(leaf)) = CertificateDer::pem_slice_iter(pem.as_bytes()).next() else {
+        return false;
+    };
+    let (Ok((_, certificate)), Ok((_, request))) = (
+        x509_parser::parse_x509_certificate(leaf.as_ref()),
+        X509CertificationRequest::from_der(csr_der),
+    ) else {
+        return false;
+    };
+    certificate.public_key().raw == request.certification_request_info.subject_pki.raw
 }
 
 fn header(headers: &HeaderMap, name: impl reqwest::header::AsHeaderName) -> Option<String> {

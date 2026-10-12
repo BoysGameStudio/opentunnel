@@ -40,8 +40,20 @@ struct CloudflareResponse<A> {
 #[derive(Deserialize)]
 struct CloudflareError {
     #[serde(default)]
+    code: u64,
+    #[serde(default)]
     message: String,
 }
+
+#[derive(Deserialize)]
+struct Listed {
+    id: String,
+    #[serde(default)]
+    content: String,
+}
+
+/// Cloudflare's error for a record that exists with the same name and content.
+const CLOUDFLARE_IDENTICAL_RECORD: u64 = 81058;
 
 #[derive(Deserialize)]
 struct Created {
@@ -49,7 +61,9 @@ struct Created {
 }
 
 impl DnsProvider {
-    /// Creates a TXT record `name` (a full name, `_acme-challenge.<host>`) with `value`, TTL 60.
+    /// Creates a TXT record `name` (a full name, `_acme-challenge.<host>`) with `value`, TTL 60. A record that
+    /// already exists with that value (left by an interrupted attempt) is used as is, and deleted afterwards
+    /// like a created one.
     pub async fn create_txt(&self, name: &str, value: &str) -> Result<TxtRecord> {
         match self {
             Self::Cloudflare {
@@ -76,6 +90,21 @@ impl DnsProvider {
                         value: value.into(),
                         id: Some(created.id),
                     }),
+                    _ if body.errors.iter().any(|error| {
+                        error.code == CLOUDFLARE_IDENTICAL_RECORD
+                            || error.message.contains("identical record already exists")
+                    }) =>
+                    {
+                        let id = self.find_txt(name, value).await.unwrap_or_else(|error| {
+                            warn!(%error, name, "failed to look up an existing challenge record");
+                            None
+                        });
+                        Ok(TxtRecord {
+                            name: name.into(),
+                            value: value.into(),
+                            id,
+                        })
+                    }
                     _ => {
                         let messages: Vec<String> = body
                             .errors
@@ -109,6 +138,39 @@ impl DnsProvider {
                 })
             }
         }
+    }
+
+    /// The ID of the Cloudflare TXT record `name` with `value`, if there is one.
+    async fn find_txt(&self, name: &str, value: &str) -> Result<Option<String>> {
+        let Self::Cloudflare {
+            http,
+            api,
+            zone_id,
+            token,
+        } = self
+        else {
+            return Ok(None);
+        };
+        let mut url = url::Url::parse(&format!("{api}/zones/{zone_id}/dns_records"))?;
+        url.query_pairs_mut()
+            .append_pair("type", "TXT")
+            .append_pair("name", name);
+        let body: CloudflareResponse<Vec<Listed>> = http
+            .get(url)
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        // Cloudflare may show TXT content quoted.
+        Ok(body
+            .result
+            .unwrap_or_default()
+            .into_iter()
+            .find(|record| record.content.trim_matches('"') == value)
+            .map(|record| record.id))
     }
 
     /// Deletes a record, logging rather than failing: a leftover TXT record is harmless.

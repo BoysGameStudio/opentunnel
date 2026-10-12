@@ -162,6 +162,16 @@ pub struct Job {
     pub created_at: u64,
 }
 
+/// A failed job, for queueing those that failed transiently again.
+#[derive(Debug, Clone)]
+pub struct FailedJob {
+    pub certificate_id: String,
+    pub tunnel_id: Option<String>,
+    pub last_error: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerCertificate {
     pub private_key: String,
@@ -303,6 +313,7 @@ type ServerCertificateRow = (
     Option<String>,
     Option<String>,
 );
+type FailedJobRow = (String, Option<String>, Option<String>, i64, i64);
 type JobRow = (String, Option<String>, String, String, String, i32, i64);
 
 fn job_from_row(row: JobRow) -> Result<Job> {
@@ -922,6 +933,54 @@ impl Store {
             .await
             .map_err(db)?;
             Ok(retried.rows_affected() == 1)
+        })
+        .await
+    }
+
+    /// Failed first-issuance jobs that last changed at or after `since`.
+    pub async fn failed_issue_jobs(&self, since: u64) -> Result<Vec<FailedJob>> {
+        timed(async {
+            let rows: Vec<FailedJobRow> = sqlx::query_as(
+                "SELECT certificate_id, tunnel_id, last_error, created_at, updated_at FROM jobs
+                 WHERE status = 'failed' AND kind = 'issue' AND updated_at >= ?",
+            )
+            .bind(since as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(certificate_id, tunnel_id, last_error, created_at, updated_at)| FailedJob {
+                        certificate_id,
+                        tunnel_id,
+                        last_error: last_error.unwrap_or_default(),
+                        created_at: created_at as u64,
+                        updated_at: updated_at as u64,
+                    },
+                )
+                .collect())
+        })
+        .await
+    }
+
+    /// Queues a failed job again as if it were new, keeping its last error. Only one caller wins. Returns
+    /// whether this one did.
+    pub async fn requeue_failed_job(&self, certificate_id: &str, now: u64) -> Result<bool> {
+        timed(async {
+            let requeued = sqlx::query(
+                "UPDATE jobs SET status = 'pending', attempts = 0, run_at = ?, created_at = ?, updated_at = ?,
+                   lease_owner = NULL, lease_until = NULL
+                 WHERE certificate_id = ? AND status = 'failed'",
+            )
+            .bind(now as i64)
+            .bind(now as i64)
+            .bind(now as i64)
+            .bind(certificate_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+            Ok(requeued.rows_affected() == 1)
         })
         .await
     }

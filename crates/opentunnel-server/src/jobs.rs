@@ -14,11 +14,13 @@ use crate::acme::Challenge;
 use crate::clock::{DAY_MS, HOUR_MS, MINUTE_MS};
 use crate::crypto::uuid;
 use crate::issuer::Issuer;
+use crate::retry;
 use crate::service::{RENEW_BEFORE_MS, Service};
 use crate::store::{Job, JobKind, LEASE_MS, ServerCertificate};
 use crate::tls;
 
-/// Attempts per job, like the Workflow step's two retries.
+/// Attempts per job for failures that are not known to be transient, like the Workflow step's two retries.
+/// Transient ones are retried for `retry::RETRY_WINDOW_MS`.
 pub const ATTEMPTS: u32 = 3;
 const PERSIST_FAILED: &str = "Failed to persist certificate state: tunnel or certificate not found";
 /// Imported issuance gets this long to finish on the Worker before this server takes it over.
@@ -247,18 +249,19 @@ impl Jobs {
                         .await
                         .map(drop);
                 }
-                if attempts < ATTEMPTS {
-                    let delay = self.retry_delay_ms * (1 << (attempts - 1));
+                let class = retry::classify(&error);
+                if let Some(at) = retry::next_attempt(
+                    class,
+                    attempts,
+                    self.retry_delay_ms,
+                    job.created_at,
+                    now,
+                    retry::jitter(),
+                ) {
+                    info!(certificate = %job.certificate_id, attempt = attempts, ?class, in_ms = at - now, "retrying certificate issuance");
                     return service
                         .store
-                        .retry_job(
-                            &job.certificate_id,
-                            owner,
-                            attempts,
-                            now + delay,
-                            reason,
-                            now,
-                        )
+                        .retry_job(&job.certificate_id, owner, attempts, at, reason, now)
                         .await
                         .map(drop);
                 }
@@ -333,6 +336,14 @@ pub async fn run_reconcile(service: Service) {
             Ok(0) => {}
             Ok(resumed) => info!(resumed, "resumed certificate issuance without a job"),
             Err(error) => error!(%error, "resuming certificate issuance failed"),
+        }
+        match service.retry_failed_issuance().await {
+            Ok(0) => {}
+            Ok(requeued) => info!(
+                requeued,
+                "queued transiently failed certificate issuance again"
+            ),
+            Err(error) => error!(%error, "queueing failed certificate issuance again failed"),
         }
     }
 }
