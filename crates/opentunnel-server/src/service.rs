@@ -60,6 +60,8 @@ pub struct Inner {
     refresh_failed_at: AtomicU64,
     /// How long tunnel connections may stay quiet.
     timeouts: std::sync::OnceLock<crate::net::Timeouts>,
+    /// Set once the server is shutting down: bridges that arrive are told to reconnect elsewhere.
+    draining: AtomicBool,
 }
 
 impl std::ops::Deref for Service {
@@ -326,6 +328,7 @@ impl Service {
             cluster: std::sync::OnceLock::new(),
             refresh_failed_at: AtomicU64::new(0),
             timeouts: std::sync::OnceLock::new(),
+            draining: AtomicBool::new(false),
         }))
     }
 
@@ -1090,6 +1093,10 @@ impl Service {
             channels: Mutex::new(HashMap::new()),
         });
         state.bridges.push(bridge.clone());
+        // Checked under the entry lock that `drain` also takes, so no bridge is missed.
+        if self.draining.load(Ordering::SeqCst) {
+            send_drain(&bridge, DRAIN_REASON);
+        }
         Ok(Some(bridge))
     }
 
@@ -1465,16 +1472,20 @@ impl Service {
     }
 
     /// Closes every bridge, for shutdown. Clients treat `drain` as a reason to reconnect.
-    pub async fn drain(&self, reason: &str) {
+    /// Tells every bridge to reconnect elsewhere (`drain`, then close 1012), and every bridge that arrives from
+    /// now on as soon as it registers.
+    pub async fn drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
         for entry in self.entries() {
             let state = entry.state.lock().await;
             for bridge in &state.bridges {
-                let message = serde_json::to_string(&json!({ "type": "drain", "reason": reason }))
-                    .expect("drain serializes");
-                let _ = bridge.tx.try_send(Outbound::Text(message));
-                bridge.close(1012, reason);
+                send_drain(bridge, DRAIN_REASON);
             }
         }
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
     }
 
     /// Ready certificates of tunnels with an attached bridge here that expire before `before` (or have
@@ -1503,6 +1514,16 @@ impl Service {
             })
             .sum()
     }
+}
+
+/// Why bridges are drained: the only reason there is.
+const DRAIN_REASON: &str = "server restarting";
+
+fn send_drain(bridge: &Bridge, reason: &str) {
+    let message = serde_json::to_string(&json!({ "type": "drain", "reason": reason }))
+        .expect("drain serializes");
+    let _ = bridge.tx.try_send(Outbound::Text(message));
+    bridge.close(1012, reason);
 }
 
 #[cfg(test)]

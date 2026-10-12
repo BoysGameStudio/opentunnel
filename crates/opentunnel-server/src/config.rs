@@ -178,6 +178,11 @@ pub struct Config {
     #[arg(long, env = "METRICS_LISTEN", default_value = "off")]
     pub metrics_listen: String,
 
+    /// After SIGTERM, how long the server keeps accepting connections (and serving the API) while bridges move
+    /// to other machines; the proxy may still send new connections here for a few seconds.
+    #[arg(long, env = "SHUTDOWN_DRAIN_MS", default_value_t = 10_000)]
+    pub shutdown_drain_ms: u64,
+
     /// `json` lines (on Fly) or human-readable `text`.
     #[arg(long, env = "LOG_FORMAT", value_enum, default_value = "text")]
     pub log_format: crate::logging::LogFormat,

@@ -29,6 +29,8 @@ use crate::website::Website;
 
 /// Public connections handled at once; beyond this, new ones wait for a slot.
 const MAX_CONNECTIONS: usize = 50_000;
+/// At shutdown, after the drain, how long HTTP connections get to finish their requests.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Server {
     pub app: Arc<App>,
@@ -233,6 +235,7 @@ impl Server {
             website,
             admin,
             stats,
+            shutdown: http::Shutdown::default(),
         });
         Ok(Self {
             app,
@@ -334,9 +337,18 @@ impl Server {
         if accepted.sni == *domain {
             let stream = tls::Replay::new(accepted.initial, accepted.stream);
             match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
-                Ok(Ok(tls)) => http::serve_connection(self.app.clone(), tls).await,
-                Ok(Err(error)) => debug!(%error, "TLS handshake failed"),
-                Err(_) => debug!("TLS handshake timed out"),
+                Ok(Ok(tls)) => {
+                    crate::metrics::api_handshake("ok");
+                    http::serve_connection(self.app.clone(), tls).await;
+                }
+                Ok(Err(error)) => {
+                    crate::metrics::api_handshake("failed");
+                    debug!(%error, "TLS handshake failed");
+                }
+                Err(_) => {
+                    crate::metrics::api_handshake("timeout");
+                    debug!("TLS handshake timed out");
+                }
             }
             return;
         }
@@ -464,21 +476,38 @@ impl Server {
         let internal =
             internal_listener.map(|listener| tokio::spawn(server.clone().serve_internal(listener)));
         shutdown_signal().await;
-        info!("shutting down; asking bridges to reconnect");
-        tls.abort();
-        if let Some(http) = http {
-            http.abort();
-        }
+        // The proxy may keep sending new connections here for a few seconds (it does not know yet, or the machine
+        // is being moved without being cordoned first), so the listeners stay open and the API keeps answering
+        // while bridges move to other machines. Closing the listener at once fails those connections, which
+        // Cloudflare reports as 525.
+        let drain = Duration::from_millis(server.config.shutdown_drain_ms);
+        info!(
+            drain_ms = server.config.shutdown_drain_ms,
+            "shutting down; asking bridges to reconnect"
+        );
         // Other machines stop forwarding here before the bridges move to them.
         if let Some(cluster) = &server.cluster {
             cluster.shutdown().await;
         }
-        service.drain("server restarting").await;
+        service.drain().await;
+        server.app.shutdown.drain();
+        tokio::select! {
+            () = tokio::time::sleep(drain) => {}
+            () = shutdown_signal() => info!("second shutdown signal; not waiting for the drain"),
+        }
+        tls.abort();
+        if let Some(http) = http {
+            http.abort();
+        }
+        let open = server.app.shutdown.open_connections();
+        if !server.app.shutdown.close(CLOSE_TIMEOUT).await {
+            warn!(open, "HTTP connections still open at shutdown");
+        }
         self_jobs.release().await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
         if let Some(internal) = internal {
             internal.abort();
         }
+        info!("shut down");
         Ok(())
     }
 }

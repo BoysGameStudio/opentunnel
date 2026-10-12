@@ -16,6 +16,8 @@ use serde_json::{Value, json};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::debug;
 
 use crate::analytics;
@@ -37,6 +39,39 @@ pub struct App {
     pub website: Website,
     pub admin: Option<Arc<dyn Admin>>,
     pub stats: Arc<Stats>,
+    pub shutdown: Shutdown,
+}
+
+/// Ends HTTP connections without cutting off requests when the server shuts down.
+#[derive(Default)]
+pub struct Shutdown {
+    /// Connections open when draining starts finish their current requests and close, so clients move theirs
+    /// elsewhere.
+    draining: CancellationToken,
+    /// Every connection finishes its current requests and closes.
+    closing: CancellationToken,
+    connections: TaskTracker,
+}
+
+impl Shutdown {
+    /// Asks the connections open now to close once idle. From now on HTTP/1.1 responses close their connection.
+    pub fn drain(&self) {
+        self.draining.cancel();
+    }
+
+    /// Asks every connection to close once idle and waits up to `timeout` for them. Returns whether all closed.
+    pub async fn close(&self, timeout: std::time::Duration) -> bool {
+        self.draining.cancel();
+        self.closing.cancel();
+        self.connections.close();
+        tokio::time::timeout(timeout, self.connections.wait())
+            .await
+            .is_ok()
+    }
+
+    pub fn open_connections(&self) -> usize {
+        self.connections.len()
+    }
 }
 
 #[derive(Default)]
@@ -554,9 +589,32 @@ pub async fn serve_connection<I>(app: Arc<App>, io: I)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let service = hyper::service::service_fn(move |request| {
+    let _tracked = app.shutdown.connections.token();
+    // A connection accepted while draining is only asked to close at the end: closing it before its first request
+    // would drop that request.
+    let late = app.shutdown.draining.is_cancelled();
+    let close = if late {
+        app.shutdown.closing.clone()
+    } else {
+        app.shutdown.draining.clone()
+    };
+    let service = hyper::service::service_fn(move |request: Request<Incoming>| {
         let app = app.clone();
-        async move { Ok::<_, Infallible>(app.handle(request).await) }
+        async move {
+            let http1 = request.version() < hyper::Version::HTTP_2;
+            let draining = app.shutdown.draining.clone();
+            let mut response = app.handle(request).await;
+            // While draining, an HTTP/1.1 connection serves one request; an upgrade keeps its own header.
+            if http1
+                && draining.is_cancelled()
+                && response.status() != StatusCode::SWITCHING_PROTOCOLS
+            {
+                response
+                    .headers_mut()
+                    .insert(header::CONNECTION, HeaderValue::from_static("close"));
+            }
+            Ok::<_, Infallible>(response)
+        }
     });
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
@@ -570,10 +628,16 @@ where
         .timer(hyper_util::rt::TokioTimer::new())
         .keep_alive_interval(std::time::Duration::from_secs(60))
         .keep_alive_timeout(std::time::Duration::from_secs(20));
-    if let Err(error) = builder
-        .serve_connection_with_upgrades(TokioIo::new(io), service)
-        .await
-    {
+    let connection = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        result = connection.as_mut() => result,
+        () = close.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
+    };
+    if let Err(error) = result {
         tracing::debug!(%error, "HTTP connection ended");
     }
 }

@@ -1,7 +1,7 @@
 name: Deploy to Fly
 
 # Deploys crates/opentunnel-server and the website (Dockerfile, fly.toml) to the `opentunnel` Fly app on every
-# push to master that changes them, rolling one machine at a time. Uses the FLY_API_TOKEN repository secret
+# push to master that changes them, blue-green (fly.toml). Uses the FLY_API_TOKEN repository secret
 # (`fly tokens create deploy -a opentunnel`). Runtime secrets persist on the app and are not set here.
 
 on:

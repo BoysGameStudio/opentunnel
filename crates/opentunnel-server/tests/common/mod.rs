@@ -147,7 +147,7 @@ impl TestServer {
         if let Some(cluster) = &self.server.cluster {
             cluster.shutdown().await;
         }
-        self.server.app.service.drain("server restarting").await;
+        self.server.app.service.drain().await;
         self.server.jobs.release().await;
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

@@ -182,6 +182,7 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `CONNECTION_IDLE_TIMEOUT_MS` | `900000` | a tunnel connection with no traffic either way for this long is reset |
 | `HALF_CLOSE_TIMEOUT_MS` | `60000` | once either direction of a tunnel connection has ended, the other is reset after this long without traffic |
 | `METRICS_LISTEN` | `off` | Prometheus metrics at `/metrics` (`[::]:9091` on Fly, unauthenticated, not in `[[services]]`); see [Observability](#observability) |
+| `SHUTDOWN_DRAIN_MS` | `10000` | after SIGTERM, how long the server keeps accepting and serving while bridges move elsewhere |
 | `LOG_FORMAT` | `text` | `json` writes one JSON object per line (`json` on Fly) |
 | `LEGACY_WORKER_URL`, `RELAY_TOKEN`, `LEGACY_EXPORT_TOKEN` | | TEMPORARY, migration only ([cutover.md](cutover.md)) |
 
@@ -202,10 +203,21 @@ Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
 - At startup the open file soft limit is raised to the hard limit (logged as
   `open file limit`); when it is reached anyway, accept loops pause 500 ms
   between attempts and log at most every 10 s.
-- Deploys are rolling, one machine at a time: on SIGTERM the machine removes
-  its registry rows, sends every bridge `drain` and closes it with 1012, and
-  clients reconnect with backoff to the next-nearest machine (a few seconds of
-  downtime for them). Issuance jobs resume where they stopped, on any machine.
+- Deploys are blue-green (`fly.toml`): a new machine starts next to each old
+  one; once all are healthy, Fly cordons the old machines (the proxy stops
+  sending them new connections), waits 10 s and stops them. On SIGTERM (or
+  SIGINT) a machine removes its registry rows, sends every bridge `drain` and
+  closes it with 1012 (clients reconnect with backoff, to the new machines),
+  and does the same at once to any bridge that arrives later. For
+  `SHUTDOWN_DRAIN_MS` (10 s) it keeps accepting connections and answering the
+  API, since the proxy may still route new connections to it (a host migration
+  stops a machine without cordoning it); HTTP/1.1 responses then carry
+  `Connection: close` and idle connections are closed, so Cloudflare moves its
+  pooled connections elsewhere. Then it stops listening, gives open requests
+  up to 10 s, releases its jobs and exits (`kill_timeout` is 30 s). Closing
+  the listener at once instead fails connections the proxy still sends, which
+  Cloudflare reports as 525. Issuance jobs resume where they stopped, on any
+  machine.
 - The domain certificate is requested on first start and checked hourly;
   until it exists, TLS to the domain fails while tunnel traffic works.
 
@@ -227,6 +239,7 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_process_resident_memory_bytes` | gauge | | from `/proc/self/statm` |
 | `opentunnel_uptime_seconds` | gauge | | |
 | `opentunnel_accept_errors_total` | counter | `error` (`emfile`, `other`) | failed accepts; `emfile` is running out of descriptors |
+| `opentunnel_api_tls_handshakes_total` | counter | `result` (`ok`, `failed`, `timeout`) | TLS for the API domain; through Cloudflare a failed handshake is a 525 |
 | `opentunnel_bridges_attached` | gauge | | |
 | `opentunnel_bridge_attaches_total` | counter | `result` (`ok`, `bad_token`, `cert_not_ready`, `invalid_route`, `route_conflict`, `error`) | |
 | `opentunnel_bridge_detaches_total` | counter | `reason` (`client_close`, `drop`, `idle_retire`, `drain`, `delete`, `server_close`) | attached bridges that ended |
@@ -273,6 +286,10 @@ sum(increase(opentunnel_acme_attempts_total{app="opentunnel",outcome="failed"}[1
   / sum(increase(opentunnel_acme_attempts_total{app="opentunnel",outcome=~"success|failed"}[1d]))
 max(opentunnel_certificate_jobs{app="opentunnel",status="failed"})
 sum(opentunnel_certificates_expiring{app="opentunnel"}) > 0
+# API TLS handshakes failing (Cloudflare 525s). 525s whose Host is a tunnel hostname are not these: requests
+# for <id>.opentunnel.xyz sent to Cloudflare (mostly scanners) reach this server with that SNI and are closed
+# when the tunnel has no bridge, like any visitor.
+sum by (region, result) (rate(opentunnel_api_tls_handshakes_total{app="opentunnel",result!="ok"}[5m]))
 # Visitors turned away, by reason; forwarding between machines failing
 sum by (outcome) (rate(opentunnel_visitor_connections_total{app="opentunnel",outcome=~"rejected.*|error"}[5m]))
 sum by (region, reason) (rate(opentunnel_cluster_forward_failures_total{app="opentunnel"}[5m]))
@@ -370,7 +387,7 @@ Failure modes:
 
 | What | Effect |
 | --- | --- |
-| A machine restarts (deploy) | Its rows are removed first, its bridges get `drain`/1012 and reattach to the next-nearest machine within seconds; forwards to it fail over to the new location after one refused attempt |
+| A machine restarts (deploy) | Its rows are removed first, its bridges get `drain`/1012 and reattach to the new or next-nearest machine within seconds; forwards to it fail over to the new location after one refused attempt |
 | A machine crashes | Forwards to it fail fast (connection refused or 3 s timeout), the sender skips it for 30 s; its rows expire after three heartbeats; its clients reconnect elsewhere and attach at once (the route check cannot reach it, so it does not count) |
 | 6PN between two machines fails | Visitors for that pair are closed (or go to the legacy Worker); local traffic is unaffected |
 | Database unavailable | Local visitors and attached bridges keep working from memory; lookups for remote bridges fail (closed); registry changes are retried by the heartbeat |
@@ -385,7 +402,7 @@ few queries.
 
 ```bash
 fly secrets set --app opentunnel --stage INTERNAL_TOKEN=$(openssl rand -hex 32)
-fly deploy --app opentunnel                  # rolling, one machine at a time; iad first
+fly deploy --app opentunnel                  # blue-green: new machines next to the old ones, then the old ones stop
 fly scale vm shared-cpu-1x --memory 1024 --app opentunnel   # if existing machines kept the old size
 for region in ord sjc gru lhr fra bom sin nrt syd; do
   fly scale count 1 --region $region --app opentunnel --yes

@@ -43,6 +43,7 @@ pub struct Metrics {
     resident_memory: Gauge,
     uptime: Gauge<f64, AtomicU64>,
     accept_errors: Family<Labels, Counter>,
+    api_handshakes: Family<Labels, Counter>,
 
     bridges_attached: Gauge,
     bridge_attaches: Family<Labels, Counter>,
@@ -87,6 +88,7 @@ impl Metrics {
             resident_memory: Gauge::default(),
             uptime: Gauge::default(),
             accept_errors: Family::default(),
+            api_handshakes: Family::default(),
             bridges_attached: Gauge::default(),
             bridge_attaches: Family::default(),
             bridge_detaches: Family::default(),
@@ -131,6 +133,11 @@ impl Metrics {
             "accept_errors",
             "Failed accepts on the listeners, by error (emfile: out of descriptors)",
             metrics.accept_errors.clone(),
+        );
+        r.register(
+            "api_tls_handshakes",
+            "TLS handshakes for the API domain, by result (ok, failed, timeout); a failed one is a 525 at Cloudflare",
+            metrics.api_handshakes.clone(),
         );
         r.register(
             "bridges_attached",
@@ -239,6 +246,14 @@ pub fn accept_error(error: &std::io::Error) {
         "other"
     };
     get().accept_errors.get_or_create(&[("error", class)]).inc();
+}
+
+/// A TLS handshake for the API domain ended: `ok`, `failed` or `timeout`.
+pub fn api_handshake(result: &'static str) {
+    get()
+        .api_handshakes
+        .get_or_create(&[("result", result)])
+        .inc();
 }
 
 /// An attach answered: `ok`, or the `attach_error` code (`bad_token`, `route_conflict`, ...).
@@ -846,6 +861,7 @@ mod tests {
     #[tokio::test]
     async fn serves_metrics() {
         bridge_attach("ok");
+        api_handshake("failed");
         bridge_detach("drop");
         visitor("served_local");
         visitor_finished(Duration::from_millis(1500), 10, 20);
@@ -892,6 +908,7 @@ mod tests {
         }
         for prefix in [
             "opentunnel_bridge_attaches_total{result=\"ok\"} ",
+            "opentunnel_api_tls_handshakes_total{result=\"failed\"} ",
             "opentunnel_bridge_detaches_total{reason=\"drop\"} ",
             "opentunnel_visitor_connections_total{outcome=\"served_local\"} ",
             "opentunnel_visitor_bytes_total{direction=\"out\"} ",
