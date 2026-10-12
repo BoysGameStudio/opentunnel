@@ -164,6 +164,15 @@ pub struct Config {
     #[arg(long, env = "CLUSTER_HEARTBEAT_MS", default_value_t = 60_000)]
     pub cluster_heartbeat_ms: u64,
 
+    /// A tunnel connection with no traffic in either direction for this long is closed.
+    #[arg(long, env = "CONNECTION_IDLE_TIMEOUT_MS", default_value_t = 900_000)]
+    pub connection_idle_timeout_ms: u64,
+
+    /// Once either direction of a tunnel connection has ended, the other is closed after this long without
+    /// traffic.
+    #[arg(long, env = "HALF_CLOSE_TIMEOUT_MS", default_value_t = 60_000)]
+    pub half_close_timeout_ms: u64,
+
     /// TEMPORARY (migration): the old Worker, e.g. its workers.dev URL. Enables the legacy relay fallback and
     /// the pull-through import.
     #[arg(long, env = "LEGACY_WORKER_URL")]
@@ -194,4 +203,13 @@ pub enum IssuerKind {
 pub enum DnsKind {
     Cloudflare,
     Challtestsrv,
+}
+
+impl Config {
+    pub fn timeouts(&self) -> crate::net::Timeouts {
+        crate::net::Timeouts {
+            idle: std::time::Duration::from_millis(self.connection_idle_timeout_ms.max(1)),
+            half_close: std::time::Duration::from_millis(self.half_close_timeout_ms.max(1)),
+        }
+    }
 }

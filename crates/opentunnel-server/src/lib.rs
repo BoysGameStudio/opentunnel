@@ -16,6 +16,7 @@ pub mod http;
 pub mod issuer;
 pub mod jobs;
 pub mod migration;
+pub mod net;
 pub mod proxy_protocol;
 pub mod record;
 pub mod relay;

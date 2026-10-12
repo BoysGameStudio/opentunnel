@@ -88,6 +88,8 @@ impl Admin for TokenAdmin {
                                 "legacy_forwarded": stats.legacy_forwarded.load(Ordering::Relaxed),
                                 // Grows with open connections and bridges only; anything else is a leak.
                                 "tasks": tokio::runtime::Handle::current().metrics().num_alive_tasks(),
+                                // Open file descriptors: sockets, the database pool, and a few files.
+                                "fds": crate::net::open_fds(),
                             });
                             // Every machine, from the registry.
                             counts["cluster"] = match cluster.machines().await {

@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
     let clock = Clock::system();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
+            opentunnel_server::net::raise_fd_limit();
             let server = Server::build(cli.config.clone(), clock).await?;
             if let (Some(ca), Some(path)) = (&server.local_ca, &cli.config.local_ca_file) {
                 std::fs::write(path, ca).with_context(|| format!("writing {}", path.display()))?;

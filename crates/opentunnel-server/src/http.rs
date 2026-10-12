@@ -564,6 +564,12 @@ where
         .http1()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(std::time::Duration::from_secs(30));
+    // An HTTP/2 connection whose peer stopped answering pings is closed.
+    builder
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .keep_alive_interval(std::time::Duration::from_secs(60))
+        .keep_alive_timeout(std::time::Duration::from_secs(20));
     if let Err(error) = builder
         .serve_connection_with_upgrades(TokioIo::new(io), service)
         .await

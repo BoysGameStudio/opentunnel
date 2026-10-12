@@ -20,6 +20,7 @@ use crate::http::{self, App, Stats};
 use crate::issuer::{Issuer, LocalCa};
 use crate::jobs::{self, Jobs, ServerCertificates};
 use crate::migration::{Legacy, LegacyFallback, PullThrough};
+use crate::net::{self, AcceptErrors};
 use crate::relay::{self, Fallback};
 use crate::service::Service;
 use crate::store::Store;
@@ -88,6 +89,7 @@ impl Server {
             clock.clone(),
             analytics,
         );
+        service.set_timeouts(config.timeouts());
 
         let (issuer, local_ca) = match config.issuer {
             IssuerKind::Local => {
@@ -211,6 +213,7 @@ impl Server {
                 fallback = Some(Arc::new(LegacyFallback {
                     legacy,
                     stats: stats.clone(),
+                    timeouts: config.timeouts(),
                 }));
             }
         }
@@ -287,15 +290,16 @@ impl Server {
     pub async fn serve_tls(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let acceptor = tls::acceptor(self.resolver.clone());
         let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let mut errors = AcceptErrors::new("accept failed");
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    warn!(%error, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    errors.failed(error).await;
                     continue;
                 }
             };
+            net::keepalive(&stream);
             let Ok(slot) = slots.clone().acquire_owned().await else {
                 return Ok(());
             };
@@ -386,15 +390,16 @@ impl Server {
     }
 
     pub async fn serve_http(self: Arc<Self>, listener: TcpListener) -> Result<()> {
+        let mut errors = AcceptErrors::new("HTTP accept failed");
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    warn!(%error, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    errors.failed(error).await;
                     continue;
                 }
             };
+            net::keepalive(&stream);
             let app = self.app.clone();
             let domain = self.config.domain.clone();
             let mode = self.config.http_mode;

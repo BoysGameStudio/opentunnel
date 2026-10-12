@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::clock::Clock;
 use crate::http::{Stats, count};
+use crate::net::{Activity, Timeouts};
 use crate::record::StoredTunnel;
 use crate::relay::{Accepted, Fallback};
 use crate::store::{ImportOutcome, Store};
@@ -125,6 +126,7 @@ pub struct Legacy {
 pub struct LegacyFallback {
     pub legacy: Legacy,
     pub stats: Arc<Stats>,
+    pub timeouts: Timeouts,
 }
 
 impl Fallback for LegacyFallback {
@@ -136,8 +138,9 @@ impl Fallback for LegacyFallback {
         url.set_path("/api/relay");
         url.query_pairs_mut().clear().append_pair("token", &token);
         count(&self.stats.legacy_forwarded);
+        let timeouts = self.timeouts;
         tokio::spawn(async move {
-            if let Err(error) = relay(url.to_string(), accepted).await {
+            if let Err(error) = relay(url.to_string(), accepted, timeouts).await {
                 debug!(%error, "legacy relay connection ended");
             }
         });
@@ -146,7 +149,7 @@ impl Fallback for LegacyFallback {
 }
 
 /// The AWS relay's protocol: binary messages carry bytes each way and `{"type":"end"}` half-closes.
-async fn relay(url: String, accepted: Accepted) -> Result<()> {
+async fn relay(url: String, accepted: Accepted, timeouts: Timeouts) -> Result<()> {
     let (socket, _) = tokio::time::timeout(
         Duration::from_secs(10),
         tokio_tungstenite::connect_async(url.as_str()),
@@ -160,15 +163,18 @@ async fn relay(url: String, accepted: Accepted) -> Result<()> {
         ..
     } = accepted;
     sink.send(Message::Binary(initial.into())).await?;
+    let activity = Activity::default();
     let (mut read, mut write) = tcp.split();
     let upload = async {
         let mut buffer = vec![0u8; 32 * 1024];
         loop {
             let read = read.read(&mut buffer).await?;
             if read == 0 {
+                activity.half_close();
                 sink.send(Message::text(r#"{"type":"end"}"#)).await?;
                 return anyhow::Ok(());
             }
+            activity.touch();
             sink.send(Message::Binary(buffer[..read].to_vec().into()))
                 .await?;
         }
@@ -176,8 +182,12 @@ async fn relay(url: String, accepted: Accepted) -> Result<()> {
     let download = async {
         while let Some(message) = stream.next().await {
             match message? {
-                Message::Binary(data) => write.write_all(&data).await?,
+                Message::Binary(data) => {
+                    write.write_all(&data).await?;
+                    activity.touch();
+                }
                 Message::Text(text) if text.as_str().contains("\"end\"") => {
+                    activity.half_close();
                     write.shutdown().await?;
                 }
                 Message::Close(_) => break,
@@ -196,6 +206,9 @@ async fn relay(url: String, accepted: Accepted) -> Result<()> {
                 uploaded = true;
             }
             result = &mut download => return result,
+            () = activity.expired(timeouts) => {
+                anyhow::bail!("legacy relay connection idle");
+            }
         }
     }
 }

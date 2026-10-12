@@ -26,7 +26,11 @@ visitor ──TLS──▶ :443 ─┬─ SNI <route>.<id>.opentunnel.xyz ─▶
    then copies both directions in 32 KiB frames. Visitor reads wait while the
    bridge's send queue is full (backpressure); a visitor that stops reading for
    30 s is reset so it cannot stall the bridge. `end` half-closes, `reset`
-   aborts with an RST. Anything else (unknown tunnel, no bridge, certificate
+   aborts with an RST. A connection with no traffic either way for 15 minutes,
+   or for 60 s once either direction has ended (a visitor that closed while the
+   target never ends, or the reverse), is reset on both sides, and every socket
+   has TCP keepalive, so peers that vanish without a FIN never hold a
+   connection. Anything else (unknown tunnel, no bridge, certificate
    not ready, deeper names) is closed, exactly as before.
 4. No bridge for the route on this machine: the visitor is forwarded to the
    machine that has one ([Multiple regions](#multiple-regions)), and only if
@@ -159,6 +163,8 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `INTERNAL_ADDRESS` | `[FLY_PRIVATE_IP]:<port>` | where other machines reach this one |
 | `FLY_MACHINE_ID`, `FLY_REGION`, `FLY_PRIVATE_IP` | random, `local`, | set by Fly: the registry's machine ID (also the job lease owner), region, and 6PN address |
 | `CLUSTER_HEARTBEAT_MS` | `60000` | registry heartbeat; rows older than three are ignored |
+| `CONNECTION_IDLE_TIMEOUT_MS` | `900000` | a tunnel connection with no traffic either way for this long is reset |
+| `HALF_CLOSE_TIMEOUT_MS` | `60000` | once either direction of a tunnel connection has ended, the other is reset after this long without traffic |
 | `LEGACY_WORKER_URL`, `RELAY_TOKEN`, `LEGACY_EXPORT_TOKEN` | | TEMPORARY, migration only ([cutover.md](cutover.md)) |
 
 Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
@@ -170,10 +176,13 @@ Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
   attached-bridge and legacy-forward counts. The top-level connection and
   bridge counts are the answering machine's; `machine` has its ID, region and
   forwarding counters (`forwarded_out`, `forwarded_in`, `forward_failures`)
-  and live Tokio tasks (`tasks`, which should follow open connections and
-  bridges, not grow over time), and `cluster` the registry's view: bridges in total, per region, and per
+  and live Tokio tasks and open file descriptors (`tasks`, `fds`, which should
+  follow open connections and bridges, not grow over time), and `cluster` the registry's view: bridges in total, per region, and per
   machine. The request lands on the machine nearest the caller's Cloudflare
   colo.
+- At startup the open file soft limit is raised to the hard limit (logged as
+  `open file limit`); when it is reached anyway, accept loops pause 500 ms
+  between attempts and log at most every 10 s.
 - Deploys are rolling, one machine at a time: on SIGTERM the machine removes
   its registry rows, sends every bridge `drain` and closes it with 1012, and
   clients reconnect with backoff to the next-nearest machine (a few seconds of
@@ -218,8 +227,9 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─▶ bridge attached, rows in 
   or `0` when it has no bridge; on `0` or a failed connection the sender drops
   its cache entry (and skips an unreachable machine for 30 s), looks up once
   more, and otherwise falls back to the legacy Worker (if configured) or
-  closes. The sender then copies both directions (`copy_bidirectional`,
-  32 KiB buffers); a reset on one side resets the other.
+  closes. The sender then copies both directions (`net::splice`, 32 KiB
+  buffers, half-closes passed on, the same idle and half-close timeouts as
+  local visitors); a reset or timeout on one side resets the other.
 - **Control.** The internal listener also serves a small HTTP/1.1 API,
   authenticated with `Authorization: Bearer <INTERNAL_TOKEN>` (compared in
   constant time): `GET /internal/tunnel/<id>/routes` (the routes this
@@ -293,7 +303,10 @@ docker rm -f ot-mysql    # when done; it holds the test databases
   restarts, migrated tunnels, renewal on attach, a database outage), the
   migration paths against a fake Worker, and two servers on one database
   (`tests/cluster.rs`: forwarding, route conflicts and deletes across
-  machines, a crashed machine, a restart, and jobs running once).
+  machines, a crashed machine, a restart, and jobs running once), and
+  connections whose peers vanish (`tests/leaks.rs`: visitors that close while
+  the target never ends, silent visitors, a bridge that goes away, partial
+  ClientHellos; tasks and descriptors return to their baseline).
 - ACME against Pebble with external account binding and DNS-01 through
   pebble-challtestsrv:
 

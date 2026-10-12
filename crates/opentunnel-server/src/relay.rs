@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -15,6 +15,7 @@ use tracing::debug;
 
 use crate::bridge::{ServerControl, data_frame};
 use crate::cluster::{Cluster, FORWARD_ACCEPTED, FORWARD_REFUSED};
+use crate::net::Activity;
 use crate::proxy_protocol;
 use crate::service::{Inbound, Outcome, Route, Service};
 use crate::sni::{CLIENT_HELLO_LIMIT, Hello, parse_client_hello};
@@ -174,7 +175,10 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
                 && let Some(cluster) = cluster
                 && let Some(route) = route_name(&accepted.sni, &id, &service.domain)
             {
-                match cluster.forward(accepted, &id, &route).await {
+                match cluster
+                    .forward(accepted, &id, &route, service.timeouts())
+                    .await
+                {
                     None => return Ok(()),
                     Some(returned) => accepted = returned,
                 }
@@ -225,11 +229,46 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
     let bytes_in = initial.len() as u64;
 
     let _ = stream.set_nodelay(true);
+    let activity = Activity::default();
+    let uploaded = AtomicU64::new(0);
     let (read, write) = stream.split();
-    let upload = upload(read, &bridge, conn, &finish, abort.clone());
-    let download = download(write, inbound, &bridge, conn, &finish, abort.clone());
-    let (uploaded, ()) = tokio::join!(upload, download);
-    if *abort.borrow_and_update() {
+    let upload = upload(
+        read,
+        &bridge,
+        conn,
+        &finish,
+        abort.clone(),
+        &activity,
+        &uploaded,
+    );
+    let download = download(
+        write,
+        inbound,
+        &bridge,
+        conn,
+        &finish,
+        abort.clone(),
+        &activity,
+    );
+    let idle = tokio::select! {
+        _ = async { tokio::join!(upload, download) } => false,
+        () = activity.expired(service.timeouts()) => true,
+    };
+    if idle {
+        // Quiet for too long, or half-closed and the other side never ended: the visitor or the target is gone
+        // without saying so.
+        bridge.channels.lock().expect("channels lock").remove(&conn);
+        let _ = bridge.tx.try_send(
+            ServerControl::Reset {
+                conn,
+                code: "client_io_error",
+            }
+            .message(),
+        );
+        finish.finish(Outcome::ClientError, true);
+        debug!(tunnel = %tunnel_id, conn, "idle tunnel connection closed");
+    }
+    if idle || *abort.borrow_and_update() {
         // Aborted: drop the socket with a reset rather than a clean close.
         let _ = stream.set_zero_linger();
     }
@@ -241,7 +280,7 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
             "tunnel_id": tunnel_id,
             "outcome": finish.outcome().unwrap_or(Outcome::Closed).as_str(),
             "duration_ms": service.now().saturating_sub(started),
-            "bytes_in": bytes_in + uploaded,
+            "bytes_in": bytes_in + uploaded.load(Ordering::Relaxed),
             "bytes_out": bytes_out.load(Ordering::Relaxed),
         }),
     );
@@ -272,35 +311,38 @@ async fn reject(
     Ok(())
 }
 
-/// Visitor to tunnel client. Returns the bytes read after the ClientHello.
+/// Visitor to tunnel client, counting the bytes read after the ClientHello in `total`.
 async fn upload(
     mut read: ReadHalf<'_>,
     bridge: &crate::service::Bridge,
     conn: u32,
     finish: &crate::service::Finish,
     mut abort: watch::Receiver<bool>,
-) -> u64 {
-    let mut total = 0u64;
+    activity: &Activity,
+    total: &AtomicU64,
+) {
     let mut buffer = vec![0u8; MAX_PAYLOAD];
     loop {
         let read = tokio::select! {
             read = read.read(&mut buffer) => read,
-            _ = abort.wait_for(|aborted| *aborted) => return total,
+            _ = abort.wait_for(|aborted| *aborted) => return,
         };
         match read {
             Ok(0) => {
+                activity.half_close();
                 let _ = bridge.tx.send(ServerControl::End { conn }.message()).await;
-                return total;
+                return;
             }
             Ok(read) => {
-                total += read as u64;
+                total.fetch_add(read as u64, Ordering::Relaxed);
+                activity.touch();
                 let sent = tokio::select! {
                     sent = bridge.tx.send(data_frame(conn, &buffer[..read])) => sent.is_ok(),
-                    _ = abort.wait_for(|aborted| *aborted) => return total,
+                    _ = abort.wait_for(|aborted| *aborted) => return,
                 };
                 if !sent {
                     finish.finish(Outcome::BridgeDisconnected, true);
-                    return total;
+                    return;
                 }
             }
             Err(_) => {
@@ -313,7 +355,7 @@ async fn upload(
                 );
                 bridge.channels.lock().expect("channels lock").remove(&conn);
                 finish.finish(Outcome::ClientError, true);
-                return total;
+                return;
             }
         }
     }
@@ -327,6 +369,7 @@ async fn download(
     conn: u32,
     finish: &crate::service::Finish,
     mut abort: watch::Receiver<bool>,
+    activity: &Activity,
 ) {
     loop {
         let item = tokio::select! {
@@ -351,8 +394,10 @@ async fn download(
                     finish.finish(Outcome::ClientError, true);
                     return;
                 }
+                activity.touch();
             }
             Some(Inbound::End) | None => {
+                activity.half_close();
                 let _ = write.shutdown().await;
                 return;
             }

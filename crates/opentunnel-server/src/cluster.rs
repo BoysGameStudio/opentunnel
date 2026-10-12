@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 use crate::clock::Clock;
 use crate::crypto::{hash_token, token_matches};
 use crate::http::{Body, Stats, count, json_response, response};
+use crate::net::{self, AcceptErrors, Timeouts};
 use crate::relay::{self, Accepted, Origin};
 use crate::service::Service;
 use crate::store::{BridgeLocation, MachineBridges, Store};
@@ -48,7 +49,6 @@ const LOCATION_TTL: Duration = Duration::from_secs(30);
 const MISSING_TTL: Duration = Duration::from_secs(10);
 /// A machine that could not be reached is skipped for this long.
 const DOWN_TTL: Duration = Duration::from_secs(30);
-const COPY_BUFFER: usize = 32 * 1024;
 
 /// A machine holding a route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,7 +265,13 @@ impl Cluster {
     // --- Forwarding --------------------------------------------------------------------------------------
 
     /// Carries a visitor to the machine holding the route. Gives the connection back when no machine has it.
-    pub async fn forward(&self, accepted: Accepted, tunnel: &str, route: &str) -> Option<Accepted> {
+    pub async fn forward(
+        &self,
+        accepted: Accepted,
+        tunnel: &str,
+        route: &str,
+        timeouts: Timeouts,
+    ) -> Option<Accepted> {
         let mut tried: Option<Location> = None;
         for attempt in 0..2 {
             let Some(location) = self.locate(tunnel, route, attempt > 0).await else {
@@ -277,7 +283,7 @@ impl Cluster {
             match self.open(&location, &accepted, tunnel, route).await {
                 Ok(Some(internal)) => {
                     count(&self.stats.forwarded_out);
-                    splice(accepted, internal).await;
+                    splice(accepted, internal, timeouts).await;
                     return None;
                 }
                 Ok(None) => {
@@ -308,13 +314,16 @@ impl Cluster {
                 .await
                 .context("connecting timed out")??;
         let _ = stream.set_nodelay(true);
+        net::keepalive(&stream);
         let mut header = Vec::with_capacity(128 + accepted.initial.len());
         header.extend_from_slice(FORWARD_MAGIC);
         header.extend_from_slice(
             format!("{} {tunnel} {route} {}\n", self.token, accepted.peer).as_bytes(),
         );
         header.extend_from_slice(&accepted.initial);
-        stream.write_all(&header).await?;
+        tokio::time::timeout(ACK_TIMEOUT, stream.write_all(&header))
+            .await
+            .context("sending the header timed out")??;
         let mut answer = [0u8; 1];
         let read = tokio::time::timeout(ACK_TIMEOUT, stream.read(&mut answer))
             .await
@@ -472,18 +481,15 @@ pub async fn run_heartbeat(service: Service, cluster: Arc<Cluster>) {
     }
 }
 
-/// Copies both directions between a visitor and the machine it was forwarded to.
-async fn splice(accepted: Accepted, mut internal: TcpStream) {
+/// Copies both directions between a visitor and the machine it was forwarded to, until both end, either side
+/// fails, or the connection stays quiet for too long.
+async fn splice(accepted: Accepted, mut internal: TcpStream, timeouts: Timeouts) {
     let mut visitor = accepted.stream;
-    let copied = tokio::io::copy_bidirectional_with_sizes(
-        &mut visitor,
-        &mut internal,
-        COPY_BUFFER,
-        COPY_BUFFER,
-    )
-    .await;
-    if copied.is_err() {
-        // The other machine reset the connection (the bridge reset it, or went away): pass the reset on.
+    let copied = net::splice(&mut visitor, &mut internal, timeouts).await;
+    if let Err(error) = copied {
+        debug!(%error, "forwarded connection ended");
+        // The other machine reset the connection (the bridge reset it, or went away), the visitor did, or it
+        // went quiet: reset both.
         let _ = visitor.set_zero_linger();
         let _ = internal.set_zero_linger();
     }
@@ -493,15 +499,16 @@ async fn splice(accepted: Accepted, mut internal: TcpStream) {
 
 /// Accepts forwarded visitors and control requests from other machines.
 pub async fn serve_internal(listener: TcpListener, service: Service, cluster: Arc<Cluster>) {
+    let mut errors = AcceptErrors::new("internal accept failed");
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) => {
-                warn!(%error, "internal accept failed");
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                errors.failed(error).await;
                 continue;
             }
         };
+        net::keepalive(&stream);
         let service = service.clone();
         let cluster = cluster.clone();
         tokio::spawn(async move {
@@ -539,6 +546,8 @@ async fn internal_connection(
             async move { Ok::<_, std::convert::Infallible>(control(request, service, cluster).await) }
         });
         let _ = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(30))
             .serve_connection(TokioIo::new(io), handler)
             .await;
         return Ok(());

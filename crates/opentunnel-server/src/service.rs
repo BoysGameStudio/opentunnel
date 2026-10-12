@@ -55,6 +55,8 @@ pub struct Inner {
     cluster: std::sync::OnceLock<Arc<Cluster>>,
     /// When refreshing a cached record last failed, Unix ms.
     refresh_failed_at: AtomicU64,
+    /// How long tunnel connections may stay quiet.
+    timeouts: std::sync::OnceLock<crate::net::Timeouts>,
 }
 
 impl std::ops::Deref for Service {
@@ -320,7 +322,16 @@ impl Service {
             pull_through: std::sync::OnceLock::new(),
             cluster: std::sync::OnceLock::new(),
             refresh_failed_at: AtomicU64::new(0),
+            timeouts: std::sync::OnceLock::new(),
         }))
+    }
+
+    pub fn set_timeouts(&self, timeouts: crate::net::Timeouts) {
+        let _ = self.timeouts.set(timeouts);
+    }
+
+    pub fn timeouts(&self) -> crate::net::Timeouts {
+        self.timeouts.get().copied().unwrap_or_default()
     }
 
     pub fn set_cluster(&self, cluster: Arc<Cluster>) {
