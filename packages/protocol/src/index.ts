@@ -1,3 +1,4 @@
+export { ApiRetry } from "./api-retry.js";
 export { BridgeProtocol } from "./bridge-protocol.js";
 export { Certificate } from "./certificate.js";
 export { CSR } from "./csr.js";

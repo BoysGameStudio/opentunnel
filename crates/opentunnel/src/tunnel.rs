@@ -239,6 +239,25 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// A failed bridge upgrade, with the HTTP status and what Cloudflare means by it.
+fn connect_error(error: tokio_tungstenite::tungstenite::Error) -> Error {
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            let status = response.status().as_u16();
+            let body = response
+                .body()
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default();
+            Error::Bridge(format!(
+                "{} (HTTP {status})",
+                crate::protocol::api::status_message(status, &body)
+            ))
+        }
+        error => Error::Bridge(error.to_string()),
+    }
+}
+
 fn backoff(attempt: u32) -> Duration {
     let base = bridge::RECONNECT_BACKOFF_MIN_MS
         .saturating_mul(1 << attempt.min(16))
@@ -321,6 +340,21 @@ mod tests {
         assert!(!super::renewal_due("2099-01-04T23:59:59.000Z"));
         assert!(super::renewal_due("2020-01-04T23:59:59.000Z"));
         assert!(super::renewal_due("not a date"));
+    }
+
+    #[test]
+    fn connect_errors_name_the_status() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(525)
+            .body(Some(b"<html>error code: 525</html>".to_vec()))
+            .unwrap();
+        let error = super::connect_error(tokio_tungstenite::tungstenite::Error::Http(Box::new(
+            response,
+        )));
+        assert_eq!(
+            error.to_string(),
+            "bridge error: Cloudflare 525: the SSL handshake with the server failed (HTTP 525)"
+        );
     }
 }
 
@@ -632,7 +666,7 @@ impl Supervisor {
         );
         let (mut socket, _) = tokio_tungstenite::connect_async(request)
             .await
-            .map_err(|error| Error::Bridge(error.to_string()))?;
+            .map_err(connect_error)?;
         socket
             .send(control(&ClientMessage::Attach {
                 token: self.identity.token.clone(),

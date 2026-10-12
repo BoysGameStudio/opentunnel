@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Option, Schema } from "effect";
+import { ApiRetry } from "../src/api-retry.js";
 import { BridgeProtocol } from "../src/bridge-protocol.js";
 import { Names } from "../src/names.js";
 import { ProxyProtocol } from "../src/proxy-protocol.js";
@@ -15,6 +16,7 @@ describe("spec vectors", async () => {
   const routes = await vector("routes.json");
   const names = await vector("names.json");
   const proxy = await vector("proxy-protocol.json");
+  const retry = await vector("api-retry.json");
 
   test("client control messages", () => {
     for (const message of control.client) {
@@ -69,6 +71,25 @@ describe("spec vectors", async () => {
       const encoded = ProxyProtocol.header(version, peer, sni);
       expect([peer, Buffer.from(encoded).toString("hex")]).toEqual([peer, header]);
       if (text !== undefined) expect(new TextDecoder().decode(encoded)).toBe(text);
+    }
+  });
+
+  test("API retries", () => {
+    expect(retry.backoff).toEqual({
+      base_ms: ApiRetry.RETRY_BASE_MS,
+      max_ms: ApiRetry.RETRY_MAX_MS,
+      retries: ApiRetry.RETRIES,
+    });
+    for (const { attempt, retry_after, min_ms, max_ms } of retry.delays) {
+      expect([attempt, ApiRetry.retryDelayMs(attempt, retry_after)]).toEqual([attempt, [min_ms, max_ms]]);
+    }
+    for (const { status, idempotent, once } of retry.statuses) {
+      expect([status, ApiRetry.retryableStatus(status, "idempotent"), ApiRetry.retryableStatus(status, "once")]).toEqual(
+        [status, idempotent, once],
+      );
+    }
+    for (const { status, body, message } of retry.messages) {
+      expect(ApiRetry.statusMessage(status, body ?? "<html>error page</html>")).toBe(message);
     }
   });
 });

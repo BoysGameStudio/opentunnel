@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::protocol::api::CertificateState;
 use reqwest::Url;
+use tracing::warn;
 
 use crate::api::Api;
 use crate::error::{Error, Result};
@@ -11,6 +12,12 @@ use crate::storage::Storage;
 use crate::tunnel::{Routes, Tunnel};
 
 const CERTIFICATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Whether a certificate expiring at `expiry` (ISO-8601) has expired; an unreadable date counts as expired.
+fn expired(expiry: &str) -> bool {
+    humantime::parse_rfc3339_weak(expiry)
+        .map_or(true, |expiry| expiry <= std::time::SystemTime::now())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvisionStage {
@@ -127,7 +134,16 @@ impl Client {
         let Some(existing) = self.storage.load(profile)? else {
             return self.create(profile, |_| {}).await;
         };
-        let certificate = self.api.certificate(&existing.token, &existing.id).await?;
+        let certificate = match self.api.certificate(&existing.token, &existing.id).await {
+            Ok(certificate) => certificate,
+            // The API is unreachable even after retries: a certificate that has not expired still serves, and a
+            // running tunnel checks for a renewed one itself.
+            Err(error) if error.is_transient() && !expired(&existing.certificate_expiry) => {
+                warn!(%error, "could not check the certificate; using the saved one");
+                return Ok(existing);
+            }
+            Err(error) => return Err(error),
+        };
         match certificate.state {
             // The server renewed the certificate while this machine was offline.
             CertificateState::Ready {
@@ -252,5 +268,57 @@ impl Client {
         self.storage.save(profile, &identity)?;
         progress(ProvisionStage::Ready);
         Ok(identity)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(api: &str) -> Client {
+        let root = std::env::temp_dir().join(format!(
+            "opentunnel-client-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let mut client = Client::new(ClientOptions {
+            api: Some(Url::parse(api).unwrap()),
+            storage: Some(Storage::at(root)),
+        });
+        client.api.retry_scale = 1000;
+        client
+    }
+
+    fn identity(expiry: &str) -> Identity {
+        Identity {
+            id: "demo".into(),
+            hostname: "demo.test".into(),
+            token: "token".into(),
+            private_key: "key".into(),
+            certificate: "certificate".into(),
+            chain: String::new(),
+            certificate_expiry: expiry.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_keeps_a_valid_certificate_while_the_api_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let client = client(&api);
+
+        client
+            .storage
+            .save("default", &identity("2099-01-01T00:00:00.000Z"))
+            .unwrap();
+        let ensured = client.ensure("default").await.unwrap();
+        assert_eq!(ensured.certificate, "certificate");
+
+        client
+            .storage
+            .save("default", &identity("2020-01-01T00:00:00.000Z"))
+            .unwrap();
+        assert!(client.ensure("default").await.is_err());
     }
 }

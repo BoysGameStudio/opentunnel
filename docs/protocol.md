@@ -37,6 +37,33 @@ type CertificateInfo = {
 }
 ```
 
+### Retries and errors
+
+The hosted API sits behind Cloudflare, so a request can fail before it reaches
+the server: Cloudflare answers `520`-`527` with an HTML page (`525`: the TLS
+handshake between Cloudflare and the server failed, for example while a
+machine restarts). Clients retry transient failures with exponential backoff:
+retry `n` (from 0) waits a random time between half of and all of
+`min(250 ms × 2ⁿ, 8 s)`, or `Retry-After` seconds (at most 8 s) when the
+response has one, for at most 6 retries. What counts as transient depends on
+whether the request may be repeated:
+
+| Requests | Retried on |
+| --- | --- |
+| `GET` (tunnel, certificate), `POST /api/tunnel/:id/certificate` (binding the CSR a tunnel already has answers with its current certificate) | network errors, `429`, any `5xx` |
+| `POST /api/tunnel`, `DELETE /api/tunnel/:id` | failures where the request cannot have arrived: no connection, `429`, `503`, `521`, `522`, `523`, `525` |
+
+Every other response fails at once. An error response without a JSON error
+body is reported with its status, and for Cloudflare's codes with their
+meaning: `Cloudflare 525: the SSL handshake with the server failed (HTTP
+525)`. `spec/vectors/api-retry.json` lists the delays, the statuses and the
+messages.
+
+When a client with a saved identity checks its certificate before connecting
+and the check still fails transiently after the retries, it keeps using the
+saved certificate if it has not expired. The bridge WebSocket reconnects with
+its own backoff ([Reconnect](#reconnect)).
+
 ## Provisioning
 
 1. `POST /api/tunnel` returns the tunnel and its token. The token is shown once.

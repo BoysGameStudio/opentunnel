@@ -1,4 +1,6 @@
 import { Cause, Effect, Layer, Queue, Context, Stream } from "effect";
+import { HttpClientError } from "effect/http";
+import { ApiRetry } from "@opentunnel/protocol/api-retry";
 import { CSR } from "@opentunnel/protocol/csr";
 import { Tunnel } from "@opentunnel/protocol/tunnel";
 import { OpenTunnelApiClient } from "./api.js";
@@ -18,8 +20,31 @@ import type {
 import { Tunnel as RunningTunnel, validateRoutes } from "./tunnel.js";
 
 const profileName = (options?: OpenTunnelProfileOptions) => options?.profile ?? "default";
-const clientError = (message: string, cause: unknown) =>
-  new OpenTunnelClientError({ message, cause });
+/** What went wrong with an API call: the HTTP status (and what Cloudflare means by it), the API's error, or the network failure. */
+export const describeApiError = (cause: unknown): string | undefined => {
+  if (HttpClientError.isHttpClientError(cause)) {
+    const response = cause.response;
+    if (!response) return cause.message;
+    const message = ApiRetry.statusMessage(response.status, "");
+    return message.startsWith("HTTP ") ? message : `${message} (HTTP ${response.status})`;
+  }
+  if (typeof cause === "object" && cause !== null) {
+    const { _tag, message } = cause as { _tag?: unknown; message?: unknown };
+    if (typeof _tag === "string" && typeof message === "string") return `${_tag}: ${message}`;
+  }
+  return cause instanceof Error ? cause.message : undefined;
+};
+
+const clientError = (message: string, cause: unknown) => {
+  const detail = describeApiError(cause);
+  return new OpenTunnelClientError({ message: detail ? `${message}: ${detail}` : message, cause });
+};
+
+/** A failure that may pass on its own: the API unreachable, rate limited, or failing on the server side. */
+const isTransient = (cause: unknown) =>
+  HttpClientError.isHttpClientError(cause) &&
+  (cause.reason._tag === "TransportError" ||
+    (cause.response !== undefined && ApiRetry.retryableStatus(cause.response.status, "idempotent")));
 
 const privateKeyPem = (buffer: ArrayBuffer): string => {
   const bytes = new Uint8Array(buffer);
@@ -181,8 +206,15 @@ export class OpenTunnelClient extends Context.Service<
           const certificate = yield* authorized.tunnel["tunnel.getCertificate"]({
             params: { id: Tunnel.ID.make(existing.id) },
           }).pipe(
+            // The API is unreachable even after retries: a certificate that has not expired still serves, and a
+            // running tunnel checks for a renewed one itself.
+            Effect.catchIf(
+              (cause) => isTransient(cause) && existing.certificateExpiry.getTime() > Date.now(),
+              () => Effect.succeed(undefined),
+            ),
             Effect.mapError((cause) => clientError("Failed to read certificate", cause)),
           );
+          if (!certificate) return existing;
           const state = certificate.state;
           // The server renewed the certificate while this machine was offline.
           if (state.type === "ready" && state.certificate !== existing.certificate) {

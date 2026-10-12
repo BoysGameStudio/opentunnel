@@ -1,0 +1,46 @@
+{
+  "backoff": { "base_ms": 250, "max_ms": 8000, "retries": 6 },
+  "delays": [
+    { "attempt": 0, "min_ms": 125, "max_ms": 250 },
+    { "attempt": 1, "min_ms": 250, "max_ms": 500 },
+    { "attempt": 4, "min_ms": 2000, "max_ms": 4000 },
+    { "attempt": 5, "min_ms": 4000, "max_ms": 8000 },
+    { "attempt": 9, "min_ms": 4000, "max_ms": 8000 },
+    { "attempt": 0, "retry_after": "3", "min_ms": 3000, "max_ms": 3000 },
+    { "attempt": 2, "retry_after": "120", "min_ms": 8000, "max_ms": 8000 },
+    { "attempt": 1, "retry_after": "soon", "min_ms": 250, "max_ms": 500 }
+  ],
+  "statuses": [
+    { "status": 200, "idempotent": false, "once": false },
+    { "status": 400, "idempotent": false, "once": false },
+    { "status": 401, "idempotent": false, "once": false },
+    { "status": 404, "idempotent": false, "once": false },
+    { "status": 409, "idempotent": false, "once": false },
+    { "status": 429, "idempotent": true, "once": true },
+    { "status": 500, "idempotent": true, "once": false },
+    { "status": 502, "idempotent": true, "once": false },
+    { "status": 503, "idempotent": true, "once": true },
+    { "status": 504, "idempotent": true, "once": false },
+    { "status": 520, "idempotent": true, "once": false },
+    { "status": 521, "idempotent": true, "once": true },
+    { "status": 522, "idempotent": true, "once": true },
+    { "status": 523, "idempotent": true, "once": true },
+    { "status": 524, "idempotent": true, "once": false },
+    { "status": 525, "idempotent": true, "once": true },
+    { "status": 526, "idempotent": true, "once": false },
+    { "status": 527, "idempotent": true, "once": false }
+  ],
+  "messages": [
+    { "status": 520, "message": "Cloudflare 520: the server returned an unknown error" },
+    { "status": 521, "message": "Cloudflare 521: the server refused the connection" },
+    { "status": 522, "message": "Cloudflare 522: the connection to the server timed out" },
+    { "status": 523, "message": "Cloudflare 523: the server is unreachable" },
+    { "status": 524, "message": "Cloudflare 524: the server did not answer in time" },
+    { "status": 525, "message": "Cloudflare 525: the SSL handshake with the server failed" },
+    { "status": 526, "message": "Cloudflare 526: the server's certificate is invalid" },
+    { "status": 527, "message": "Cloudflare 527: the connection to the server failed" },
+    { "status": 502, "body": "", "message": "HTTP 502" },
+    { "status": 503, "body": "  upstream unavailable\n", "message": "upstream unavailable" },
+    { "status": 404, "body": "<html>\n<body>not here</body>\n</html>", "message": "<html>\n<body>not here</body>\n</html>" }
+  ]
+}

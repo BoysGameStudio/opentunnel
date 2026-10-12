@@ -35,6 +35,18 @@ pub enum Error {
 }
 
 impl Error {
+    /// A failure that may pass on its own: the API unreachable, rate limited, or failing on the server side.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Error::Api { status, .. } => crate::protocol::api::retryable_status(
+                *status,
+                crate::protocol::api::Repeat::Idempotent,
+            ),
+            Error::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn io(context: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
         let context = context.into();
         move |source| Error::Io { context, source }

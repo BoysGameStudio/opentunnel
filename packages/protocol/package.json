@@ -13,6 +13,10 @@
     "dist"
   ],
   "exports": {
+    "./api-retry": {
+      "types": "./dist/api-retry.d.ts",
+      "default": "./dist/api-retry.js"
+    },
     "./bridge-protocol": {
       "types": "./dist/bridge-protocol.d.ts",
       "default": "./dist/bridge-protocol.js"

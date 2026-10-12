@@ -132,3 +132,45 @@ fn route_options() {
         );
     }
 }
+
+#[test]
+fn api_retry() {
+    use opentunnel::protocol::api::{
+        RETRIES, RETRY_BASE_MS, RETRY_MAX_MS, Repeat, retry_delay_ms, retryable_status,
+        status_message,
+    };
+    let retry = vector("api-retry.json");
+    assert_eq!(retry["backoff"]["base_ms"], RETRY_BASE_MS);
+    assert_eq!(retry["backoff"]["max_ms"], RETRY_MAX_MS);
+    assert_eq!(retry["backoff"]["retries"], RETRIES);
+    for case in retry["delays"].as_array().unwrap() {
+        let attempt = case["attempt"].as_u64().unwrap() as u32;
+        let range = retry_delay_ms(attempt, case["retry_after"].as_str());
+        assert_eq!(
+            range,
+            (
+                case["min_ms"].as_u64().unwrap(),
+                case["max_ms"].as_u64().unwrap()
+            ),
+            "{case}"
+        );
+    }
+    for case in retry["statuses"].as_array().unwrap() {
+        let status = case["status"].as_u64().unwrap() as u16;
+        assert_eq!(
+            retryable_status(status, Repeat::Idempotent),
+            case["idempotent"].as_bool().unwrap(),
+            "{case}"
+        );
+        assert_eq!(
+            retryable_status(status, Repeat::Once),
+            case["once"].as_bool().unwrap(),
+            "{case}"
+        );
+    }
+    for case in retry["messages"].as_array().unwrap() {
+        let status = case["status"].as_u64().unwrap() as u16;
+        let body = case["body"].as_str().unwrap_or("<html>error page</html>");
+        assert_eq!(status_message(status, body), case["message"], "{case}");
+    }
+}
