@@ -72,8 +72,9 @@ MySQL 8, in production the PlanetScale database `opentunnel` (org
   (derived from the record for queries), `alarm_at`, `region` (reserved), and
   `local_update`, which is 0 while a row is exactly as imported so a later
   import may refresh it.
-- `jobs`: issuance jobs (`issue`, `renew`, `server`) with attempts, the next
-  run time, and a lease (`lease_owner`, `lease_until`).
+- `jobs`: issuance jobs (`issue`, `renew`, `server`) with a status
+  (`pending`, `done`, `failed`, `abandoned`), attempts, the next run time, and
+  a lease (`lease_owner`, `lease_until`).
 - `server_certificates`: the domain's key, CSR, certificate and expiry.
 - `meta`: the API certificate's current job, and the local test CA when
   `ISSUER=local`.
@@ -123,11 +124,30 @@ Nothing assumes a single writer, so two servers on one database stay correct:
   are repeated a few times, valid authorizations and already finalized orders
   of a reused order are skipped, and a challenge record that already exists in
   Cloudflare is used and deleted like a created one.
+- The CA hands a pending authorization to every new order for its identifier.
+  ZeroSSL's validation sometimes never finishes (the challenge stays
+  `processing`), and such an authorization came back to every attempt for a
+  day. So an attempt answers challenges only after the records propagated,
+  polls the authorizations for up to 60 intervals, and deactivates (RFC 8555
+  §7.5.2) any still pending at its end, whatever the error; an order that
+  arrives with a challenge already in progress or a failed authorization is
+  abandoned for a fresh one (after deactivating the stuck ones). Challenge
+  records, one name shared by a hostname and its wildcard, are deleted only
+  once every answered authorization is valid, invalid or deactivated; if a
+  deactivation fails they are left in place. A failed validation's error
+  (`ACME authorization for <name> ended in invalid: <type>: <detail>`) is
+  logged and recorded; it gets three attempts.
+- A job whose tunnel was deleted or bound another certificate ends as
+  `abandoned` (checked before each attempt and after a failed one), which
+  does not count as a failure.
 - The reconcile also queues again (a compare-and-set from `failed` to
   `pending`) first issuance that gave up early on a transient error, when the
   tunnel is not deleted and still shows that certificate as failed; it shows
   `issuing` again. The requeued job starts a new retry window, so it is
-  requeued at most once.
+  requeued at most once. First issuance queued before the deactivation fix
+  (`AUTHZ_PENDING_FIX_MS`) whose last attempt ended on a pending authorization,
+  failed or still retrying, is likewise queued once more with a fresh window
+  (a job a server is running is left alone).
 - The legacy pull-through import is the same insert-first import, so two
   machines importing one tunnel at once insert it once.
 - The domain's key is created insert-if-absent and its job is requested with a

@@ -53,7 +53,7 @@ const SCHEMA: &[&str] = &[
   kind VARCHAR(16) NOT NULL,
   identifiers TEXT NOT NULL,
   csr TEXT NOT NULL,
-  -- pending, done or failed.
+  -- pending, done, failed or abandoned (no longer wanted).
   status VARCHAR(16) NOT NULL,
   attempts INT NOT NULL DEFAULT 0,
   run_at BIGINT NOT NULL,
@@ -162,11 +162,13 @@ pub struct Job {
     pub created_at: u64,
 }
 
-/// A failed job, for queueing those that failed transiently again.
+/// A failed (or still retrying) job, for queueing those that failed transiently again.
 #[derive(Debug, Clone)]
 pub struct FailedJob {
     pub certificate_id: String,
     pub tunnel_id: Option<String>,
+    /// `failed` or `pending`.
+    pub status: String,
     pub last_error: String,
     pub created_at: u64,
     pub updated_at: u64,
@@ -316,7 +318,20 @@ type ServerCertificateRow = (
     Option<String>,
     Option<String>,
 );
-type FailedJobRow = (String, Option<String>, Option<String>, i64, i64);
+type FailedJobRow = (String, Option<String>, String, Option<String>, i64, i64);
+
+fn failed_job_from_row(
+    (certificate_id, tunnel_id, status, last_error, created_at, updated_at): FailedJobRow,
+) -> FailedJob {
+    FailedJob {
+        certificate_id,
+        tunnel_id,
+        status,
+        last_error: last_error.unwrap_or_default(),
+        created_at: created_at as u64,
+        updated_at: updated_at as u64,
+    }
+}
 type JobRow = (String, Option<String>, String, String, String, i32, i64);
 
 fn job_from_row(row: JobRow) -> Result<Job> {
@@ -971,25 +986,67 @@ impl Store {
     pub async fn failed_issue_jobs(&self, since: u64) -> Result<Vec<FailedJob>> {
         timed("failed_issue_jobs", async {
             let rows: Vec<FailedJobRow> = sqlx::query_as(
-                "SELECT certificate_id, tunnel_id, last_error, created_at, updated_at FROM jobs
+                "SELECT certificate_id, tunnel_id, status, last_error, created_at, updated_at FROM jobs
                  WHERE status = 'failed' AND kind = 'issue' AND updated_at >= ?",
             )
             .bind(since as i64)
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
-            Ok(rows
-                .into_iter()
-                .map(
-                    |(certificate_id, tunnel_id, last_error, created_at, updated_at)| FailedJob {
-                        certificate_id,
-                        tunnel_id,
-                        last_error: last_error.unwrap_or_default(),
-                        created_at: created_at as u64,
-                        updated_at: updated_at as u64,
-                    },
-                )
-                .collect())
+            Ok(rows.into_iter().map(failed_job_from_row).collect())
+        })
+        .await
+    }
+
+    /// First-issuance jobs queued before `before`, failed since `since` or still retrying, whose last attempt
+    /// ended with an ACME authorization still pending.
+    pub async fn authz_pending_issue_jobs(
+        &self,
+        before: u64,
+        since: u64,
+    ) -> Result<Vec<FailedJob>> {
+        timed("authz_pending_issue_jobs", async {
+            let rows: Vec<FailedJobRow> = sqlx::query_as(
+                "SELECT certificate_id, tunnel_id, status, last_error, created_at, updated_at FROM jobs
+                 WHERE kind = 'issue' AND status IN ('failed', 'pending') AND created_at < ? AND updated_at >= ?
+                   AND last_error LIKE '%authorization ended in pending%'",
+            )
+            .bind(before as i64)
+            .bind(since as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+            Ok(rows.into_iter().map(failed_job_from_row).collect())
+        })
+        .await
+    }
+
+    /// Queues a failed or retrying job that was queued before `before` again as if it were new, unless a
+    /// server is running it. It counts as queued at `before` at the earliest, so it is requeued like this once.
+    /// Only one caller wins. Returns whether this one did.
+    pub async fn requeue_job_queued_before(
+        &self,
+        certificate_id: &str,
+        before: u64,
+        now: u64,
+    ) -> Result<bool> {
+        timed("requeue_job_queued_before", async {
+            let requeued = sqlx::query(
+                "UPDATE jobs SET status = 'pending', attempts = 0, run_at = ?, created_at = ?, updated_at = ?,
+                   lease_owner = NULL, lease_until = NULL
+                 WHERE certificate_id = ? AND status IN ('failed', 'pending') AND created_at < ?
+                   AND (lease_until IS NULL OR lease_until < ?)",
+            )
+            .bind(now as i64)
+            .bind(now.max(before) as i64)
+            .bind(now as i64)
+            .bind(certificate_id)
+            .bind(before as i64)
+            .bind(now as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+            Ok(requeued.rows_affected() == 1)
         })
         .await
     }

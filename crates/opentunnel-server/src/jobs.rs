@@ -162,6 +162,9 @@ impl Jobs {
         let kind = job.kind;
         let owner = &self.owner;
         let started = std::time::Instant::now();
+        if !self.wanted(&job).await {
+            return self.abandon(&job, None, started).await;
+        }
         let issue = self
             .issuer
             .issue(&job.identifiers, &job.csr, async |challenge: Challenge| {
@@ -241,6 +244,10 @@ impl Jobs {
             }
             Err(error) => {
                 let reason = format!("{error:#}");
+                // The tunnel was deleted or issued another certificate meanwhile: nobody wants this one.
+                if reason.contains(PERSIST_FAILED) || !self.wanted(&job).await {
+                    return self.abandon(&job, Some(reason), started).await;
+                }
                 let error_class = crate::metrics::error_class(&error);
                 let status = error
                     .chain()
@@ -259,15 +266,6 @@ impl Jobs {
                 );
                 crate::metrics::acme_failure(kind.as_str(), error_class);
                 let attempts = job.attempts + 1;
-                if reason.contains(PERSIST_FAILED) {
-                    crate::metrics::acme_attempt(kind.as_str(), "abandoned", started.elapsed());
-                    // The tunnel was deleted or issued another certificate meanwhile.
-                    return service
-                        .store
-                        .finish_job(&job.certificate_id, owner, "failed", Some(reason), now)
-                        .await
-                        .map(drop);
-                }
                 let class = retry::classify(&error);
                 if let Some(at) = retry::next_attempt(
                     class,
@@ -313,6 +311,52 @@ impl Jobs {
                     .map(drop)
             }
         }
+    }
+
+    /// Whether the job's tunnel still waits for its certificate. When that cannot be read, it is assumed to.
+    async fn wanted(&self, job: &Job) -> bool {
+        let (JobKind::Issue | JobKind::Renew, Some(tunnel)) = (&job.kind, &job.tunnel_id) else {
+            return true;
+        };
+        match self
+            .service
+            .wants_certificate(tunnel, &job.certificate_id)
+            .await
+        {
+            Ok(wanted) => wanted,
+            Err(error) => {
+                warn!(%error, tunnel, certificate = %job.certificate_id, "checking whether a certificate is still wanted failed");
+                true
+            }
+        }
+    }
+
+    /// Ends a job nobody wants any more (its tunnel was deleted or bound another certificate) without counting
+    /// it as a failure.
+    async fn abandon(
+        &self,
+        job: &Job,
+        reason: Option<String>,
+        started: std::time::Instant,
+    ) -> Result<()> {
+        crate::metrics::acme_attempt(job.kind.as_str(), "abandoned", started.elapsed());
+        info!(
+            certificate = %job.certificate_id,
+            tunnel = job.tunnel_id.as_deref(),
+            kind = job.kind.as_str(),
+            "certificate is no longer wanted; abandoning its issuance"
+        );
+        self.service
+            .store
+            .finish_job(
+                &job.certificate_id,
+                &self.owner,
+                "abandoned",
+                reason,
+                self.service.now(),
+            )
+            .await
+            .map(drop)
     }
 }
 

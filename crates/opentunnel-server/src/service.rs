@@ -33,6 +33,9 @@ pub const RENEWAL_STALE_MS: u64 = DAY_MS;
 pub const ORPHAN_MAX_AGE_MS: u64 = 2 * DAY_MS;
 /// Issuance that failed transiently is queued again only when it failed less than this long ago.
 pub const RETRY_FAILED_MAX_AGE_MS: u64 = 7 * DAY_MS;
+/// 2026-10-14T06:00:00Z, after attempts started deactivating authorizations left pending. First issuance queued
+/// before then that ended on a pending authorization is queued once more.
+pub const AUTHZ_PENDING_FIX_MS: u64 = 1_791_957_600_000;
 /// A bridge silent for this long is gone: its client pings every heartbeat and gives up after the idle timeout.
 pub const STALE_BRIDGE_MS: u64 = IDLE_TIMEOUT_MS + HEARTBEAT_MS;
 /// After a failed refresh, cached records are used without asking the database for this long.
@@ -851,6 +854,20 @@ impl Service {
         Ok(true)
     }
 
+    /// Whether the tunnel still waits for certificate `certificate_id`: it exists, is not deleted, and the
+    /// certificate is its current one or its renewal.
+    pub async fn wants_certificate(&self, tunnel_id: &str, certificate_id: &str) -> Result<bool> {
+        let entry = self.entry(tunnel_id);
+        let state = self.lock_fresh(&entry).await?;
+        Ok(state.record().is_some_and(|record| {
+            record.certificate_id.as_deref() == Some(certificate_id)
+                || record
+                    .renewal
+                    .as_ref()
+                    .is_some_and(|renewal| renewal.certificate_id == certificate_id)
+        }))
+    }
+
     async fn set_alarm(&self, id: &str, at: Option<u64>) -> Result<()> {
         self.store.set_alarm(id, at).await?;
         self.alarms.notify_one();
@@ -1001,9 +1018,14 @@ impl Service {
     /// transient errors were retried for a day) and the tunnel still waits for that certificate. The tunnel shows
     /// `issuing` again, so clients that poll it see it become ready. A job requeued like this starts a new retry
     /// window, so it is requeued at most once.
+    ///
+    /// Also queues first issuance again, once, that was queued before `AUTHZ_PENDING_FIX_MS` and failed or keeps
+    /// failing with an ACME authorization still pending: ZeroSSL reused a stuck authorization for every attempt,
+    /// which attempts now deactivate.
     pub async fn retry_failed_issuance(&self) -> Result<usize> {
         let now = self.now();
         let mut requeued = 0;
+        let mut seen = std::collections::HashSet::new();
         for job in self
             .store
             .failed_issue_jobs(now.saturating_sub(RETRY_FAILED_MAX_AGE_MS))
@@ -1052,6 +1074,56 @@ impl Service {
             // Should this fail, the job still runs and records the certificate when it is ready.
             if let Err(error) = self.save(&mut state, issuing).await {
                 warn!(tunnel, %error, "failed to show requeued issuance as issuing");
+            }
+            seen.insert(job.certificate_id.clone());
+            requeued += 1;
+        }
+        for job in self
+            .store
+            .authz_pending_issue_jobs(
+                AUTHZ_PENDING_FIX_MS,
+                now.saturating_sub(RETRY_FAILED_MAX_AGE_MS),
+            )
+            .await?
+        {
+            if seen.contains(&job.certificate_id) {
+                continue;
+            }
+            let Some(tunnel) = &job.tunnel_id else {
+                continue;
+            };
+            let entry = self.entry(tunnel);
+            let mut state = self.lock_fresh(&entry).await?;
+            let Some(record) = state.record().cloned() else {
+                continue;
+            };
+            let waiting = record.certificate_id.as_deref() == Some(&job.certificate_id)
+                && record.certificate.as_ref().is_some_and(|certificate| {
+                    certificate.id == job.certificate_id
+                        && !matches!(certificate.state, CertificateState::Ready { .. })
+                });
+            if !waiting
+                || !self
+                    .store
+                    .requeue_job_queued_before(&job.certificate_id, AUTHZ_PENDING_FIX_MS, now)
+                    .await?
+            {
+                continue;
+            }
+            info!(tunnel, certificate = %job.certificate_id, status = %job.status, reason = %job.last_error, "retrying certificate issuance stuck on a pending authorization");
+            if record.certificate.as_ref().is_some_and(|certificate| {
+                matches!(certificate.state, CertificateState::Failed { .. })
+            }) {
+                let issuing = StoredTunnel {
+                    certificate: Some(CertificateInfo {
+                        id: job.certificate_id.clone(),
+                        state: CertificateState::Issuing,
+                    }),
+                    ..record
+                };
+                if let Err(error) = self.save(&mut state, issuing).await {
+                    warn!(tunnel, %error, "failed to show requeued issuance as issuing");
+                }
             }
             requeued += 1;
         }
@@ -2130,5 +2202,138 @@ mod tests {
         harness.service.invalidate("noncenonce01").await;
         assert_eq!(harness.service.retry_failed_issuance().await.unwrap(), 0);
         assert!(!store.job_pending("cert_nonce").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn queues_issuance_stuck_on_a_pending_authorization_again_once() {
+        let Some(harness) = Harness::new().await else {
+            return;
+        };
+        let store = &harness.service.store;
+        let base = harness.tunnel(T0 + 80 * DAY_MS, None).await;
+        const PENDING: &str = "ACME authorization ended in pending";
+        let queued = AUTHZ_PENDING_FIX_MS - DAY_MS;
+        // A job queued before the fix whose attempts ended on a pending authorization: `failed` gave up after its
+        // retry window, otherwise it is still retrying (and maybe running).
+        let stuck = async |id: &str, state: CertificateState, status: &str, queued: u64| {
+            let mut record = base.clone();
+            record.id = id.into();
+            let certificate = format!("cert_{id}");
+            record.certificate_id = Some(certificate.clone());
+            record.certificate = Some(CertificateInfo {
+                id: certificate.clone(),
+                state,
+            });
+            store.put_tunnel(&record, T0).await.unwrap();
+            let job = Job {
+                certificate_id: certificate.clone(),
+                tunnel_id: Some(id.into()),
+                kind: JobKind::Issue,
+                identifiers: vec![record.hostname.clone()],
+                csr: "CSR".into(),
+                attempts: 0,
+                created_at: queued,
+            };
+            store.add_job(job, queued).await.unwrap();
+            let updated = T0 - HOUR_MS;
+            store
+                .claim_job(&certificate, "old", updated)
+                .await
+                .unwrap()
+                .unwrap();
+            if status == "failed" {
+                store
+                    .finish_job(&certificate, "old", "failed", Some(PENDING.into()), updated)
+                    .await
+                    .unwrap();
+            } else {
+                store
+                    .retry_job(&certificate, "old", 30, T0, PENDING.into(), updated)
+                    .await
+                    .unwrap();
+            }
+            if status == "running" {
+                store
+                    .claim_job(&certificate, "busy", T0)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            certificate
+        };
+        let failed = || CertificateState::Failed {
+            reason: PENDING.into(),
+        };
+        let challenge = || CertificateState::Challenge {
+            token: "t".into(),
+            key: "k".into(),
+        };
+        let gave_up = stuck("gaveup000000", failed(), "failed", queued).await;
+        let retrying = stuck("retrying0000", challenge(), "pending", queued).await;
+        let running = stuck("running00000", challenge(), "running", queued).await;
+        let after_fix = stuck(
+            "afterfix0000",
+            failed(),
+            "failed",
+            AUTHZ_PENDING_FIX_MS + HOUR_MS,
+        )
+        .await;
+        let ready = stuck(
+            "readynow0000",
+            base.certificate.clone().unwrap().state,
+            "failed",
+            queued,
+        )
+        .await;
+        let deleted = stuck("deleted00000", failed(), "failed", queued).await;
+        let mut record = store.tunnel("deleted00000").await.unwrap().unwrap().record;
+        record.deleted_at = Some(iso(T0));
+        store.put_tunnel(&record, T0).await.unwrap();
+
+        assert_eq!(harness.service.retry_failed_issuance().await.unwrap(), 2);
+        let record = store.tunnel("gaveup000000").await.unwrap().unwrap().record;
+        assert_eq!(record.certificate.unwrap().state, CertificateState::Issuing);
+        let record = store.tunnel("retrying0000").await.unwrap().unwrap().record;
+        assert_eq!(record.certificate.unwrap().state, challenge());
+        let due = store
+            .claim_due_jobs("new", harness.service.now(), 10)
+            .await
+            .unwrap();
+        let mut ids: Vec<_> = due.iter().map(|job| job.certificate_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, [gave_up.clone(), retrying.clone()]);
+        assert!(
+            due.iter()
+                .all(|job| job.attempts == 0 && job.created_at == T0)
+        );
+        for certificate in [&after_fix, &ready, &deleted] {
+            assert!(!store.job_pending(certificate).await.unwrap());
+        }
+        // The running one is left to finish; it is not taken from its server.
+        assert!(store.job_pending(&running).await.unwrap());
+        store
+            .finish_job(&running, "busy", "done", None, T0)
+            .await
+            .unwrap();
+
+        // Once only: they fail again on a pending authorization after their retry window, and stay failed.
+        harness.advance(retry::RETRY_WINDOW_MS);
+        let now = harness.service.now();
+        for certificate in [&gave_up, &retrying] {
+            store
+                .finish_job(certificate, "new", "failed", Some(PENDING.into()), now)
+                .await
+                .unwrap();
+        }
+        let mut record = store.tunnel("gaveup000000").await.unwrap().unwrap().record;
+        record.certificate = Some(CertificateInfo {
+            id: gave_up.clone(),
+            state: failed(),
+        });
+        store.put_tunnel(&record, now).await.unwrap();
+        harness.service.invalidate("gaveup000000").await;
+        assert_eq!(harness.service.retry_failed_issuance().await.unwrap(), 0);
+        assert!(!store.job_pending(&gave_up).await.unwrap());
+        assert!(!store.job_pending(&retrying).await.unwrap());
     }
 }

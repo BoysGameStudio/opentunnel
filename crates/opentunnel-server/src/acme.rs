@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::crypto::{base64url, decode_base64url};
 use crate::dns::{DnsProvider, TxtRecord, wait_for_propagation};
@@ -94,6 +94,45 @@ struct AcmeChallenge {
     token: String,
     #[serde(default)]
     status: String,
+    /// Why validation failed (RFC 8555 section 8), a problem document.
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+impl Authorization {
+    fn dns_challenge(&self) -> Option<&AcmeChallenge> {
+        self.challenges
+            .iter()
+            .find(|challenge| challenge.kind == "dns-01")
+    }
+
+    /// The CA's reasons for failed validation, from the challenges' error documents.
+    fn error_detail(&self) -> String {
+        self.challenges
+            .iter()
+            .filter_map(|challenge| challenge.error.as_ref())
+            .map(|error| {
+                let kind = error["type"].as_str().unwrap_or_default();
+                let detail = error["detail"].as_str().unwrap_or_default();
+                match (kind.is_empty(), detail.is_empty()) {
+                    (false, false) => format!("{kind}: {detail}"),
+                    (true, true) => error.to_string(),
+                    _ => format!("{kind}{detail}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// A pending authorization this attempt answers.
+struct Pending {
+    url: String,
+    identifier: String,
+    challenge_url: String,
+    token: String,
+    /// The TXT record value.
+    value: String,
 }
 
 struct Key {
@@ -140,6 +179,10 @@ impl Transient {
 const REQUEST_TRIES: u32 = 3;
 /// The pause before repeating such a request, doubled each time.
 const REQUEST_RETRY_PAUSE: Duration = Duration::from_millis(500);
+/// Reads of the answered authorizations, `authorization_poll` apart, before giving up on them.
+const AUTHORIZATION_POLLS: u32 = 60;
+/// Orders per attempt: one more after abandoning an order whose authorizations an earlier attempt left unusable.
+const ORDERS: u32 = 2;
 
 impl Acme {
     pub fn new(config: AcmeConfig, http: reqwest::Client, dns: Option<DnsProvider>) -> Self {
@@ -196,63 +239,40 @@ impl Acme {
             session.kid = Some(location);
         }
 
-        let identifiers_json: Vec<Value> = identifiers
-            .iter()
-            .map(|value| json!({ "type": "dns", "value": value }))
-            .collect();
-        let response = session
-            .post(
-                &directory.new_order,
-                Some(&json!({ "identifiers": identifiers_json })),
-            )
-            .await?;
-        let order_url = header(&response.headers, LOCATION)
-            .ok_or_else(|| anyhow!("ACME order has no location URL"))?;
-        let order: Order = parse(&response.body, "order")?;
-
-        // The CA may hand back an order or authorizations from an earlier attempt: valid ones are skipped.
-        let mut pending = Vec::new();
-        for url in &order.authorizations {
-            let authorization: Authorization =
-                parse(&session.get(url).await?.body, "authorization")?;
-            match &authorization.status[..] {
-                "valid" => continue,
-                "pending" => {}
-                status => bail!("ACME authorization ended in {status}"),
-            }
-            let challenge = authorization
-                .challenges
-                .into_iter()
-                .find(|challenge| challenge.kind == "dns-01")
-                .ok_or_else(|| anyhow!("ACME server did not offer dns-01"))?;
-            let key_authorization = format!("{}.{}", challenge.token, key.thumbprint);
-            let value = base64url(
-                ring::digest::digest(&ring::digest::SHA256, key_authorization.as_bytes()).as_ref(),
-            );
-            pending.push((
-                url.clone(),
-                challenge,
-                value,
-                authorization.identifier.value,
-            ));
-        }
-        if let Some((_, challenge, value, _)) = pending.first() {
+        let (order_url, pending) = place_order(
+            &mut session,
+            &directory.new_order,
+            identifiers,
+            &key.thumbprint,
+        )
+        .await?;
+        if let Some(first) = pending.first() {
             on_challenge(Challenge {
-                token: challenge.token.clone(),
-                key: value.clone(),
+                token: first.token.clone(),
+                key: first.value.clone(),
             })
             .await?;
         }
 
         // A hostname and its wildcard share one record name, and may share a token (so one value).
         let mut wanted: Vec<(String, String)> = Vec::new();
-        for (_, _, value, hostname) in &pending {
-            let name = format!("_acme-challenge.{}", hostname.trim_start_matches("*."));
-            if !wanted.iter().any(|(n, v)| *n == name && v == value) {
-                wanted.push((name, value.clone()));
+        for authorization in &pending {
+            let name = format!(
+                "_acme-challenge.{}",
+                authorization.identifier.trim_start_matches("*.")
+            );
+            if !wanted
+                .iter()
+                .any(|(n, v)| *n == name && *v == authorization.value)
+            {
+                wanted.push((name, authorization.value.clone()));
             }
         }
         let mut records: Vec<TxtRecord> = Vec::new();
+        // Authorizations whose challenge was (or may have been) answered and that have not reached a final
+        // state. The CA may still be checking their records, so those stay published until each one is valid,
+        // invalid or deactivated.
+        let mut unsettled: Vec<&Pending> = Vec::new();
         let result = async {
             for (name, value) in &wanted {
                 records.push(
@@ -262,28 +282,63 @@ impl Acme {
                 );
             }
             wait_for_propagation(&self.http, &records, self.config.dns_propagation_timeout).await;
-            for (url, challenge, _, _) in &pending {
-                // Answering a challenge the CA is already validating is at best a no-op.
-                if challenge.status.is_empty() || challenge.status == "pending" {
-                    session.post(&challenge.url, Some(&json!({}))).await?;
-                }
-                let mut authorization: Authorization =
-                    parse(&session.get(url).await?.body, "authorization")?;
-                for _ in 0..30 {
-                    if authorization.status != "pending" {
-                        break;
+            for authorization in &pending {
+                unsettled.push(authorization);
+                session
+                    .post(&authorization.challenge_url, Some(&json!({})))
+                    .await?;
+            }
+            let mut polls = 0;
+            loop {
+                let mut index = 0;
+                while index < unsettled.len() {
+                    let current = unsettled[index];
+                    let authorization: Authorization =
+                        parse(&session.get(&current.url).await?.body, "authorization")?;
+                    match &authorization.status[..] {
+                        "valid" => {
+                            unsettled.remove(index);
+                        }
+                        "pending" => index += 1,
+                        status => {
+                            unsettled.remove(index);
+                            let detail = authorization.error_detail();
+                            warn!(
+                                identifier = %current.identifier,
+                                authorization = %current.url,
+                                status,
+                                error = %detail,
+                                "ACME authorization failed"
+                            );
+                            // Other pending authorizations are deactivated below; the next attempt starts over.
+                            if detail.is_empty() {
+                                bail!(
+                                    "ACME authorization for {} ended in {status}",
+                                    current.identifier
+                                );
+                            }
+                            bail!(
+                                "ACME authorization for {} ended in {status}: {detail}",
+                                current.identifier
+                            );
+                        }
                     }
-                    tokio::time::sleep(self.config.authorization_poll).await;
-                    authorization = parse(&session.get(url).await?.body, "authorization")?;
                 }
-                match &authorization.status[..] {
-                    "valid" => {}
-                    // The next attempt's order picks the same authorization up again.
-                    "pending" => {
-                        return Err(Transient::new("ACME authorization ended in pending").into());
+                if unsettled.is_empty() {
+                    break;
+                }
+                polls += 1;
+                if polls > AUTHORIZATION_POLLS {
+                    for current in &unsettled {
+                        warn!(
+                            identifier = %current.identifier,
+                            authorization = %current.url,
+                            "ACME authorization still pending; deactivating it so the next attempt gets a new one"
+                        );
                     }
-                    status => bail!("ACME authorization ended in {status}"),
+                    return Err(Transient::new("ACME authorization ended in pending").into());
                 }
+                tokio::time::sleep(self.config.authorization_poll).await;
             }
 
             let mut order: Order = parse(&session.get(&order_url).await?.body, "order")?;
@@ -329,13 +384,138 @@ impl Acme {
             Ok(issued)
         }
         .await;
-        for record in &records {
-            dns.delete_txt(record).await;
+        // An authorization left pending is handed to the next order as it is, its challenge possibly stuck in
+        // `processing` for good (ZeroSSL), so it is deactivated (RFC 8555 section 7.5.2) and the next attempt
+        // gets a new one. Its records are deleted only once the CA can no longer be checking them.
+        let mut settled = true;
+        for authorization in &unsettled {
+            if let Err(error) = deactivate(&mut session, &authorization.url).await {
+                warn!(
+                    error = %format!("{error:#}"),
+                    identifier = %authorization.identifier,
+                    authorization = %authorization.url,
+                    "deactivating an ACME authorization failed; keeping its challenge records"
+                );
+                settled = false;
+            }
+        }
+        if settled {
+            for record in &records {
+                dns.delete_txt(record).await;
+            }
         }
         if result.is_ok() {
             info!(identifiers = ?identifiers, "certificate issued");
         }
         result
+    }
+}
+
+/// Places an order and reads its authorizations: the order's URL and the pending ones to answer. The CA hands
+/// back authorizations from earlier orders for the same identifiers: valid ones are skipped, and an order with
+/// one that cannot succeed (a challenge an earlier attempt answered whose validation never finished, or a failed
+/// authorization) is abandoned for a fresh one, after deactivating the stuck ones so they are not reused.
+async fn place_order(
+    session: &mut Session<'_>,
+    new_order: &str,
+    identifiers: &[String],
+    thumbprint: &str,
+) -> Result<(String, Vec<Pending>)> {
+    let identifiers: Vec<Value> = identifiers
+        .iter()
+        .map(|value| json!({ "type": "dns", "value": value }))
+        .collect();
+    for _ in 0..ORDERS {
+        let response = session
+            .post(new_order, Some(&json!({ "identifiers": identifiers })))
+            .await?;
+        let order_url = header(&response.headers, LOCATION)
+            .ok_or_else(|| anyhow!("ACME order has no location URL"))?;
+        let order: Order = parse(&response.body, "order")?;
+        let mut pending = Vec::new();
+        let mut stale = Vec::new();
+        let mut usable = true;
+        for url in &order.authorizations {
+            let authorization: Authorization =
+                parse(&session.get(url).await?.body, "authorization")?;
+            let identifier = authorization.identifier.value.clone();
+            match &authorization.status[..] {
+                "valid" => continue,
+                "pending" => {}
+                status => {
+                    // invalid, deactivated, expired or revoked: the order cannot become ready.
+                    warn!(
+                        %identifier,
+                        authorization = %url,
+                        status,
+                        error = %authorization.error_detail(),
+                        "ACME order has a failed authorization; placing a new order"
+                    );
+                    usable = false;
+                    continue;
+                }
+            }
+            let challenge = authorization
+                .dns_challenge()
+                .ok_or_else(|| anyhow!("ACME server did not offer dns-01"))?;
+            // Each attempt settles the challenges it answers or deactivates their authorizations, so one being
+            // validated now was left by an attempt that was cut off, or by an older version of this server; such
+            // validation may never finish, and the CA keeps handing the authorization out until it is deactivated.
+            if !(challenge.status.is_empty() || challenge.status == "pending") {
+                warn!(
+                    %identifier,
+                    authorization = %url,
+                    challenge = %challenge.status,
+                    error = %authorization.error_detail(),
+                    "ACME authorization was left with a challenge in progress; deactivating it"
+                );
+                stale.push(url.clone());
+                usable = false;
+                continue;
+            }
+            let key_authorization = format!("{}.{thumbprint}", challenge.token);
+            let value = base64url(
+                ring::digest::digest(&ring::digest::SHA256, key_authorization.as_bytes()).as_ref(),
+            );
+            pending.push(Pending {
+                url: url.clone(),
+                identifier,
+                challenge_url: challenge.url.clone(),
+                token: challenge.token.clone(),
+                value,
+            });
+        }
+        if usable {
+            return Ok((order_url, pending));
+        }
+        // Its unanswered authorizations are fine for the next order.
+        for url in &stale {
+            deactivate(session, url).await?;
+        }
+    }
+    Err(Transient::new("ACME server kept handing out authorizations that cannot succeed").into())
+}
+
+/// Deactivates an authorization (RFC 8555 section 7.5.2) so the CA stops validating it and hands out a new one.
+/// One that reached a final state meanwhile needs nothing.
+async fn deactivate(session: &mut Session<'_>, url: &str) -> Result<()> {
+    match session
+        .post(url, Some(&json!({ "status": "deactivated" })))
+        .await
+    {
+        Ok(_) => {
+            info!(authorization = %url, "deactivated an ACME authorization");
+            Ok(())
+        }
+        Err(error) => {
+            let authorization: Authorization =
+                parse(&session.get(url).await?.body, "authorization")?;
+            if authorization.status == "pending" {
+                Err(error.context("deactivating an ACME authorization"))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
