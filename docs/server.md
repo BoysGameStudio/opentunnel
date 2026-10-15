@@ -346,7 +346,7 @@ strips it.)
 
 ## Multiple regions
 
-Ten machines, one in each of `iad`, `ord`, `sjc`, `gru`, `lhr`, `fra`, `bom`,
+Eleven machines, one in each of `iad`, `ord`, `sjc`, `gru`, `lhr`, `fra`, `cdg`, `jnb`,
 `sin`, `nrt` and `syd`, behind one anycast IPv4/IPv6. Fly sends each TCP
 connection to the nearest machine: a visitor to the one nearest the visitor,
 and a client's bridge (through Cloudflare, which proxies `opentunnel.xyz`) to
@@ -424,7 +424,7 @@ few queries.
 fly secrets set --app opentunnel --stage INTERNAL_TOKEN=$(openssl rand -hex 32)
 fly deploy --app opentunnel                  # blue-green: new machines next to the old ones, then the old ones stop
 fly scale vm shared-cpu-1x --memory 1024 --app opentunnel   # if existing machines kept the old size
-for region in ord sjc gru lhr fra bom sin nrt syd; do
+for region in ord sjc gru lhr fra cdg jnb sin nrt syd; do
   fly scale count 1 --region $region --app opentunnel --yes
 done                                         # or: fly machine clone <iad machine> --region <region>
 fly status --app opentunnel                  # ten machines, one per region, all passing checks
