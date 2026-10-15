@@ -32,6 +32,11 @@ pub struct Config {
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     pub database_url: Option<String>,
 
+    /// Connections per machine. Every attach and API call holds one for a round trip to the database, which is
+    /// slow from regions far from it, so reconnect bursts need room.
+    #[arg(long, env = "DATABASE_POOL_SIZE", default_value_t = 50)]
+    pub database_pool_size: u32,
+
     /// The built website (`vite build` output).
     #[arg(long, env = "WEBSITE_DIR", default_value = "/app/website")]
     pub website_dir: PathBuf,

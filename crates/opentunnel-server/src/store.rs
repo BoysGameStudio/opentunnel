@@ -349,8 +349,8 @@ fn job_from_row(row: JobRow) -> Result<Job> {
 
 impl Store {
     /// A pool that connects on demand, so a database that is down at startup only delays it.
-    pub fn connect(url: &str) -> Result<Self> {
-        Self::connect_with(url, 10)
+    pub fn connect(url: &str, max_connections: u32) -> Result<Self> {
+        Self::connect_with(url, max_connections)
     }
 
     fn connect_with(url: &str, max_connections: u32) -> Result<Self> {
@@ -359,17 +359,18 @@ impl Store {
             .max_connections(max_connections)
             .min_connections(1)
             .acquire_timeout(Duration::from_secs(5))
-            .idle_timeout(Duration::from_secs(5 * 60))
+            // Shorter than PlanetScale's idle cutoff, so pooled connections are rarely dead. Pinging before every
+            // acquire would double each query's round trip from regions far from the database.
+            .idle_timeout(Duration::from_secs(60))
             .max_lifetime(Duration::from_secs(30 * 60))
-            // A connection the server or a proxy dropped is noticed and replaced before use.
-            .test_before_acquire(true)
+            .test_before_acquire(false)
             .connect_lazy_with(options);
         Ok(Self { pool })
     }
 
     /// Connects and migrates, failing if the database is unavailable (the CLI's import and export).
     pub async fn open(url: &str) -> Result<Self> {
-        let store = Self::connect(url)?;
+        let store = Self::connect_with(url, 2)?;
         store.migrate().await?;
         Ok(store)
     }

@@ -68,7 +68,7 @@ impl Server {
             .as_deref()
             .filter(|url| !url.is_empty())
             .context("DATABASE_URL is not set")?;
-        let store = Store::connect(url)?;
+        let store = Store::connect(url, config.database_pool_size)?;
         store.wait_ready().await?;
         Self::with_store(config, clock, store).await
     }
