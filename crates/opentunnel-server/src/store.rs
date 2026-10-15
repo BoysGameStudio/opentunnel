@@ -355,7 +355,9 @@ async fn timed_within<T>(
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     let started = std::time::Instant::now();
-    let result = match tokio::time::timeout(limit, future).await {
+    // Boxed, so the futures of callers that make many storage calls stay shallow enough for the compiler's
+    // layout computation in release builds.
+    let result = match tokio::time::timeout(limit, Box::pin(future)).await {
         Ok(result) => result,
         Err(_) => Err(anyhow!("storage timed out").context("storage unavailable")),
     };
