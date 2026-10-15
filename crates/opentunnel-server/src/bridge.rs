@@ -94,7 +94,12 @@ pub async fn run<S>(
     let (sink, stream) = socket.split();
     let cancel = bridge.cancel.clone();
     let mut writer = tokio::spawn(write(sink, rx, cancel.clone()));
-    let (code, clean) = read(&service, &tunnel_id, &bridge, stream).await;
+    let mut followup = None;
+    let (code, clean) = read(&service, &tunnel_id, &bridge, stream, &mut followup).await;
+    // The attach's registry write lands before the removal is queued.
+    if let Some(followup) = followup {
+        let _ = followup.await;
+    }
     if let Err(error) = service
         .bridge_closed(&tunnel_id, &bridge, code, clean)
         .await
@@ -162,6 +167,7 @@ async fn read<S>(
     tunnel_id: &str,
     bridge: &Arc<Bridge>,
     mut stream: futures_util::stream::SplitStream<WebSocketStream<S>>,
+    followup: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> (u16, bool)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -215,7 +221,8 @@ where
                     continue;
                 };
                 if !attached {
-                    attached = attach(service, tunnel_id, bridge, &control).await;
+                    *followup = attach(service, tunnel_id, bridge, &control).await;
+                    attached = followup.is_some();
                     continue;
                 }
                 handle_control(service, tunnel_id, bridge, &control).await;
@@ -229,17 +236,18 @@ async fn send(bridge: &Bridge, message: Outbound) {
     let _ = bridge.tx.send(message).await;
 }
 
-/// Handles the first control message. Returns whether the bridge attached.
+/// Handles the first control message. Once the bridge attached, returns the task doing the attach's
+/// bookkeeping, which runs while the session goes on.
 async fn attach(
     service: &Service,
     tunnel_id: &str,
     bridge: &Arc<Bridge>,
     control: &serde_json::Map<String, Value>,
-) -> bool {
+) -> Option<tokio::task::JoinHandle<()>> {
     let (Some("attach"), Some(token)) = (control["type"].as_str(), control["token"].as_str())
     else {
         bridge.close(1008, "attach required");
-        return false;
+        return None;
     };
     let routes = match control.get("routes") {
         Some(Value::Array(routes)) => {
@@ -262,7 +270,11 @@ async fn attach(
         .attach(tunnel_id, bridge, token, routes, max_conns)
         .await
     {
-        Ok(Attach::Attached { session, routes }) => {
+        Ok(Attach::Attached {
+            session,
+            routes,
+            followup,
+        }) => {
             crate::metrics::bridge_attach("ok");
             send(
                 bridge,
@@ -275,19 +287,24 @@ async fn attach(
                 .message(),
             )
             .await;
-            true
+            let service = service.clone();
+            let tunnel_id = tunnel_id.to_owned();
+            let bridge = bridge.clone();
+            Some(tokio::spawn(async move {
+                service.after_attach(&tunnel_id, &bridge, followup).await;
+            }))
         }
         Ok(Attach::Error(code, reason)) => {
             crate::metrics::bridge_attach(code);
             send(bridge, ServerControl::AttachError { code }.message()).await;
             bridge.close(1008, reason);
-            false
+            None
         }
         Err(error) => {
             crate::metrics::bridge_attach("error");
             warn!(%error, tunnel = %tunnel_id, "attach failed");
             bridge.close(1011, "internal error");
-            false
+            None
         }
     }
 }

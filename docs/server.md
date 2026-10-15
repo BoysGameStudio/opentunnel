@@ -56,7 +56,10 @@ visitor ──TLS──▶ :443 ─┬─ SNI <route>.<id>.opentunnel.xyz ─▶
 Two things changed by necessity: analytics no longer carry `country` and
 `colo` (they came from Cloudflare's request metadata), and a tunnel's `state`
 in the API is computed from live bridges, so it is never stale after a
-restart.
+restart. The stored record's `state` is only informational: an attach sets it
+`online` together with `lastConnectedAt` (written at most hourly per tunnel),
+and closing bridges leave it as it is, so reconnecting clients do not rewrite
+their record.
 
 ## Storage
 
@@ -153,10 +156,11 @@ Nothing assumes a single writer, so two servers on one database stay correct:
 - The domain's key is created insert-if-absent and its job is requested with a
   compare-and-set on `meta`.
 
-When the database is unavailable the server keeps running: the pool (10
-connections, 5 s acquire timeout, connections checked before use and
-recycled after 30 minutes) reconnects on its own, every statement gives up
-after 10 s, and API calls that need storage answer 503
+When the database is unavailable the server keeps running: the pool
+(`DATABASE_POOL_SIZE` connections, 50 by default, 8 kept open while idle, a
+3 s acquire timeout, no check before use, idle ones closed after a minute and
+all recycled after 30 minutes) reconnects on its own, every statement gives up
+after 10 s (an attach's read after 4 s), and API calls that need storage answer 503
 (`{"_tag":"ServiceUnavailableError","message":"storage unavailable"}`). Tunnels
 with an attached bridge keep their record in memory, so visitor traffic and
 token checks for them never touch the database; a bridge that attaches during
@@ -395,6 +399,31 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─▶ bridge attached, rows in 
   a `route_conflict`, so a crashed or draining machine's leftover rows never
   block a client that moved. Two machines accepting the same route in the same
   instant is possible; visitors then go to the newer row and nothing breaks.
+- **Round trips.** Machines far from the database (~150 ms from `nrt`,
+  `syd`) pay for every sequential statement, so the paths clients wait on take
+  as few as possible. An attach reads the record, its renewal alarm and the
+  tunnel's live registry rows on other machines in one query (sent as a plain
+  text query, so it is one round trip even on a pooled connection that has
+  not prepared it), checks route conflicts from those rows (asking another
+  machine only when it has a row for a requested route), and answers
+  `attached`. The rest runs afterwards, side by side and without failing the
+  attach: the registry upsert, `lastConnectedAt` (at most hourly) and the
+  renewal check. A visitor on another machine in the round trip before the row
+  lands is closed, as for a bridge still connecting; a failed upsert is retried
+  by the heartbeat. Closing a bridge touches no record; its registry removal is
+  queued and written with others in one statement within ~100 ms. A
+  database that does not answer an attach within 4 s (or a pool with no free
+  connection within 3 s) fails it, or attaches from a cached record, well
+  inside the clients' 10 s connect timeout, so they back off instead of
+  reconnecting at once. The job runner and the alarm loop each take one query
+  per wakeup, wake on local notifications and when the next job or alarm is
+  due, and otherwise poll every 30-60 s (jittered). Upgrades and visitors for
+  a missing or deleted tunnel trust that answer for 30 s, and a record whose
+  certificate is not ready is read again at most every 5 s, so scanners and
+  the clients of deleted tunnels do not query the database on every
+  connection (a tunnel created on another machine becomes reachable here at
+  most that much later; clients retry the upgrade). `attaches_within_one_database_round_trip`
+  in `service.rs` checks the attach against a database 100 ms away.
 - **Cached records.** A machine caches tunnel records for routing, so the
   database stays off the visitor path. With other machines writing, API calls,
   attaches, alarms and certificate updates read the record again (one query),
@@ -415,8 +444,8 @@ Failure modes:
 
 Latency: PlanetScale is in us-east-1, ~200 ms from `syd`. The visitor path
 reads the database only on a tunnel's first visitor per machine (record load
-and, without a local bridge, one registry lookup per 30 s); attaching costs a
-few queries.
+and, without a local bridge, one registry lookup per 30 s); an attach waits
+for one round trip (see Round trips above).
 
 ### Deploying
 

@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use sqlx::Executor;
 use sqlx::mysql::{
-    MySqlConnectOptions, MySqlDatabaseError, MySqlPool, MySqlPoolOptions, MySqlSslMode,
+    MySqlConnectOptions, MySqlDatabaseError, MySqlPool, MySqlPoolOptions, MySqlRow, MySqlSslMode,
 };
+use sqlx::{Executor, Row};
 use tracing::warn;
 
 use crate::record::StoredTunnel;
@@ -98,6 +98,12 @@ const SCHEMA: &[&str] = &[
 
 /// Every statement gives up after this long, so a stalled database cannot hang a request.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a statement waits for a pooled connection. Well inside a client's 10 s bridge connect timeout, so a
+/// saturated pool fails an attach while the client can still back off, instead of after it gave up.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Connections kept open while idle, so a burst after a quiet spell does not wait for TLS handshakes (several
+/// round trips each from regions far from the database).
+const MIN_CONNECTIONS: u32 = 8;
 /// How long a job lease lasts; the runner extends it while the job runs.
 pub const LEASE_MS: u64 = 2 * 60 * 1000;
 
@@ -120,6 +126,16 @@ pub struct Conflict;
 pub struct Loaded {
     pub record: StoredTunnel,
     pub revision: u64,
+}
+
+/// What an attach needs from the database, read in one round trip: the tunnel, its renewal alarm, and the live
+/// registry rows of its bridges on other machines.
+#[derive(Debug, Clone)]
+pub struct AttachSnapshot {
+    pub loaded: Loaded,
+    pub alarm: Option<u64>,
+    /// Newest first.
+    pub bridges: Vec<BridgeLocation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +225,32 @@ pub struct MachineBridges {
 
 type BridgeRow = (String, String, String, i64, String, String, i64);
 
+fn loaded_from_row(row: &MySqlRow) -> Result<Loaded> {
+    let record: String = row.try_get(0)?;
+    let revision: i64 = row.try_get(1)?;
+    Ok(Loaded {
+        record: serde_json::from_str(&record).context("decoding a stored tunnel")?,
+        revision: revision as u64,
+    })
+}
+
+/// A registry row from the columns starting at `at`: tunnel ID, route, machine, bridge ID, region, address, and
+/// time refreshed, all NULL when a join found none.
+fn bridge_at(row: &MySqlRow, at: usize) -> Result<Option<BridgeLocation>> {
+    let Some(tunnel_id) = row.try_get::<Option<String>, _>(at)? else {
+        return Ok(None);
+    };
+    Ok(Some(BridgeLocation {
+        tunnel_id,
+        route: row.try_get(at + 1)?,
+        machine_id: row.try_get(at + 2)?,
+        bridge_id: row.try_get::<i64, _>(at + 3)? as u64,
+        region: row.try_get(at + 4)?,
+        address: row.try_get(at + 5)?,
+        updated_at: row.try_get::<i64, _>(at + 6)? as u64,
+    }))
+}
+
 fn bridge_from_row(row: BridgeRow) -> BridgeLocation {
     let (tunnel_id, route, machine_id, bridge_id, region, address, updated_at) = row;
     BridgeLocation {
@@ -288,10 +330,32 @@ fn db(error: sqlx::Error) -> anyhow::Error {
     anyhow::Error::new(error).context("storage unavailable")
 }
 
+/// `value` as a SQL string literal, when it consists only of characters that need no escaping (the IDs and names
+/// this server generates and validates). Statements built with literals go out as plain text queries, which take
+/// one round trip on any connection, where a prepared statement takes two on a connection that has not prepared
+/// it yet (and a pool spreads statements over many connections). Anything else is bound as a parameter.
+fn literal(value: &str) -> Option<String> {
+    let plain = !value.is_empty()
+        && value.len() <= 191
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@'));
+    plain.then(|| format!("'{value}'"))
+}
+
 /// Runs one storage operation with the statement timeout, recording its duration and failure as `operation`.
 async fn timed<T>(operation: &'static str, future: impl Future<Output = Result<T>>) -> Result<T> {
+    timed_within(operation, QUERY_TIMEOUT, future).await
+}
+
+/// [`timed`] with a shorter limit, for operations a client waits on.
+async fn timed_within<T>(
+    operation: &'static str,
+    limit: Duration,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
     let started = std::time::Instant::now();
-    let result = match tokio::time::timeout(QUERY_TIMEOUT, future).await {
+    let result = match tokio::time::timeout(limit, future).await {
         Ok(result) => result,
         Err(_) => Err(anyhow!("storage timed out").context("storage unavailable")),
     };
@@ -357,8 +421,8 @@ impl Store {
         let options = connect_options(url)?;
         let pool = MySqlPoolOptions::new()
             .max_connections(max_connections)
-            .min_connections(1)
-            .acquire_timeout(Duration::from_secs(5))
+            .min_connections(MIN_CONNECTIONS.min(max_connections))
+            .acquire_timeout(ACQUIRE_TIMEOUT)
             // Shorter than PlanetScale's idle cutoff, so pooled connections are rarely dead. Pinging before every
             // acquire would double each query's round trip from regions far from the database.
             .idle_timeout(Duration::from_secs(60))
@@ -440,19 +504,70 @@ impl Store {
 
     pub async fn tunnel(&self, id: &str) -> Result<Option<Loaded>> {
         timed("tunnel", async {
-            let row: Option<(String, i64)> =
-                sqlx::query_as("SELECT record, revision FROM tunnels WHERE id = ?")
+            const SQL: &str = "SELECT record, revision FROM tunnels WHERE id = ";
+            let row = match literal(id) {
+                Some(id) => self
+                    .pool
+                    .fetch_optional(sqlx::AssertSqlSafe(format!("{SQL}{id}")))
+                    .await
+                    .map_err(db)?,
+                None => sqlx::query(sqlx::AssertSqlSafe(format!("{SQL}?")))
                     .bind(id)
                     .fetch_optional(&self.pool)
                     .await
-                    .map_err(db)?;
-            row.map(|(record, revision)| {
-                Ok(Loaded {
-                    record: serde_json::from_str(&record).context("decoding a stored tunnel")?,
-                    revision: revision as u64,
-                })
-            })
-            .transpose()
+                    .map_err(db)?,
+            };
+            row.as_ref().map(loaded_from_row).transpose()
+        })
+        .await
+    }
+
+    /// The tunnel, its alarm, and the live registry rows (refreshed since `since`) of its bridges on machines
+    /// other than `machine_id`, in one round trip, for an attach. Gives up after `limit`.
+    pub async fn attach_snapshot(
+        &self,
+        id: &str,
+        machine_id: &str,
+        since: u64,
+        limit: Duration,
+    ) -> Result<Option<AttachSnapshot>> {
+        timed_within("attach_snapshot", limit, async {
+            let sql = |id: &str, machine: &str| {
+                format!(
+                    "SELECT t.record, t.revision, t.alarm_at,
+                       b.tunnel_id, b.route, b.machine_id, b.bridge_id, b.region, b.address, b.updated_at
+                     FROM tunnels t
+                     LEFT JOIN bridges b ON b.tunnel_id = t.id AND b.machine_id <> {machine} AND b.updated_at >= {since}
+                     WHERE t.id = {id}
+                     ORDER BY b.updated_at DESC"
+                )
+            };
+            let rows = match (literal(id), literal(machine_id)) {
+                (Some(id), Some(machine)) => self
+                    .pool
+                    .fetch_all(sqlx::AssertSqlSafe(sql(&id, &machine)))
+                    .await
+                    .map_err(db)?,
+                _ => sqlx::query(sqlx::AssertSqlSafe(sql("?", "?")))
+                    .bind(machine_id)
+                    .bind(id)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(db)?,
+            };
+            let Some(first) = rows.first() else {
+                return Ok(None);
+            };
+            let alarm: Option<i64> = first.try_get(2)?;
+            let mut bridges = Vec::new();
+            for row in &rows {
+                bridges.extend(bridge_at(row, 3)?);
+            }
+            Ok(Some(AttachSnapshot {
+                loaded: loaded_from_row(first)?,
+                alarm: alarm.map(|alarm| alarm as u64),
+                bridges,
+            }))
         })
         .await
     }
@@ -558,15 +673,27 @@ impl Store {
     /// Clears and returns the alarms due at `now`, like a Durable Object alarm firing once. Each alarm is
     /// cleared only if it is still the one that was read, so concurrent callers never both take it.
     pub async fn take_due_alarms(&self, now: u64) -> Result<Vec<String>> {
+        Ok(self.take_due_alarms_and_next(now).await?.0)
+    }
+
+    /// [`Store::take_due_alarms`], and when the next alarm after those is due (with the same query).
+    pub async fn take_due_alarms_and_next(&self, now: u64) -> Result<(Vec<String>, Option<u64>)> {
+        const LIMIT: usize = 500;
         timed("take_due_alarms", async {
-            let due: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT id, alarm_at FROM tunnels WHERE alarm_at IS NOT NULL AND alarm_at <= ?
-                 ORDER BY alarm_at LIMIT 500",
+            let mut due: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT id, alarm_at FROM tunnels WHERE alarm_at IS NOT NULL ORDER BY alarm_at LIMIT ?",
             )
-            .bind(now as i64)
+            .bind(LIMIT as i64 + 1)
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
+            let later = due
+                .iter()
+                .position(|(_, alarm)| *alarm as u64 > now)
+                .unwrap_or(due.len())
+                .min(LIMIT);
+            let next = due.get(later).map(|(_, alarm)| (*alarm as u64).max(now));
+            due.truncate(later);
             let mut taken = Vec::with_capacity(due.len());
             for (id, alarm) in due {
                 let cleared =
@@ -580,7 +707,7 @@ impl Store {
                     taken.push(id);
                 }
             }
-            Ok(taken)
+            Ok((taken, next))
         })
         .await
     }
@@ -1073,14 +1200,25 @@ impl Store {
         .await
     }
 
-    pub async fn next_job_at(&self) -> Result<Option<u64>> {
-        timed("next_job_at", async {
-            let next: Option<i64> =
-                sqlx::query_scalar("SELECT MIN(run_at) FROM jobs WHERE status = 'pending'")
-                    .fetch_one(&self.pool)
-                    .await
-                    .map_err(db)?;
-            Ok(next.map(|next| next as u64))
+    /// Up to `limit` pending jobs with when `owner` may take each (Unix ms), soonest first: when it is due and
+    /// any lease of another process has expired. The job runner's one query per wakeup.
+    pub async fn job_schedule(&self, owner: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+        timed("job_schedule", async {
+            let rows: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT certificate_id,
+                   GREATEST(run_at, CASE WHEN lease_until IS NULL OR lease_owner = ? THEN 0 ELSE lease_until + 1 END)
+                     AS ready_at
+                 FROM jobs WHERE status = 'pending' ORDER BY ready_at LIMIT ?",
+            )
+            .bind(owner)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+            Ok(rows
+                .into_iter()
+                .map(|(id, ready_at)| (id, ready_at.max(0) as u64))
+                .collect())
         })
         .await
     }
@@ -1259,6 +1397,32 @@ impl Store {
         .await
     }
 
+    /// Removes the rows of many bridges of one machine (`(tunnel, bridge ID)` pairs) in few statements.
+    pub async fn delete_bridges(&self, machine_id: &str, bridges: &[(String, u64)]) -> Result<()> {
+        for chunk in bridges.chunks(200) {
+            timed("delete_bridges", async {
+                let mut query = sqlx::QueryBuilder::new("DELETE FROM bridges WHERE machine_id = ");
+                query.push_bind(machine_id).push(" AND (");
+                for (index, (tunnel_id, bridge_id)) in chunk.iter().enumerate() {
+                    if index > 0 {
+                        query.push(" OR ");
+                    }
+                    query
+                        .push("(tunnel_id = ")
+                        .push_bind(tunnel_id)
+                        .push(" AND bridge_id = ")
+                        .push_bind(*bridge_id as i64)
+                        .push(")");
+                }
+                query.push(")");
+                query.build().execute(&self.pool).await.map_err(db)?;
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn delete_tunnel_bridges(&self, tunnel_id: &str) -> Result<()> {
         timed("delete_tunnel_bridges", async {
             sqlx::query("DELETE FROM bridges WHERE tunnel_id = ?")
@@ -1319,11 +1483,31 @@ impl Store {
         since: u64,
     ) -> Result<Vec<BridgeLocation>> {
         timed("bridge_locations", async {
-            let rows: Vec<BridgeRow> = sqlx::query_as(
-                "SELECT tunnel_id, route, machine_id, bridge_id, region, address, updated_at FROM bridges
-                 WHERE tunnel_id = ? AND (? IS NULL OR route = ?) AND updated_at >= ?
-                 ORDER BY updated_at DESC",
-            )
+            const COLUMNS: &str =
+                "SELECT tunnel_id, route, machine_id, bridge_id, region, address, updated_at FROM bridges";
+            let literals = (literal(tunnel_id), route.map(literal));
+            if let (Some(tunnel), None | Some(Some(_))) = &literals {
+                let route = match &literals.1 {
+                    Some(Some(route)) => format!(" AND route = {route}"),
+                    _ => String::new(),
+                };
+                let rows = self
+                    .pool
+                    .fetch_all(sqlx::AssertSqlSafe(format!(
+                        "{COLUMNS} WHERE tunnel_id = {tunnel}{route} AND updated_at >= {since}
+                         ORDER BY updated_at DESC"
+                    )))
+                    .await
+                    .map_err(db)?;
+                return rows
+                    .iter()
+                    .filter_map(|row| bridge_at(row, 0).transpose())
+                    .collect();
+            }
+            let rows: Vec<BridgeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "{COLUMNS} WHERE tunnel_id = ? AND (? IS NULL OR route = ?) AND updated_at >= ?
+                 ORDER BY updated_at DESC"
+            )))
             .bind(tunnel_id)
             .bind(route)
             .bind(route)
@@ -1693,6 +1877,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_snapshots_read_the_record_alarm_and_other_machines_rows_at_once() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let limit = Duration::from_secs(5);
+        assert!(
+            store
+                .attach_snapshot("abcdefghijkl", "a", 0, limit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.put_tunnel(&record("abcdefghijkl"), 1).await.unwrap();
+        let snapshot = store
+            .attach_snapshot("abcdefghijkl", "a", 0, limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.loaded.revision, 1);
+        assert_eq!(snapshot.loaded.record.id, "abcdefghijkl");
+        assert_eq!(snapshot.alarm, None);
+        assert!(snapshot.bridges.is_empty());
+
+        store.set_alarm("abcdefghijkl", Some(77)).await.unwrap();
+        let location = |machine: &str, bridge_id, updated_at| BridgeLocation {
+            tunnel_id: "abcdefghijkl".into(),
+            route: String::new(),
+            machine_id: machine.into(),
+            bridge_id,
+            region: "iad".into(),
+            address: "[fdaa::1]:9000".into(),
+            updated_at,
+        };
+        let routes = ["api".to_owned(), "@".to_owned()];
+        store
+            .put_bridge(&location("a", 1, 100), &routes)
+            .await
+            .unwrap();
+        store
+            .put_bridge(&location("b", 2, 100), &routes)
+            .await
+            .unwrap();
+        store
+            .put_bridge(&location("c", 3, 200), &routes[..1])
+            .await
+            .unwrap();
+        let snapshot = store
+            .attach_snapshot("abcdefghijkl", "a", 0, limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.alarm, Some(77));
+        let mut rows: Vec<_> = snapshot
+            .bridges
+            .iter()
+            .map(|row| (row.machine_id.as_str(), row.route.as_str(), row.bridge_id))
+            .collect();
+        assert_eq!(rows[0], ("c", "api", 3));
+        rows.sort();
+        assert_eq!(rows, [("b", "@", 2), ("b", "api", 2), ("c", "api", 3)]);
+        // Rows not refreshed since `since` do not count.
+        let fresh = store
+            .attach_snapshot("abcdefghijkl", "a", 150, limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.bridges.len(), 1);
+        // IDs that cannot be inlined as literals are bound instead, with the same result.
+        let bound = store
+            .attach_snapshot("abcdefghijkl", "a'b", 0, limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.bridges.len(), 5);
+        assert!(store.tunnel("abc'def").await.unwrap().is_none());
+        assert_eq!(
+            store
+                .bridge_locations("abcdefghijkl", Some("@"), 0)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .bridge_locations("abcdefghijkl", Some("x'"), 0)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // Removals in one batch, only of the named bridges.
+        store
+            .delete_bridges(
+                "b",
+                &[("abcdefghijkl".into(), 2), ("abcdefghijkl".into(), 9)],
+            )
+            .await
+            .unwrap();
+        let left: Vec<_> = store
+            .bridge_locations("abcdefghijkl", None, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.machine_id)
+            .collect();
+        assert_eq!(left.len(), 3);
+        assert!(!left.contains(&"b".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn alarm_scans_report_the_next_alarm() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        assert_eq!(
+            store.take_due_alarms_and_next(100).await.unwrap(),
+            (vec![], None)
+        );
+        for (id, at) in [
+            ("tunnel000001", 50),
+            ("tunnel000002", 300),
+            ("tunnel000003", 400),
+        ] {
+            store.put_tunnel(&record(id), 1).await.unwrap();
+            store.set_alarm(id, Some(at)).await.unwrap();
+        }
+        assert_eq!(
+            store.take_due_alarms_and_next(100).await.unwrap(),
+            (vec!["tunnel000001".to_owned()], Some(300))
+        );
+        assert_eq!(
+            store.take_due_alarms_and_next(100).await.unwrap(),
+            (vec![], Some(300))
+        );
+    }
+
+    #[tokio::test]
     async fn alarms_fire_once_across_concurrent_callers() {
         let Some(store) = test_store().await else {
             return;
@@ -1781,6 +2104,40 @@ mod tests {
         );
         assert!(!store.job_pending("cert_1").await.unwrap());
         assert!(store.job_exists("cert_1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn job_schedules_say_when_each_job_may_be_taken() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        assert!(store.job_schedule("a", 10).await.unwrap().is_empty());
+        store.add_job(job("cert_due"), 10).await.unwrap();
+        store.add_job(job("cert_later"), 500).await.unwrap();
+        store.add_job(job("cert_leased"), 10).await.unwrap();
+        store
+            .claim_job("cert_leased", "b", 20)
+            .await
+            .unwrap()
+            .unwrap();
+        // Another owner's lease holds the job until it expires; the owner's own lease does not.
+        assert_eq!(
+            store.job_schedule("a", 10).await.unwrap(),
+            [
+                ("cert_due".to_owned(), 10),
+                ("cert_later".to_owned(), 500),
+                ("cert_leased".to_owned(), 20 + LEASE_MS + 1),
+            ]
+        );
+        assert_eq!(
+            store.job_schedule("b", 2).await.unwrap(),
+            [("cert_due".to_owned(), 10), ("cert_leased".to_owned(), 10)]
+        );
+        store
+            .finish_job("cert_leased", "b", "done", None, 30)
+            .await
+            .unwrap();
+        assert_eq!(store.job_schedule("a", 10).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -25,6 +25,15 @@ pub const ATTEMPTS: u32 = 3;
 const PERSIST_FAILED: &str = "Failed to persist certificate state: tunnel or certificate not found";
 /// Imported issuance gets this long to finish on the Worker before this server takes it over.
 pub const ORPHAN_GRACE_MS: u64 = 15 * MINUTE_MS;
+/// Without a known reason to wake earlier (a due job or alarm, or a local notification), the job runner and the
+/// alarm loop look at the database again after this long plus up to as much again of jitter, which spreads the
+/// machines' polls apart. Jobs and alarms added elsewhere are run by the machine that added them (it is
+/// notified); polling only covers machines that went away, and leases and compare-and-set keep it safe.
+const POLL_MS: u64 = 30_000;
+
+fn poll_wait() -> u64 {
+    POLL_MS + (retry::jitter() * POLL_MS as f64) as u64
+}
 
 pub struct Jobs {
     pub service: Service,
@@ -70,32 +79,43 @@ impl Jobs {
     pub async fn run(self: Arc<Self>) {
         let mut tasks = JoinSet::new();
         loop {
-            if let Err(error) = self.start_due(&mut tasks).await {
-                error!(%error, "failed to start certificate jobs");
-            }
-            let wait = match self.service.store.next_job_at().await {
-                Ok(Some(at)) => {
-                    Duration::from_millis(at.saturating_sub(self.service.now()).min(30_000))
+            let next = match self.start_due(&mut tasks).await {
+                Ok(next) => next,
+                Err(error) => {
+                    error!(%error, "failed to start certificate jobs");
+                    None
                 }
-                _ => Duration::from_secs(30),
             };
+            let poll = poll_wait();
+            let wait = next.map_or(poll, |at| at.saturating_sub(self.service.now()).min(poll));
             tokio::select! {
-                _ = tokio::time::sleep(wait.max(Duration::from_millis(50))) => {}
+                _ = tokio::time::sleep(Duration::from_millis(wait.max(50))) => {}
                 _ = self.service.jobs.notified() => {}
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             }
         }
     }
 
-    async fn start_due(self: &Arc<Self>, tasks: &mut JoinSet<()>) -> Result<()> {
+    /// Claims and starts due jobs while there is room. Returns when the next job not yet due may be taken.
+    async fn start_due(self: &Arc<Self>, tasks: &mut JoinSet<()>) -> Result<Option<u64>> {
         let running = self.running.lock().expect("running lock").len();
         if running >= self.concurrency {
-            return Ok(());
+            // A finishing task wakes the runner.
+            return Ok(None);
         }
         let store = &self.service.store;
-        let due = store
-            .due_job_ids(&self.owner, self.service.now(), self.concurrency + running)
-            .await?;
+        let limit = self.concurrency + running + 1;
+        let schedule = store.job_schedule(&self.owner, limit).await?;
+        let now = self.service.now();
+        let mut next = schedule.iter().map(|(_, at)| *at).find(|at| *at > now);
+        if next.is_none() && schedule.len() == limit {
+            // Every listed job is due, so there may be more: look again soon.
+            next = Some(now + 1_000);
+        }
+        let due = schedule
+            .into_iter()
+            .filter(|(_, at)| *at <= now)
+            .map(|(id, _)| id);
         for id in due {
             if self.running.lock().expect("running lock").len() >= self.concurrency {
                 break;
@@ -130,7 +150,7 @@ impl Jobs {
                 jobs.service.jobs.notify_one();
             });
         }
-        Ok(())
+        Ok(next)
     }
 
     /// Gives up this process's job leases, on shutdown.
@@ -362,7 +382,15 @@ impl Jobs {
 
 /// Fires due renewal alarms. Returns how many fired.
 pub async fn fire_due_alarms(service: &Service) -> Result<usize> {
-    let due = service.store.take_due_alarms(service.now()).await?;
+    Ok(fire_due_alarms_and_next(service).await?.0)
+}
+
+/// [`fire_due_alarms`], and when the next alarm is due.
+async fn fire_due_alarms_and_next(service: &Service) -> Result<(usize, Option<u64>)> {
+    let (due, next) = service
+        .store
+        .take_due_alarms_and_next(service.now())
+        .await?;
     for id in &due {
         if let Err(error) = service.alarm(id).await {
             // Like a Durable Object alarm that throws: try again shortly.
@@ -373,20 +401,30 @@ pub async fn fire_due_alarms(service: &Service) -> Result<usize> {
                 .await?;
         }
     }
-    Ok(due.len())
+    // An alarm that failed was set a minute out, after the next one was read.
+    let next = if due.is_empty() {
+        next
+    } else {
+        Some(next.map_or(service.now() + MINUTE_MS, |next| {
+            next.min(service.now() + MINUTE_MS)
+        }))
+    };
+    Ok((due.len(), next))
 }
 
 pub async fn run_alarms(service: Service) {
     loop {
-        if let Err(error) = fire_due_alarms(&service).await {
-            error!(%error, "renewal alarms failed");
-        }
-        let wait = match service.store.next_alarm().await {
-            Ok(Some(at)) => Duration::from_millis(at.saturating_sub(service.now()).min(60_000)),
-            _ => Duration::from_secs(60),
+        let next = match fire_due_alarms_and_next(&service).await {
+            Ok((_, next)) => next,
+            Err(error) => {
+                error!(%error, "renewal alarms failed");
+                None
+            }
         };
+        let poll = poll_wait();
+        let wait = next.map_or(poll, |at| at.saturating_sub(service.now()).min(poll));
         tokio::select! {
-            _ = tokio::time::sleep(wait.max(Duration::from_millis(100))) => {}
+            _ = tokio::time::sleep(Duration::from_millis(wait.max(100))) => {}
             _ = service.alarms.notified() => {}
         }
     }

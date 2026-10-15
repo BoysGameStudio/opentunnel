@@ -281,6 +281,7 @@ impl Server {
                 service.clone(),
                 cluster.clone(),
             )));
+            tasks.push(tokio::spawn(cluster::run_removals(cluster.clone())));
         }
         tasks.push(tokio::spawn(self.jobs.clone().run()));
         tasks.push(tokio::spawn(jobs::run_alarms(service.clone())));

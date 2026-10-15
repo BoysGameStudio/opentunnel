@@ -49,6 +49,8 @@ const LOCATION_TTL: Duration = Duration::from_secs(30);
 const MISSING_TTL: Duration = Duration::from_secs(10);
 /// A machine that could not be reached is skipped for this long.
 const DOWN_TTL: Duration = Duration::from_secs(30);
+/// Bridge removals are collected this long and written together.
+const REMOVAL_BATCH_DELAY: Duration = Duration::from_millis(100);
 
 /// A machine holding a route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,8 +86,9 @@ pub struct Cluster {
     pub stats: Arc<Stats>,
     locations: Mutex<HashMap<CacheKey, (Option<Location>, Instant)>>,
     down: Mutex<HashMap<String, Instant>>,
-    /// Bridge rows whose removal failed, retried by the heartbeat.
+    /// Bridge rows to remove, written in batches by `run_removals`; failed ones are retried by the heartbeat.
     pending_removals: Mutex<HashSet<(String, u64)>>,
+    removals: tokio::sync::Notify,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,6 +130,7 @@ impl Cluster {
             locations: Mutex::new(HashMap::new()),
             down: Mutex::new(HashMap::new()),
             pending_removals: Mutex::new(HashSet::new()),
+            removals: tokio::sync::Notify::new(),
         })
     }
 
@@ -189,18 +193,35 @@ impl Cluster {
         }
     }
 
-    /// Removes a bridge's routes; retried by the heartbeat when the database is unavailable.
-    pub async fn unpublish(&self, tunnel: &str, bridge_id: u64) {
-        if let Err(error) = self
-            .store
-            .delete_bridge(tunnel, &self.machine_id, bridge_id)
-            .await
-        {
-            warn!(tunnel, error = %format!("{error:#}"), "could not remove a bridge from the registry");
+    /// Queues the removal of a bridge's routes, without waiting for it: `run_removals` writes removals in
+    /// batches, and the heartbeat retries them when the database is unavailable. Until then other machines may
+    /// still forward visitors here, which are refused, so they look up the route again. Only rows of this
+    /// bridge ID are removed, so a newer bridge that took the routes keeps its rows.
+    pub fn unpublish(&self, tunnel: &str, bridge_id: u64) {
+        self.pending_removals
+            .lock()
+            .expect("removals lock")
+            .insert((tunnel.to_owned(), bridge_id));
+        self.removals.notify_one();
+    }
+
+    /// Writes the queued removals; on failure they stay queued.
+    async fn flush_removals(&self) {
+        let removals: Vec<(String, u64)> = self
+            .pending_removals
+            .lock()
+            .expect("removals lock")
+            .drain()
+            .collect();
+        if removals.is_empty() {
+            return;
+        }
+        if let Err(error) = self.store.delete_bridges(&self.machine_id, &removals).await {
+            warn!(count = removals.len(), error = %format!("{error:#}"), "could not remove bridges from the registry");
             self.pending_removals
                 .lock()
                 .expect("removals lock")
-                .insert((tunnel.to_owned(), bridge_id));
+                .extend(removals);
         }
     }
 
@@ -343,18 +364,20 @@ impl Cluster {
         format!("http://{}{path}", location.address)
     }
 
-    /// Whether another machine's live bridge holds any of `routes`. Rows of machines that cannot be reached
-    /// or no longer hold the route (a crash, or a bridge closing) do not count.
-    pub async fn held_elsewhere(&self, tunnel: &str, routes: &[String]) -> bool {
-        let rows = match self.elsewhere(tunnel, None).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                warn!(tunnel, error = %format!("{error:#}"), "route check across machines failed");
-                return false;
-            }
-        };
+    /// Whether another machine's live bridge holds any of `routes`, given the tunnel's live registry rows on
+    /// other machines. Only machines with a row for one of the routes are asked; rows of machines that cannot be
+    /// reached or no longer hold the route (a crash, or a bridge closing) do not count.
+    pub async fn held_elsewhere(
+        &self,
+        tunnel: &str,
+        routes: &[String],
+        rows: &[BridgeLocation],
+    ) -> bool {
         let mut machines: Vec<Location> = Vec::new();
-        for row in rows.iter().filter(|row| routes.contains(&row.route)) {
+        for row in rows
+            .iter()
+            .filter(|row| row.machine_id != self.machine_id && routes.contains(&row.route))
+        {
             let location = Location::from(row);
             if !machines.contains(&location) && !self.is_down(&location.machine_id) {
                 machines.push(location);
@@ -453,15 +476,7 @@ impl Cluster {
         let now = self.clock.now_ms();
         self.store.refresh_bridges(&self.machine_id, now).await?;
         let live = service.republish(self).await;
-        let removals: Vec<(String, u64)> = self
-            .pending_removals
-            .lock()
-            .expect("removals lock")
-            .drain()
-            .collect();
-        for (tunnel, bridge_id) in removals {
-            self.unpublish(&tunnel, bridge_id).await;
-        }
+        self.flush_removals().await;
         for tunnel in self.store.deleted_tunnels(&live).await? {
             info!(
                 tunnel,
@@ -484,6 +499,15 @@ pub async fn run_heartbeat(service: Service, cluster: Arc<Cluster>) {
         if let Err(error) = cluster.heartbeat(&service).await {
             warn!(error = %format!("{error:#}"), "cluster heartbeat failed");
         }
+    }
+}
+
+/// Writes queued bridge removals in batches.
+pub async fn run_removals(cluster: Arc<Cluster>) {
+    loop {
+        cluster.removals.notified().await;
+        tokio::time::sleep(REMOVAL_BATCH_DELAY).await;
+        cluster.flush_removals().await;
     }
 }
 
