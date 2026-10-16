@@ -664,7 +664,7 @@ impl Supervisor {
             "user-agent",
             HeaderValue::from_static(concat!("opentunnel/", env!("CARGO_PKG_VERSION"))),
         );
-        let (mut socket, _) = tokio_tungstenite::connect_async(request)
+        let mut socket = crate::tls::connect_websocket(request, self.api.trust())
             .await
             .map_err(connect_error)?;
         socket
@@ -714,7 +714,7 @@ fn retry(error: String) -> SessionEnd {
     }
 }
 
-type WebSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+use crate::tls::WebSocket;
 
 struct AttachedSession {
     session: String,

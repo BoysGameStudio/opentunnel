@@ -164,6 +164,7 @@ async fn provision(server: &TestServer, dir: &std::path::Path) -> (String, Strin
     let client = Client::new(ClientOptions {
         api: Some(server.api.parse().unwrap()),
         storage: Some(Storage::at(dir.join("client"))),
+        ..Default::default()
     });
     let identity = client.create("default", |_| {}).await.unwrap();
     (identity.id, identity.token, identity.hostname)

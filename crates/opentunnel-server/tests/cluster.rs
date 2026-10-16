@@ -48,6 +48,7 @@ fn client(server: &TestServer, storage: &std::path::Path) -> Client {
     Client::new(ClientOptions {
         api: Some(server.api.parse().unwrap()),
         storage: Some(Storage::at(storage)),
+        ..Default::default()
     })
 }
 

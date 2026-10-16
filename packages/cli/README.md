@@ -58,6 +58,28 @@ edits to the config file) within a few seconds, and picks up certificates the
 server renews without dropping connections. Its log is shown by
 `opentunnel status`.
 
+## Corporate proxies / custom CAs
+
+The connection to `opentunnel.xyz` (API and bridge) trusts the bundled Mozilla
+roots plus the OS trust store, so a TLS-inspecting proxy whose CA is installed
+system-wide works without configuration. `SSL_CERT_FILE` and `SSL_CERT_DIR`
+replace the OS store when set, as with OpenSSL.
+
+For a CA that is not in the OS store, pass a PEM file with one or more
+certificates:
+
+```bash
+opentunnel --ca-cert /path/to/proxy-ca.pem up
+# or
+OPENTUNNEL_CA_CERT=/path/to/proxy-ca.pem opentunnel up
+```
+
+`up` and `route add` register the background service with that file, so it
+keeps trusting the CA after a restart. `SSL_CERT_FILE` and `SSL_CERT_DIR` are
+not passed to a systemd or launchd service; use `--ca-cert` for those. Visitor
+traffic is unaffected: it is still decrypted only on your machine with the
+tunnel's own certificate.
+
 ## Files
 
 Configuration is declarative, contains no credentials, and is safe to commit to

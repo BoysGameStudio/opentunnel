@@ -35,6 +35,11 @@ struct Cli {
     #[arg(long, global = true, env = "OPENTUNNEL_API", hide = true)]
     api: Option<String>,
 
+    /// PEM file of extra CA certificates to trust for opentunnel.xyz, for
+    /// TLS-inspecting proxies. The OS trust store is already used.
+    #[arg(long, global = true, env = "OPENTUNNEL_CA_CERT", value_name = "PATH")]
+    ca_cert: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -113,18 +118,36 @@ async fn run(cli: Cli) -> Result<()> {
     if !names::is_valid_profile(&cli.profile) {
         bail!("profile names must contain only lowercase letters, numbers, and hyphens");
     }
-    let api = cli.api.as_deref();
+    let ca_cert = cli
+        .ca_cert
+        .as_deref()
+        .map(|path| {
+            opentunnel::tls::read_ca_certificates(path)?;
+            std::path::absolute(path).context("resolving --ca-cert")
+        })
+        .transpose()?;
+    // Global options the background service is started with.
+    let mut service_args = Vec::new();
+    if let Some(api) = &cli.api {
+        service_args.extend(["--api".to_owned(), api.clone()]);
+    }
+    if let Some(ca_cert) = &ca_cert {
+        service_args.extend(["--ca-cert".to_owned(), ca_cert.display().to_string()]);
+    }
     let client = Client::new(ClientOptions {
-        api: api
+        api: cli
+            .api
+            .as_deref()
             .map(|api| api.parse().context("invalid --api URL"))
             .transpose()?,
         storage: None,
+        ca_cert,
     });
     let profile = cli.profile.as_str();
 
     match cli.command {
         Commands::Up => {
-            let hostname = up(&client, profile, api).await?;
+            let hostname = up(&client, profile, &service_args).await?;
             println!("Connected https://{hostname}");
             if config::load(profile)?.routes.is_empty() {
                 println!("Add a route with: opentunnel route add <port>");
@@ -140,7 +163,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Status => status(&client, profile).await,
-        Commands::Route(command) => route(&client, profile, command, api).await,
+        Commands::Route(command) => route(&client, profile, command, &service_args).await,
         Commands::Serve => daemon::serve(client, profile.to_owned()).await,
         Commands::Delete { yes } => {
             if !yes {
@@ -155,12 +178,12 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 /// Ensures the profile has a tunnel and the service is running. Returns the hostname.
-async fn up(client: &Client, profile: &str, api: Option<&str>) -> Result<String> {
+async fn up(client: &Client, profile: &str, service_args: &[String]) -> Result<String> {
     let identity = match client.get(profile)? {
         Some(identity) => identity,
         None => create(client, profile).await?,
     };
-    service::up(profile, api).await?;
+    service::up(profile, service_args).await?;
     Ok(identity.hostname)
 }
 
@@ -283,7 +306,7 @@ async fn route(
     client: &Client,
     profile: &str,
     command: RouteCommand,
-    api: Option<&str>,
+    service_args: &[String],
 ) -> Result<()> {
     let hostname = client.get(profile)?.map(|identity| identity.hostname);
     let public = |name: &str| match &hostname {
@@ -319,7 +342,7 @@ async fn route(
                 config.routes.insert(name.clone(), route.clone());
                 config::save(profile, &config)?;
             }
-            let hostname = up(client, profile, api).await?;
+            let hostname = up(client, profile, service_args).await?;
             match change {
                 config::Change::Added => println!("Added route {name} → {route}"),
                 config::Change::Unchanged => println!("Route {name} → {route} already exists"),

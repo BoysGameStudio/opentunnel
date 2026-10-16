@@ -41,6 +41,17 @@ application expects that header; see
 
 See [packages/cli](packages/cli) for the full command reference.
 
+## Corporate proxies / custom CAs
+
+Behind a TLS-inspecting proxy (Zscaler, Netskope, Cato, …), the CLI trusts the
+proxy's CA when it is installed in the OS trust store; nothing to configure.
+`SSL_CERT_FILE` and `SSL_CERT_DIR` are honored. To trust a specific CA instead,
+pass `--ca-cert <path>` or set `OPENTUNNEL_CA_CERT` to a PEM file with one or
+more certificates. This only concerns the connection to `opentunnel.xyz`;
+visitor traffic is still decrypted only on your machine. See
+[packages/cli](packages/cli#corporate-proxies--custom-cas) and, for the SDK,
+[packages/client](packages/client#corporate-proxies--custom-cas).
+
 ## Architecture
 
 The hosted service is one Rust binary, `crates/opentunnel-server`, on Fly.io

@@ -8,32 +8,41 @@ use reqwest::{Method, RequestBuilder, Response, Url};
 use tracing::debug;
 
 use crate::error::{Error, Result};
+use crate::tls::Trust;
 
 #[derive(Debug, Clone)]
 pub struct Api {
     base: Url,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
+    trust: Trust,
     /// Divides the retry delays, so tests need not wait for them.
     pub(crate) retry_scale: u64,
 }
 
 impl Api {
+    /// An API client trusting the bundled Mozilla roots, the OS store, and
+    /// the CA file in `OPENTUNNEL_CA_CERT`, if any.
     pub fn new(base: Url) -> Self {
+        Self::with_trust(base, Trust::new(crate::tls::roots(None)))
+    }
+
+    pub(crate) fn with_trust(base: Url, trust: Trust) -> Self {
         crate::install_crypto_provider();
-        // Bundled Mozilla roots, like the bridge WebSocket, so the client
-        // works on systems without a CA store (for example slim containers).
-        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
-            .iter()
-            .filter_map(|certificate| reqwest::Certificate::from_der(certificate).ok());
         let http = reqwest::Client::builder()
-            .tls_certs_only(roots)
+            .tls_backend_preconfigured(trust.http.clone())
             .build()
             .expect("HTTP client configuration is valid");
         Self {
             base,
             http,
+            trust,
             retry_scale: 1,
         }
+    }
+
+    /// TLS settings for the bridge WebSocket, sharing the API's roots.
+    pub(crate) fn trust(&self) -> &Trust {
+        &self.trust
     }
 
     pub fn base(&self) -> &Url {

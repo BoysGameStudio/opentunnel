@@ -42,7 +42,7 @@ pub async fn status(profile: &str) -> Option<DaemonStatus> {
 
 /// Starts the service in the background unless it is already running.
 /// Returns whether it was started.
-async fn ensure_running(profile: &str, api: Option<&str>) -> Result<bool> {
+async fn ensure_running(profile: &str, args: &[String]) -> Result<bool> {
     if status(profile).await.is_some() {
         return Ok(false);
     }
@@ -56,10 +56,7 @@ async fn ensure_running(profile: &str, api: Option<&str>) -> Result<bool> {
         .with_context(|| format!("opening {}", paths.log.display()))?;
 
     let mut command = Process::new(std::env::current_exe()?);
-    command.args(["--profile", profile]);
-    if let Some(api) = api {
-        command.args(["--api", api]);
-    }
+    command.args(["--profile", profile]).args(args);
     command
         .arg("serve")
         .env("OPENTUNNEL_DAEMON", "1")
@@ -87,9 +84,9 @@ async fn wait_until_running(profile: &str) -> Result<()> {
 /// Starts the service and registers it with the OS (systemd on Linux, launchd
 /// on macOS) so it starts at login. Where neither is available it runs as a
 /// plain background process until the next reboot.
-pub async fn up(profile: &str, api: Option<&str>) -> Result<()> {
+pub async fn up(profile: &str, args: &[String]) -> Result<()> {
     if !platform::supported() {
-        if !ensure_running(profile, api).await? {
+        if !ensure_running(profile, args).await? {
             request(profile, Command::Reload).await?;
         }
         return Ok(());
@@ -100,7 +97,7 @@ pub async fn up(profile: &str, api: Option<&str>) -> Result<()> {
     }
     // Replace a service started without OS registration.
     stop(profile).await?;
-    install(profile, api)?;
+    install(profile, args)?;
     wait_until_running(profile).await
 }
 
@@ -135,16 +132,14 @@ pub async fn stop(profile: &str) -> Result<bool> {
     bail!("background service did not stop")
 }
 
-fn install(profile: &str, api: Option<&str>) -> Result<PathBuf> {
+fn install(profile: &str, args: &[String]) -> Result<PathBuf> {
     let executable = std::env::current_exe()?;
     let mut arguments = vec![
         executable.display().to_string(),
         "--profile".into(),
         profile.into(),
     ];
-    if let Some(api) = api {
-        arguments.extend(["--api".into(), api.into()]);
-    }
+    arguments.extend(args.iter().cloned());
     arguments.push("serve".into());
     platform::install(profile, &arguments)
 }

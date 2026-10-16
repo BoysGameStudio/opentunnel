@@ -25,3 +25,8 @@ tunnel.wait().await?;
 `$XDG_DATA_HOME/opentunnel`, in the same layout as the TypeScript SDK and CLI.
 `Tunnel` keeps one bridge session connected, reconnects with backoff, accepts
 route changes with `set_routes`, and picks up certificates the server renews.
+
+The API and bridge connections trust the bundled Mozilla roots, the OS trust
+store (`SSL_CERT_FILE` and `SSL_CERT_DIR` are honored), and the PEM file in
+`ClientOptions::ca_cert` or `OPENTUNNEL_CA_CERT`, so the client works behind
+TLS-inspecting corporate proxies. Unreadable OS certificates are skipped.

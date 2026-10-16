@@ -116,6 +116,23 @@ not expire, so a tunnel it created can no longer be deleted. Call
 `client.tunnel.remove()` before exiting, or use the default store for tunnels
 that should outlive the process.
 
+## Corporate proxies / custom CAs
+
+The SDK uses the runtime's `fetch` and `WebSocket`, so it trusts whatever CAs
+the runtime does. Behind a TLS-inspecting proxy, make the runtime trust the
+proxy's CA:
+
+- Node: `NODE_EXTRA_CA_CERTS=/path/to/proxy-ca.pem`, or the OS store with
+  `--use-system-ca` / `NODE_USE_SYSTEM_CA=1` (Node 22.15+ and 23.8+).
+- Bun: `NODE_EXTRA_CA_CERTS=/path/to/proxy-ca.pem`, or the OS store with
+  `--use-system-ca` / `NODE_USE_SYSTEM_CA=1`.
+- Deno: `DENO_CERT=/path/to/proxy-ca.pem` (or `--cert`), or the OS store with
+  `DENO_TLS_CA_STORE=system,mozilla`.
+
+The Rust client and CLI use the OS store automatically and also read
+`OPENTUNNEL_CA_CERT`. Either way this only concerns the connection to
+`opentunnel.xyz`; visitor traffic is still decrypted only in your process.
+
 ## Backpressure
 
 The SDK stops reading from a local socket while more than 1 MiB is queued on

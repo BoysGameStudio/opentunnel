@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::protocol::api::CertificateState;
@@ -9,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::identity::{Identity, PendingIdentity};
 use crate::provision;
 use crate::storage::Storage;
+use crate::tls::Trust;
 use crate::tunnel::{Routes, Tunnel};
 
 const CERTIFICATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -37,6 +39,10 @@ pub struct ClientOptions {
     pub api: Option<Url>,
     /// Identity storage. Defaults to the XDG data directory.
     pub storage: Option<Storage>,
+    /// PEM file of extra CA certificates to trust for the API and the
+    /// bridge, besides the bundled and OS roots. Defaults to
+    /// `OPENTUNNEL_CA_CERT`.
+    pub ca_cert: Option<PathBuf>,
 }
 
 /// Creates, stores, and connects tunnels. Each profile owns one tunnel.
@@ -58,7 +64,10 @@ impl Client {
             Url::parse(crate::protocol::api::DEFAULT_API).expect("default API URL is valid")
         });
         Self {
-            api: Api::new(api),
+            api: Api::with_trust(
+                api,
+                Trust::new(crate::tls::roots(options.ca_cert.as_deref())),
+            ),
             storage: options.storage.unwrap_or_default(),
         }
     }
@@ -284,6 +293,7 @@ mod tests {
         let mut client = Client::new(ClientOptions {
             api: Some(Url::parse(api).unwrap()),
             storage: Some(Storage::at(root)),
+            ..Default::default()
         });
         client.api.retry_scale = 1000;
         client

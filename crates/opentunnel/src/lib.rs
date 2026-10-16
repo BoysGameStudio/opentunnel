@@ -19,6 +19,7 @@ mod identity;
 pub mod paths;
 mod provision;
 mod storage;
+pub mod tls;
 mod tunnel;
 
 pub use client::{Client, ClientOptions, ProvisionStage};

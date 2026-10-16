@@ -163,6 +163,7 @@ fn connect(base: &str, identity: &Identity, routes: Routes) -> (Tunnel, Storage)
     let client = Client::new(ClientOptions {
         api: Some(base.parse().unwrap()),
         storage: Some(storage.clone()),
+        ..Default::default()
     });
     (client.connect("default", routes).unwrap(), storage)
 }
