@@ -180,6 +180,23 @@ pub fn open_fds() -> Option<usize> {
     std::fs::read_dir("/proc/self/fd").ok().map(Iterator::count)
 }
 
+/// The memory this process may use: the machine's, or its cgroup's limit when lower.
+pub fn memory_limit() -> Option<u64> {
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .trim()
+        .trim_end_matches(" kB")
+        .parse::<u64>()
+        .ok()?
+        * 1024;
+    let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|limit| limit.trim().parse::<u64>().ok());
+    Some(cgroup.map_or(total, |cgroup| cgroup.min(total)))
+}
+
 /// Raises the open file soft limit to the hard limit: every connection holds at least one descriptor.
 pub fn raise_fd_limit() {
     #[cfg(unix)]

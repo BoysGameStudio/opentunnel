@@ -277,7 +277,7 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_uptime_seconds` | gauge | | |
 | `opentunnel_accept_errors_total` | counter | `error` (`emfile`, `other`) | failed accepts; `emfile` is running out of descriptors |
 | `opentunnel_api_tls_handshakes_total` | counter | `result` (`ok`, `failed`, `timeout`) | TLS for the API domain; through Cloudflare a failed handshake is a 525 |
-| `opentunnel_connections_shed_total` | counter | `reason` (`handshakes`, `connections`) | public connections closed unserved because the machine is saturated: no API TLS handshake slot within 1 s, or at the 60,000 connection limit ([Capacity](#capacity)) |
+| `opentunnel_connections_shed_total` | counter | `reason` (`handshakes`, `connections`) | public connections closed unserved because the machine is saturated: no API TLS handshake slot within 1 s, or at the connection limit (as many as three quarters of the memory hold at ~32 KB each, at most 60,000; logged at startup) ([Capacity](#capacity)) |
 | `opentunnel_bridges_attached` | gauge | | |
 | `opentunnel_bridge_attaches_total` | counter | `result` (`ok`, `bad_token`, `cert_not_ready`, `invalid_route`, `route_conflict`, `error`) | |
 | `opentunnel_bridge_detaches_total` | counter | `reason` (`client_close`, `drop`, `idle_retire`, `drain`, `delete`, `server_close`) | attached bridges that ended |
@@ -544,8 +544,10 @@ heartbeat (within a minute). Old machines need nothing from new ones.
 
 ## Capacity
 
-Per `performance-1x` machine (one dedicated core, 2 GB), measured with the
-load test below against the server confined to one core and 2 GB.
+Measured with the load test below against the server confined like a Fly
+machine: one core and 2 GB (`performance-1x`), or 1 GB and 6% of a core
+(`shared-cpu-1x` with its burst balance used up, the worst case; with
+balance left it bursts to the whole core).
 
 **What a bridge costs.** Memory: ~22 KB per idle bridge for the connection
 itself (rustls with its 4 KB record buffer, the two tasks, the queue, the
@@ -591,21 +593,36 @@ mesh on, records of real size):
 | Storm: all dropped at once, local DB | 3.8 s, 6,600 kernel resets | 16-19 s, peak 90% CPU, no client timeouts, attach p99 5.3 s |
 | Storm, DB 150 ms away | 6.5 s | 16-19 s, no client timeouts |
 
-**Limits.** Memory binds first: ~160 MB at rest on Fly (pool connections,
-mesh table, website) plus ~29 KB per bridge reaches 60% of 2 GB at ~37,000
-bridges, while CPU stays near 5% idle and a storm of all of them drains in
-~15 s at a full core. `fly.toml` therefore sets `[services.concurrency]` on
-:443 (connections: bridges plus visitors and API calls) to `soft_limit` 15,000
-and `hard_limit` 35,000. Fly's proxy sends a new connection to the closest
-machine in the region that is under `soft_limit`, so with two or more machines
-in a region they fill evenly from 15,000 on (smaller storms per machine);
-soft limits never move traffic to another region. Above `hard_limit` a
-machine gets no new connections, and only when every machine in the region
-is there does the proxy use another region (bridges then attach there, and
-the mesh forwards their visitors). Plan a second machine in a region before
-it holds ~25,000 bridges (`opentunnel_bridges_attached`), or when
-`fly_instance_memory` passes 60% or CPU stays above 50%. The server's own
-limit is 60,000 connections, closed at once beyond that.
+On 1 GB and the shared core: 15,000 bridges take 440 MB (560 MB after
+visitors) and, bursting, a storm of all of them drains in 3 s. Held to 6% of
+the core, 4,000 bridges attach at 420/s (71/s before, with 1,650 client
+timeouts) and a storm of them drains in 14 s (18 s before); a storm of 10,000
+takes ~80 s, many attempts timing out while the core is starved.
+
+**Limits.** Memory: ~160 MB at rest on Fly (pool connections, mesh table,
+website) plus ~29 KB per bridge, so 60% memory is ~37,000 bridges on 2 GB and
+~15,000 on 1 GB. CPU: ~1% of a core per 10,000 idle bridges, ~0.14 ms per
+attach, ~0.15 ms per visitor connection. On a dedicated core memory binds
+first; on `shared-cpu-1x` the storm a machine must absorb on a starved core
+does (it should stay at a few thousand bridges).
+
+| Machine | Bridges at ~60% memory | Recommended `soft_limit` / `hard_limit` (connections on :443) |
+| --- | --- | --- |
+| `shared-cpu-1x`, 1 GB (`fly.toml` today) | ~15,000 | 5,000 / 10,000 |
+| `performance-1x`, 2 GB | ~37,000 | 15,000 / 35,000 |
+
+The limits count every connection on :443 (bridges, visitors, API calls).
+Fly's proxy sends a new connection to the closest machine in the region that
+is under `soft_limit`, so with two or more machines in a region they fill
+evenly past it, which keeps storms per machine small; soft limits never move
+traffic to another region. Above `hard_limit` a machine gets no new
+connections, and only when every machine in the region is there does the
+proxy use another region (bridges then attach there, and the mesh forwards
+their visitors). Add a machine to a region before its machines average the
+soft limit in `opentunnel_bridges_attached`, or when `fly_instance_memory`
+passes 60% or CPU stays above 50%. The server's own limit (as many
+connections as three quarters of the memory hold, at most 60,000) closes new
+connections at once beyond it.
 
 **The load test.** `crates/opentunnel-server/examples/loadtest.rs`: `seed`
 writes tunnels with ready certificates straight into a database, `run`

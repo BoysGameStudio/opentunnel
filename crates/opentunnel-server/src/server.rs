@@ -27,8 +27,9 @@ use crate::store::Store;
 use crate::tls;
 use crate::website::Website;
 
-/// Public connections handled at once; beyond this, new ones are closed at once. A bridge costs ~30 KB, so this
-/// is about all 2 GB hold; Fly's `hard_limit` (fly.toml) stops well before it.
+/// What one public connection may cost, for the connection limit: a bridge is ~30 KB with its tunnel's record.
+const CONNECTION_MEMORY: u64 = 32 * 1024;
+/// The most public connections handled at once, whatever the memory.
 const MAX_CONNECTIONS: usize = 60_000;
 /// API TLS handshakes at once. A handshake is ~0.1 ms of CPU (the key exchange and signature) plus a round trip
 /// to the client, so this keeps the core busy while a reconnect storm cannot queue tens of thousands of them.
@@ -304,7 +305,9 @@ impl Server {
     /// Accepts public TLS connections until the listener fails.
     pub async fn serve_tls(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let acceptor = tls::acceptor(self.resolver.clone());
-        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let limit = max_connections();
+        info!(limit, "public connection limit");
+        let slots = Arc::new(Semaphore::new(limit));
         let mut errors = AcceptErrors::new("accept failed");
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -545,6 +548,15 @@ impl Server {
         info!("shut down");
         Ok(())
     }
+}
+
+/// Public connections handled at once: as many as three quarters of the memory hold, at most `MAX_CONNECTIONS`.
+/// Beyond it new ones are closed at once, before memory runs out; Fly's `hard_limit` (fly.toml) stops sooner.
+fn max_connections() -> usize {
+    let memory = net::memory_limit().unwrap_or(2 << 30);
+    usize::try_from(memory / 4 * 3 / CONNECTION_MEMORY)
+        .unwrap_or(MAX_CONNECTIONS)
+        .clamp(1_000, MAX_CONNECTIONS)
 }
 
 async fn shutdown_signal() {
