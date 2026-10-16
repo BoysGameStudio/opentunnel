@@ -5,12 +5,17 @@
 mod common;
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{TestServer, app, eventually};
+use opentunnel::protocol::api::{CertificateInfo, CertificateState};
 use opentunnel::{Client, ClientOptions, Routes, State, Storage};
+use opentunnel_server::clock::iso;
+use opentunnel_server::crypto::hash_token;
 use opentunnel_server::issuer::Issuer;
-use opentunnel_server::store::{Job, JobKind};
+use opentunnel_server::service::Route;
+use opentunnel_server::store::{Job, JobKind, Machine};
+use tokio::net::TcpListener;
 
 const HEARTBEAT_MS: u64 = 300;
 
@@ -282,6 +287,129 @@ async fn runs_each_job_once_across_machines() {
         let runs = on_a.get(name).copied().unwrap_or(0) + on_b.get(name).copied().unwrap_or(0);
         assert_eq!(runs, 1, "{name} ran {runs} times");
     }
+    a.stop().await;
+    b.stop().await;
+}
+
+/// How a machine's routing sees a tunnel right now: absent, its certificate not ready, or routable.
+async fn routing(server: &TestServer, id: &str) -> &'static str {
+    let service = server.service();
+    match service
+        .route(id, &format!("{id}.{}", service.domain))
+        .await
+        .unwrap()
+    {
+        Route::Rejected {
+            tunnel_exists: false,
+            ..
+        } => "missing",
+        Route::Rejected { outcome, .. } => outcome,
+        Route::Bridge { .. } => "bridge",
+    }
+}
+
+/// Waits until `check` holds, failing after `within`, and returns how long it took.
+async fn within<F, Fut>(what: &str, within: Duration, mut check: F) -> Duration
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let started = Instant::now();
+    while !check().await {
+        assert!(started.elapsed() < within, "{what} took over {within:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    started.elapsed()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changes_reach_other_machines_caches_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(a) = machine(dir.path(), "machine-a", "iad").await else {
+        return;
+    };
+    let b = machine(dir.path(), "machine-b", "syd").await.unwrap();
+    let store = &a.service().store;
+
+    // A machine that is listed as live but never answers.
+    let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_address = silent.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = silent.accept().await {
+            held.push(stream);
+        }
+    });
+    store
+        .put_machine(&Machine {
+            machine_id: "machine-silent".into(),
+            region: "jnb".into(),
+            address: silent_address,
+            updated_at: a.service().now() + 60_000,
+        })
+        .await
+        .unwrap();
+
+    // B looks the ID up before it exists and caches "missing" (trusted for 30 s); the upgrade path agrees.
+    let id = "createdlater";
+    assert_eq!(routing(&b, id).await, "missing");
+    assert!(!b.service().exists(id).await.unwrap());
+
+    // A creates it, without waiting for the silent machine, and B accepts it at once.
+    let started = Instant::now();
+    a.service()
+        .create(id, hash_token("token"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "create took {:?}",
+        started.elapsed()
+    );
+    within(
+        "B to see the new tunnel",
+        Duration::from_secs(2),
+        || async { b.service().exists(id).await.unwrap() },
+    )
+    .await;
+    assert_eq!(routing(&b, id).await, "certificate_not_ready");
+
+    // B now caches "certificate not ready" (trusted for 5 s); the certificate becomes ready on A.
+    let mut issuing = store.tunnel(id).await.unwrap().unwrap().record;
+    issuing.certificate_id = Some("cert_later".into());
+    issuing.certificate = Some(CertificateInfo {
+        id: "cert_later".into(),
+        state: CertificateState::Issuing,
+    });
+    store.put_tunnel(&issuing, a.service().now()).await.unwrap();
+    // Written behind A's back, so B is told by hand here.
+    b.service().expire(id).await;
+    assert_eq!(routing(&b, id).await, "certificate_not_ready");
+    let ready = CertificateState::Ready {
+        certificate: "C".into(),
+        chain: "CH".into(),
+        expiry: iso(a.service().now() + 90 * 24 * 3600 * 1000),
+    };
+    assert!(
+        a.service()
+            .update_certificate(id, "cert_later", ready)
+            .await
+            .unwrap()
+    );
+    let took = within("B to route the tunnel", Duration::from_secs(2), || async {
+        routing(&b, id).await == "no_bridge"
+    })
+    .await;
+    assert!(took < Duration::from_secs(1), "took {took:?}");
+
+    // A deletion reaches B's cached ready record too (B never re-reads a ready record by itself).
+    a.service().remove(id, "token").await.unwrap();
+    within("B to forget the tunnel", Duration::from_secs(2), || async {
+        !b.service().exists(id).await.unwrap()
+    })
+    .await;
+
     a.stop().await;
     b.stop().await;
 }

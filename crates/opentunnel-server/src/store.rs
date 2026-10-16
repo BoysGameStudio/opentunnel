@@ -223,6 +223,20 @@ pub struct MachineBridges {
     pub updated_at: u64,
 }
 
+/// A machine of the cluster, refreshed by its heartbeat whether or not it holds bridges. Kept in `meta` as
+/// `machine:<id>`, so finding the machines took no schema change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Machine {
+    #[serde(skip)]
+    pub machine_id: String,
+    pub region: String,
+    pub address: String,
+    pub updated_at: u64,
+}
+
+const MACHINE_PREFIX: &str = "machine:";
+
 type BridgeRow = (String, String, String, i64, String, String, i64);
 
 fn loaded_from_row(row: &MySqlRow) -> Result<Loaded> {
@@ -1577,6 +1591,90 @@ impl Store {
         }
         Ok(deleted)
     }
+
+    // --- Machines ------------------------------------------------------------------------------------------
+
+    /// Records a machine as live, at startup and every heartbeat.
+    pub async fn put_machine(&self, machine: &Machine) -> Result<()> {
+        let value = serde_json::to_string(machine)?;
+        timed("put_machine", async {
+            sqlx::query(
+                "INSERT INTO meta (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+            )
+            .bind(format!("{MACHINE_PREFIX}{}", machine.machine_id))
+            .bind(value)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Removes a machine, on its clean shutdown.
+    pub async fn delete_machine(&self, machine_id: &str) -> Result<()> {
+        timed("delete_machine", async {
+            sqlx::query("DELETE FROM meta WHERE name = ?")
+                .bind(format!("{MACHINE_PREFIX}{machine_id}"))
+                .execute(&self.pool)
+                .await
+                .map_err(db)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every recorded machine, live or not.
+    async fn all_machines(&self) -> Result<Vec<Machine>> {
+        let rows: Vec<(String, String)> = timed("machines", async {
+            sqlx::query_as("SELECT name, value FROM meta WHERE name LIKE ?")
+                .bind(format!("{MACHINE_PREFIX}%"))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db)
+        })
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(name, value)| {
+                let mut machine: Machine = serde_json::from_str(&value).ok()?;
+                machine.machine_id = name.strip_prefix(MACHINE_PREFIX)?.to_owned();
+                Some(machine)
+            })
+            .collect())
+    }
+
+    /// Machines refreshed since `since`.
+    pub async fn machines(&self, since: u64) -> Result<Vec<Machine>> {
+        let mut machines = self.all_machines().await?;
+        machines.retain(|machine| machine.updated_at >= since);
+        Ok(machines)
+    }
+
+    /// Removes machines nobody refreshed since `before`.
+    pub async fn delete_expired_machines(&self, before: u64) -> Result<u64> {
+        let expired: Vec<String> = self
+            .all_machines()
+            .await?
+            .into_iter()
+            .filter(|machine| machine.updated_at < before)
+            .map(|machine| format!("{MACHINE_PREFIX}{}", machine.machine_id))
+            .collect();
+        if expired.is_empty() {
+            return Ok(0);
+        }
+        timed("delete_expired_machines", async {
+            let mut query = sqlx::QueryBuilder::new("DELETE FROM meta WHERE name IN (");
+            let mut separated = query.separated(", ");
+            for name in &expired {
+                separated.push_bind(name);
+            }
+            query.push(")");
+            let deleted = query.build().execute(&self.pool).await.map_err(db)?;
+            Ok(deleted.rows_affected())
+        })
+        .await
+    }
 }
 
 /// The database was migrated by a newer server.
@@ -1800,6 +1898,29 @@ mod tests {
         );
         let loaded = store.tunnel("pulledthrugh").await.unwrap().unwrap();
         assert_eq!(loaded.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn machines_are_listed_until_they_expire() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let machine = |id: &str, updated_at| Machine {
+            machine_id: id.into(),
+            region: "iad".into(),
+            address: format!("[fdaa::{id}]:9000"),
+            updated_at,
+        };
+        store.put_machine(&machine("a", 100)).await.unwrap();
+        store.put_machine(&machine("b", 100)).await.unwrap();
+        store.put_machine(&machine("b", 300)).await.unwrap();
+        store.swap_meta("test_ca", None, "x").await.unwrap();
+        assert_eq!(store.machines(0).await.unwrap().len(), 2);
+        assert_eq!(store.machines(200).await.unwrap(), vec![machine("b", 300)]);
+        assert_eq!(store.delete_expired_machines(200).await.unwrap(), 1);
+        store.delete_machine("b").await.unwrap();
+        assert!(store.machines(0).await.unwrap().is_empty());
+        assert_eq!(store.meta("test_ca").await.unwrap().as_deref(), Some("x"));
     }
 
     #[tokio::test]

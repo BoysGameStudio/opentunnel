@@ -41,9 +41,11 @@ pub const STALE_BRIDGE_MS: u64 = IDLE_TIMEOUT_MS + HEARTBEAT_MS;
 /// After a failed refresh, cached records are used without asking the database for this long.
 const REFRESH_BACKOFF_MS: u64 = 5_000;
 /// Routing and bridge upgrades trust "no such tunnel" (missing or deleted) for this long before reading it again,
-/// so scanners and the clients of deleted tunnels do not read the database on every connection.
+/// so scanners and the clients of deleted tunnels do not read the database on every connection. The machine
+/// that creates or changes a tunnel tells the others at once (`Cluster::invalidate_elsewhere`); the TTL only
+/// bounds how long a lost notification can leave this machine wrong.
 pub const MISSING_TTL_MS: u64 = 30_000;
-/// Routing reads a record whose certificate is not ready again at most this often.
+/// Routing reads a record whose certificate is not ready again at most this often (unless notified sooner).
 const NOT_READY_TTL_MS: u64 = 5_000;
 /// How long an attach waits for the database before it fails (or goes on with a cached record), well inside the
 /// client's 10 s connect timeout, so clients back off instead of reconnecting the moment they gave up.
@@ -99,6 +101,8 @@ pub struct EntryState {
     revision: u64,
     /// When `record` was last read from the database, Unix ms.
     checked_at: u64,
+    /// Another machine changed the tunnel since: routing reads it again before trusting the cached copy.
+    stale: bool,
     bridges: Vec<Arc<Bridge>>,
     sequence: u32,
 }
@@ -414,6 +418,7 @@ impl Service {
             };
             state.loaded = true;
             state.checked_at = self.now();
+            state.stale = false;
         }
         Ok(state)
     }
@@ -438,8 +443,9 @@ impl Service {
 
     /// Locks a tunnel for routing. A cached record that is live with a ready certificate cannot be wrong about
     /// routing (deletes elsewhere close bridges here), so only a missing or not yet ready one is read again, and
-    /// not more often than `MISSING_TTL_MS` and `NOT_READY_TTL_MS`: a tunnel created or issued on another machine
-    /// becomes routable here that much later at worst (clients retry the upgrade with backoff).
+    /// not more often than `MISSING_TTL_MS` and `NOT_READY_TTL_MS`, unless another machine said it changed
+    /// (created, deleted, certificate bound or ready): then it is read at once. The TTLs only matter when that
+    /// notification was lost (clients retry the upgrade with backoff).
     pub async fn lock_routable<'a>(
         &self,
         entry: &'a Entry,
@@ -451,6 +457,9 @@ impl Service {
         if !state.loaded {
             drop(state);
             return self.lock(entry).await;
+        }
+        if state.stale {
+            return Ok(self.refresh(entry, state).await);
         }
         let ttl = match state.record() {
             Some(record) if record.certificate_ready() => return Ok(state),
@@ -501,6 +510,7 @@ impl Service {
                 state.revision = snapshot.loaded.revision;
                 state.loaded = true;
                 state.checked_at = now;
+                state.stale = false;
                 Ok((
                     state,
                     Some(snapshot.bridges),
@@ -520,6 +530,7 @@ impl Service {
                 state.revision = 0;
                 state.loaded = true;
                 state.checked_at = now;
+                state.stale = false;
                 Ok((state, None, unread))
             }
             Err(error) if state.loaded => {
@@ -547,6 +558,7 @@ impl Service {
                     None => (None, 0),
                 };
                 state.checked_at = now;
+                state.stale = false;
             }
             Err(error) => {
                 self.refresh_failed_at.store(now, Ordering::Relaxed);
@@ -573,6 +585,22 @@ impl Service {
                 Err(_) => true,
             }
         });
+    }
+
+    /// Marks a cached tunnel as changed by another machine, so routing reads it again before trusting it. The
+    /// cached copy stays for when the database cannot be reached. Nothing to do if it is not cached here.
+    pub async fn expire(&self, id: &str) {
+        let entry = self.tunnels.lock().expect("tunnels lock").get(id).cloned();
+        if let Some(entry) = entry {
+            entry.state.lock().await.stale = true;
+        }
+    }
+
+    /// Tells the other machines that a tunnel changed in a way routing cares about.
+    fn changed(&self, id: &str) {
+        if let Some(cluster) = self.cluster() {
+            cluster.invalidate_elsewhere(id);
+        }
     }
 
     /// Forgets the cached copy of a tunnel, after an import changed it underneath.
@@ -657,6 +685,7 @@ impl Service {
             renewal: None,
         };
         self.save(&mut state, record.clone()).await?;
+        self.changed(id);
         // A recreated ID must not inherit the deleted tunnel's alarm.
         self.store.set_alarm(id, None).await?;
         Ok(Some(self.view(&state, &record)))
@@ -759,6 +788,7 @@ impl Service {
             ..record.clone()
         };
         self.save(&mut state, issuing.clone()).await?;
+        self.changed(id);
         if let Err(error) = self.ensure_issuance(&issuing, JobKind::Issue).await {
             let reason = error.to_string();
             self.analytics.publish(
@@ -800,6 +830,7 @@ impl Service {
             ..record.clone()
         };
         self.save(&mut state, deleted).await?;
+        self.changed(id);
         self.store.set_alarm(id, None).await?;
         let age = parse_iso(&record.created_at).map_or(0, |created| now.saturating_sub(created));
         self.analytics.publish(
@@ -887,6 +918,7 @@ impl Service {
                         ..record.clone()
                     };
                     self.save(&mut state, renewed.clone()).await?;
+                    self.changed(tunnel_id);
                     self.schedule_renewal(&renewed).await?;
                     self.analytics.publish(
                         "certificate.renewed",
@@ -928,6 +960,9 @@ impl Service {
             ..record.clone()
         };
         self.save(&mut state, updated.clone()).await?;
+        if matches!(input, CertificateState::Ready { .. }) {
+            self.changed(tunnel_id);
+        }
         self.schedule_renewal(&updated).await?;
         let previous = record
             .certificate

@@ -79,8 +79,9 @@ MySQL 8, in production the PlanetScale database `opentunnel` (org
   (`pending`, `done`, `failed`, `abandoned`), attempts, the next run time, and
   a lease (`lease_owner`, `lease_until`).
 - `server_certificates`: the domain's key, CSR, certificate and expiry.
-- `meta`: the API certificate's current job, and the local test CA when
-  `ISSUER=local`.
+- `meta`: the API certificate's current job, the local test CA when
+  `ISSUER=local`, and one `machine:<id>` row per live machine (region,
+  internal address, `updatedAt`; [Multiple regions](#multiple-regions)).
 - `bridges` (schema 2): the registry of attached bridges, one row per tunnel,
   route and machine (`bridge_id`, `region`, the machine's internal `address`,
   `updated_at`).
@@ -391,9 +392,11 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─▶ bridge attached, rows in 
 - **Control.** The internal listener also serves a small HTTP/1.1 API,
   authenticated with `Authorization: Bearer <INTERNAL_TOKEN>` (compared in
   constant time): `GET /internal/tunnel/<id>/routes` (the routes this
-  machine's live bridges hold, after retiring silent ones) and `POST
-  /internal/tunnel/<id>/close` (a deletion). Deleting a tunnel on any machine
-  closes its bridges on every machine in the registry and removes its rows.
+  machine's live bridges hold, after retiring silent ones), `POST
+  /internal/tunnel/<id>/close` (a deletion) and `POST
+  /internal/tunnel/<id>/invalidate` (the tunnel changed: drop cached answers
+  for it). Deleting a tunnel on any machine closes its bridges on every
+  machine in the registry and removes its rows.
   Attaching checks the registry for the requested routes on other machines
   and asks those machines whether they still hold them; only a live answer is
   a `route_conflict`, so a crashed or draining machine's leftover rows never
@@ -421,9 +424,23 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─▶ bridge attached, rows in 
   a missing or deleted tunnel trust that answer for 30 s, and a record whose
   certificate is not ready is read again at most every 5 s, so scanners and
   the clients of deleted tunnels do not query the database on every
-  connection (a tunnel created on another machine becomes reachable here at
-  most that much later; clients retry the upgrade). `attaches_within_one_database_round_trip`
+  connection. Those answers are not left to expire when the tunnel changes
+  elsewhere: see Invalidation below. `attaches_within_one_database_round_trip`
   in `service.rs` checks the attach against a database 100 ms away.
+- **Invalidation.** Each machine records itself in `meta` (`machine:<id>`)
+  at startup and every heartbeat, with or without bridges, and removes the
+  row on a clean shutdown. When a tunnel is created, deleted, its certificate
+  bound, or its certificate (or renewal) becomes ready, the machine that wrote
+  it lists the live machines (one query) and sends each other one `POST
+  /internal/tunnel/<id>/invalidate`, concurrently and in the background (1 s
+  timeout), so the API call never waits for it and an unreachable machine
+  delays nothing. The receiver marks its cached entry (if it has one) stale,
+  and its next upgrade or visitor reads the record again; during a database
+  outage the cached copy is still used. So a client whose tunnel was just
+  created or issued through one machine is accepted at once by another, even
+  if that one had looked the ID up before. A lost invalidation (machine
+  restarting, 6PN trouble) only falls back to the TTLs above: 30 s for
+  missing, 5 s for not ready.
 - **Cached records.** A machine caches tunnel records for routing, so the
   database stays off the visitor path. With other machines writing, API calls,
   attaches, alarms and certificate updates read the record again (one query),

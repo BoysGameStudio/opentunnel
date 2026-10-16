@@ -7,7 +7,8 @@
 //! - a visitor for a route with no bridge here is forwarded over the private network to the machine holding
 //!   it: a one-line header, then the ClientHello, then both directions copied as they are;
 //! - control that used to stay in one process (closing a deleted tunnel's bridges, route conflicts between
-//!   clients sharing a tunnel) goes to the other machine over a small HTTP API on the same internal listener.
+//!   clients sharing a tunnel, dropping cached records when a tunnel is created or its certificate changes)
+//!   goes to the other machines over a small HTTP API on the same internal listener.
 //!
 //! The internal listener only binds the private network and every request carries the shared secret.
 
@@ -32,7 +33,7 @@ use crate::http::{Body, Stats, count, json_response, response};
 use crate::net::{self, AcceptErrors, Timeouts};
 use crate::relay::{self, Accepted, Origin};
 use crate::service::Service;
-use crate::store::{BridgeLocation, MachineBridges, Store};
+use crate::store::{BridgeLocation, Machine, MachineBridges, Store};
 
 /// The first line of a forwarded connection: `OPENTUNNEL-FORWARD/1 <token> <tunnel> <route> <visitor>\n`.
 pub const FORWARD_MAGIC: &[u8] = b"OPENTUNNEL-FORWARD/1 ";
@@ -45,6 +46,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// The receiver may need to load the tunnel from the database before it answers.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Invalidations are fire-and-forget; a machine that does not answer this fast falls back to its cache TTLs.
+const INVALIDATE_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCATION_TTL: Duration = Duration::from_secs(30);
 const MISSING_TTL: Duration = Duration::from_secs(10);
 /// A machine that could not be reached is skipped for this long.
@@ -411,6 +414,43 @@ impl Cluster {
         false
     }
 
+    /// After a tunnel changed in a way routing cares about (created, deleted, its certificate bound or ready):
+    /// tells every other live machine to drop its cached copy, so a "missing" or "not ready" answer cached
+    /// there is not trusted until its TTL runs out. Returns at once; the requests go out concurrently in the
+    /// background. A lost one only means that machine reads the record again after the TTL, as before.
+    pub fn invalidate_elsewhere(self: &Arc<Self>, tunnel: &str) {
+        let cluster = self.clone();
+        let tunnel = tunnel.to_owned();
+        tokio::spawn(async move {
+            let machines = match cluster.store.machines(cluster.live_since()).await {
+                Ok(machines) => machines,
+                Err(error) => {
+                    warn!(tunnel, error = %format!("{error:#}"), "could not list machines to invalidate a tunnel");
+                    return;
+                }
+            };
+            let path = format!("/internal/tunnel/{tunnel}/invalidate");
+            let requests = machines
+                .iter()
+                .filter(|machine| machine.machine_id != cluster.machine_id && !machine.address.is_empty())
+                .map(|machine| {
+                    let request = cluster
+                        .http
+                        .post(format!("http://{}{path}", machine.address))
+                        .bearer_auth(&cluster.token)
+                        .timeout(INVALIDATE_TIMEOUT)
+                        .send();
+                    let tunnel = &tunnel;
+                    async move {
+                        if let Err(error) = request.await.and_then(reqwest::Response::error_for_status) {
+                            warn!(tunnel, machine = %machine.machine_id, %error, "could not invalidate a tunnel on a machine");
+                        }
+                    }
+                });
+            futures_util::future::join_all(requests).await;
+        });
+    }
+
     /// After a tunnel is deleted: closes its bridges on other machines and removes its rows.
     pub async fn close_elsewhere(&self, tunnel: &str) {
         self.forget(tunnel);
@@ -458,6 +498,7 @@ impl Cluster {
     /// Removes rows a previous run of this machine left (it crashed), before anything attaches.
     pub async fn start(&self) -> Result<()> {
         let removed = self.store.delete_machine_bridges(&self.machine_id).await?;
+        self.store.put_machine(&self.machine()).await?;
         info!(machine = %self.machine_id, region = %self.region, address = %self.address(), removed, "joined the cluster");
         Ok(())
     }
@@ -467,6 +508,19 @@ impl Cluster {
         if let Err(error) = self.store.delete_machine_bridges(&self.machine_id).await {
             warn!(error = %format!("{error:#}"), "could not remove this machine's bridges from the registry");
         }
+        if let Err(error) = self.store.delete_machine(&self.machine_id).await {
+            warn!(error = %format!("{error:#}"), "could not remove this machine from the registry");
+        }
+    }
+
+    /// This machine's row in the list of machines.
+    fn machine(&self) -> Machine {
+        Machine {
+            machine_id: self.machine_id.clone(),
+            region: self.region.clone(),
+            address: self.address().to_owned(),
+            updated_at: self.clock.now_ms(),
+        }
     }
 
     /// One heartbeat: refreshes this machine's rows, records bridges the registry missed, retries failed
@@ -474,6 +528,7 @@ impl Cluster {
     /// drops rows of machines that are long gone.
     pub async fn heartbeat(&self, service: &Service) -> Result<()> {
         let now = self.clock.now_ms();
+        self.store.put_machine(&self.machine()).await?;
         self.store.refresh_bridges(&self.machine_id, now).await?;
         let live = service.republish(self).await;
         self.flush_removals().await;
@@ -484,9 +539,9 @@ impl Cluster {
             );
             service.close_deleted(&tunnel).await;
         }
-        self.store
-            .delete_expired_bridges(now.saturating_sub(10 * 3 * self.heartbeat_ms))
-            .await?;
+        let expired = now.saturating_sub(10 * 3 * self.heartbeat_ms);
+        self.store.delete_expired_bridges(expired).await?;
+        self.store.delete_expired_machines(expired).await?;
         Ok(())
     }
 }
@@ -633,6 +688,13 @@ async fn control(
                 &json!({ "error": format!("{error:#}") }),
             ),
         },
+        (&Method::POST, "invalidate") => {
+            cluster.forget(tunnel);
+            // The entry may be locked by a slow database read; the sender need not wait for it.
+            let tunnel = tunnel.to_owned();
+            tokio::spawn(async move { service.expire(&tunnel).await });
+            response(StatusCode::NO_CONTENT)
+        }
         (&Method::POST, "close") => {
             info!(
                 tunnel,
