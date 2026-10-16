@@ -13,9 +13,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::debug;
@@ -24,12 +22,14 @@ use crate::analytics;
 use crate::crypto::{hash_token, slug, token};
 use crate::service::{Bind, CertificateLookup, Lookup, Service};
 use crate::website::{Resolved, Website};
+use crate::websocket;
 
 pub type Body = Full<Bytes>;
 
 const OPENAPI: &str = include_str!("openapi.json");
 const MAX_BODY: usize = 1024 * 1024;
-const MAX_FRAME: usize = 1024 * 1024;
+/// The largest bridge message accepted. Frames carry at most 32 KiB of data; this leaves room for any client.
+const MAX_MESSAGE: usize = 1024 * 1024;
 
 /// Subprotocols this server speaks, newest first.
 const SUBPROTOCOLS: &[&str] = &["opentunnel"];
@@ -549,16 +549,9 @@ impl App {
                     return;
                 }
             };
-            let mut config = WebSocketConfig::default();
-            config.max_message_size = Some(MAX_FRAME * 16);
-            config.max_frame_size = Some(MAX_FRAME * 16);
-            let socket = WebSocketStream::from_raw_socket(
-                TokioIo::new(upgraded),
-                Role::Server,
-                Some(config),
-            )
-            .await;
-            crate::bridge::run(service, id, socket, client).await;
+            let (read, write) = tokio::io::split(TokioIo::new(upgraded));
+            let reader = websocket::Reader::new(read, MAX_MESSAGE);
+            crate::bridge::run(service, id, reader, websocket::Writer::new(write), client).await;
         });
         let mut response = response(StatusCode::SWITCHING_PROTOCOLS);
         let headers = response.headers_mut();
@@ -603,7 +596,7 @@ where
         async move {
             let http1 = request.version() < hyper::Version::HTTP_2;
             let draining = app.shutdown.draining.clone();
-            let mut response = app.handle(request).await;
+            let mut response = Box::pin(app.handle(request)).await;
             // While draining, an HTTP/1.1 connection serves one request; an upgrade keeps its own header.
             if http1
                 && draining.is_cancelled()

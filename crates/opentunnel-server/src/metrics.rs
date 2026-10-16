@@ -44,6 +44,7 @@ pub struct Metrics {
     uptime: Gauge<f64, AtomicU64>,
     accept_errors: Family<Labels, Counter>,
     api_handshakes: Family<Labels, Counter>,
+    connections_shed: Family<Labels, Counter>,
 
     bridges_attached: Gauge,
     bridge_attaches: Family<Labels, Counter>,
@@ -101,6 +102,7 @@ impl Metrics {
             uptime: Gauge::default(),
             accept_errors: Family::default(),
             api_handshakes: Family::default(),
+            connections_shed: Family::default(),
             bridges_attached: Gauge::default(),
             bridge_attaches: Family::default(),
             bridge_detaches: Family::default(),
@@ -158,6 +160,11 @@ impl Metrics {
             "api_tls_handshakes",
             "TLS handshakes for the API domain, by result (ok, failed, timeout); a failed one is a 525 at Cloudflare",
             metrics.api_handshakes.clone(),
+        );
+        r.register(
+            "connections_shed",
+            "Public connections closed at once because the machine is saturated, by reason (handshakes: too many API TLS handshakes waiting; connections: at the connection limit)",
+            metrics.connections_shed.clone(),
         );
         r.register(
             "bridges_attached",
@@ -296,6 +303,14 @@ pub fn accept_error(error: &std::io::Error) {
         "other"
     };
     get().accept_errors.get_or_create(&[("error", class)]).inc();
+}
+
+/// A public connection was closed unserved because the machine is saturated: `handshakes` or `connections`.
+pub fn connection_shed(reason: &'static str) {
+    get()
+        .connections_shed
+        .get_or_create(&[("reason", reason)])
+        .inc();
 }
 
 /// A TLS handshake for the API domain ended: `ok`, `failed` or `timeout`.
@@ -786,14 +801,31 @@ pub fn fd_level(open: u64, limit: u64) -> u8 {
     }
 }
 
+const TRIM_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Hands memory freed inside glibc's heaps back to the kernel. glibc returns only the free top of a heap, so after
+/// a burst (visitors, a reconnect storm) the memory of connections long gone stayed resident (half as much again
+/// as in use, in the load test).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_heap() {
+    let started = Instant::now();
+    // SAFETY: malloc_trim has no preconditions.
+    unsafe { libc::malloc_trim(0) };
+    debug!(elapsed = ?started.elapsed(), "trimmed the heap");
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_heap() {}
+
 /// Warns when descriptor use crosses half and 80% of the limit (again every ten minutes while it stays
-/// there), and refreshes the certificate job counts every minute.
+/// there), refreshes the certificate job counts every minute, and trims the heap every minute.
 pub async fn run_monitor(store: crate::store::Store, clock: crate::clock::Clock) {
     const REPEAT: Duration = Duration::from_secs(600);
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     let mut level = 0u8;
     let mut warned_at: Option<Instant> = None;
     let mut jobs_at: Option<Instant> = None;
+    let mut trimmed_at: Option<Instant> = None;
     loop {
         interval.tick().await;
         if let (Some(open), Some(limit)) = (crate::net::open_fds(), fd_limit()) {
@@ -817,6 +849,11 @@ pub async fn run_monitor(store: crate::store::Store, clock: crate::clock::Clock)
                 info!(fds = open, limit, "open file descriptors are back down");
             }
             level = current;
+        }
+        if trimmed_at.is_none_or(|at| at.elapsed() >= TRIM_INTERVAL) {
+            trimmed_at = Some(Instant::now());
+            // Off the runtime's threads: it takes a few milliseconds on a large heap.
+            let _ = tokio::task::spawn_blocking(trim_heap).await;
         }
         if jobs_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
             jobs_at = Some(Instant::now());

@@ -30,6 +30,7 @@ pub mod sni;
 pub mod store;
 pub mod tls;
 pub mod website;
+pub mod websocket;
 
 /// Installs the ring crypto provider as the process default for rustls.
 pub fn install_crypto_provider() {

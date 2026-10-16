@@ -27,8 +27,18 @@ use crate::store::Store;
 use crate::tls;
 use crate::website::Website;
 
-/// Public connections handled at once; beyond this, new ones wait for a slot.
-const MAX_CONNECTIONS: usize = 50_000;
+/// Public connections handled at once; beyond this, new ones are closed at once. A bridge costs ~30 KB, so this
+/// is about all 2 GB hold; Fly's `hard_limit` (fly.toml) stops well before it.
+const MAX_CONNECTIONS: usize = 60_000;
+/// API TLS handshakes at once. A handshake is ~0.1 ms of CPU (the key exchange and signature) plus a round trip
+/// to the client, so this keeps the core busy while a reconnect storm cannot queue tens of thousands of them.
+const MAX_HANDSHAKES: usize = 256;
+/// How long a new API connection waits for a handshake slot. Beyond it the connection is closed, so its client
+/// retries after its backoff (which grows on each failure) instead of timing out in a queue that only grows: a
+/// storm then drains at the rate the machine can attach.
+const HANDSHAKE_QUEUE_TIMEOUT: Duration = Duration::from_secs(1);
+/// A handshake gives its slot up after this long, while it waits for a slow client to finish.
+const HANDSHAKE_SLOT_HOLD: Duration = Duration::from_secs(1);
 /// At shutdown, after the drain, how long HTTP connections get to finish their requests.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -43,6 +53,7 @@ pub struct Server {
     pub config: Config,
     /// The local CA's certificate, when that is the issuer.
     pub local_ca: Option<String>,
+    handshakes: Semaphore,
 }
 
 /// An HTTP client for ACME, Cloudflare, analytics and the Worker, trusting Mozilla's roots plus `extra`.
@@ -246,6 +257,7 @@ impl Server {
             cluster,
             config,
             local_ca,
+            handshakes: Semaphore::new(MAX_HANDSHAKES),
         })
     }
 
@@ -302,9 +314,12 @@ impl Server {
                     continue;
                 }
             };
-            net::keepalive(&stream);
-            let Ok(slot) = slots.clone().acquire_owned().await else {
-                return Ok(());
+            net::tune(&stream);
+            // Closed rather than left waiting: a stalled accept loop would leave every new connection in the
+            // kernel's queue, the healthy ones too.
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                crate::metrics::connection_shed("connections");
+                continue;
             };
             let server = self.clone();
             let acceptor = acceptor.clone();
@@ -331,21 +346,42 @@ impl Server {
         };
         let domain = &self.app.service.domain;
         if accepted.sni == *domain {
+            let Ok(Ok(slot)) =
+                tokio::time::timeout(HANDSHAKE_QUEUE_TIMEOUT, self.handshakes.acquire()).await
+            else {
+                crate::metrics::connection_shed("handshakes");
+                debug!(%peer, "API connection shed: too many TLS handshakes waiting");
+                return;
+            };
+            let mut slot = Some(slot);
             let stream = tls::Replay::new(accepted.initial, accepted.stream);
-            match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
-                Ok(Ok(tls)) => {
-                    crate::metrics::api_handshake("ok");
-                    http::serve_connection(self.app.clone(), tls).await;
+            let accept = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream));
+            tokio::pin!(accept);
+            // The work is done as soon as the ClientHello (already read) is processed; the rest is waiting for the
+            // client, which must not hold a slot for long.
+            let result = tokio::select! {
+                result = &mut accept => result,
+                () = tokio::time::sleep(HANDSHAKE_SLOT_HOLD) => {
+                    slot = None;
+                    accept.await
                 }
+            };
+            drop(slot);
+            let tls = match result {
+                Ok(Ok(tls)) => tls,
                 Ok(Err(error)) => {
                     crate::metrics::api_handshake("failed");
                     debug!(%error, "TLS handshake failed");
+                    return;
                 }
                 Err(_) => {
                     crate::metrics::api_handshake("timeout");
                     debug!("TLS handshake timed out");
+                    return;
                 }
-            }
+            };
+            crate::metrics::api_handshake("ok");
+            Box::pin(http::serve_connection(self.app.clone(), tls)).await;
             return;
         }
         http::count(&self.app.stats.tunnel_connections);
@@ -354,7 +390,8 @@ impl Server {
             cluster: self.cluster.as_ref(),
             fallback: self.fallback.as_ref(),
         };
-        if let Err(error) = relay::route_tunnel(&self.app.service, accepted, origin).await {
+        if let Err(error) = Box::pin(relay::route_tunnel(&self.app.service, accepted, origin)).await
+        {
             debug!(%error, %peer, "TCP connection rejected");
         }
     }
@@ -376,9 +413,7 @@ impl Server {
         {
             address.set_ip(private);
         }
-        let listener = TcpListener::bind(address)
-            .await
-            .with_context(|| format!("binding {address}"))?;
+        let listener = net::listen(address).with_context(|| format!("binding {address}"))?;
         let bound = listener.local_addr()?;
         let advertised = match &self.config.internal_address {
             Some(advertised) if !advertised.is_empty() => advertised.clone(),
@@ -428,7 +463,7 @@ impl Server {
                     continue;
                 }
             };
-            net::keepalive(&stream);
+            net::tune(&stream);
             let app = self.app.clone();
             let domain = self.config.domain.clone();
             let mode = self.config.http_mode;
@@ -443,17 +478,15 @@ impl Server {
 
     /// Binds the listeners, runs until SIGTERM or Ctrl-C, then tells bridges to reconnect.
     pub async fn run(self) -> Result<()> {
-        let tls_listener = TcpListener::bind(self.config.tls_listen)
-            .await
+        let tls_listener = net::listen(self.config.tls_listen)
             .with_context(|| format!("binding {}", self.config.tls_listen))?;
         info!(address = %self.config.tls_listen, domain = %self.config.domain, "listening for TLS");
         let http_listener = match self.config.http_listen.as_str() {
             "" | "off" => None,
             address => {
                 let address: SocketAddr = address.parse().context("HTTP_LISTEN")?;
-                let listener = TcpListener::bind(address)
-                    .await
-                    .with_context(|| format!("binding {address}"))?;
+                let listener =
+                    net::listen(address).with_context(|| format!("binding {address}"))?;
                 info!(%address, mode = ?self.config.http_mode, "listening for HTTP");
                 Some(listener)
             }
@@ -485,7 +518,10 @@ impl Server {
         if let Some(cluster) = &server.cluster {
             cluster.shutdown().await;
         }
-        service.drain().await;
+        tokio::spawn({
+            let service = service.clone();
+            async move { service.drain().await }
+        });
         server.app.shutdown.drain();
         tokio::select! {
             () = tokio::time::sleep(drain) => {}

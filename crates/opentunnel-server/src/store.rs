@@ -5,6 +5,8 @@
 //! Nothing relies on a single writer: tunnel records carry a revision that every write checks, alarms and
 //! job leases are taken with conditional updates, and imports lock the row they replace.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -113,9 +115,26 @@ const ER_DUP_ENTRY: u16 = 1062;
 const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
 const ER_LOCK_DEADLOCK: u16 = 1213;
 
+/// Tunnels read in one statement at most. Each is a few KB of JSON.
+const READ_BATCH: usize = 200;
+/// Batched tunnel reads in flight at once, leaving the rest of the pool to writes, jobs and the API.
+const READ_BATCHES: usize = 8;
+
 #[derive(Clone)]
 pub struct Store {
     pool: MySqlPool,
+    reads: Arc<Mutex<Reads>>,
+}
+
+type ReadResult = Result<Option<AttachSnapshot>>;
+
+/// Single-tunnel reads waiting for a batch. A reconnect storm on a machine far from the database (150 ms from
+/// `nrt` and `syd`) made every attach take a pooled connection for a round trip of its own, so the pool capped
+/// attaches at ~100 a second there; batched, one round trip serves up to `READ_BATCH` of them.
+#[derive(Default)]
+struct Reads {
+    waiting: Vec<(String, tokio::sync::oneshot::Sender<ReadResult>)>,
+    running: usize,
 }
 
 /// A tunnel record changed since it was read, by an import or another server.
@@ -211,15 +230,6 @@ pub struct BridgeLocation {
 }
 
 type BridgeRow = (String, String, String, i64, String, String, i64);
-
-fn loaded_from_row(row: &MySqlRow) -> Result<Loaded> {
-    let record: String = row.try_get(0)?;
-    let revision: i64 = row.try_get(1)?;
-    Ok(Loaded {
-        record: serde_json::from_str(&record).context("decoding a stored tunnel")?,
-        revision: revision as u64,
-    })
-}
 
 /// A registry row from the columns starting at `at`: tunnel ID, route, machine, bridge ID, region, address, and
 /// time refreshed, all NULL when a join found none.
@@ -418,7 +428,10 @@ impl Store {
             .max_lifetime(Duration::from_secs(30 * 60))
             .test_before_acquire(false)
             .connect_lazy_with(options);
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            reads: Arc::default(),
+        })
     }
 
     /// Connects and migrates, failing if the database is unavailable (the CLI's import and export).
@@ -492,23 +505,15 @@ impl Store {
     }
 
     pub async fn tunnel(&self, id: &str) -> Result<Option<Loaded>> {
-        timed("tunnel", async {
-            const SQL: &str = "SELECT record, revision FROM tunnels WHERE id = ";
-            let row = match literal(id) {
-                Some(id) => self
-                    .pool
-                    .fetch_optional(sqlx::AssertSqlSafe(format!("{SQL}{id}")))
-                    .await
-                    .map_err(db)?,
-                None => sqlx::query(sqlx::AssertSqlSafe(format!("{SQL}?")))
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(db)?,
-            };
-            row.as_ref().map(loaded_from_row).transpose()
-        })
-        .await
+        Ok(self
+            .tunnel_with_alarm(id)
+            .await?
+            .map(|snapshot| snapshot.loaded))
+    }
+
+    /// The tunnel and its alarm, which come in the same read.
+    pub async fn tunnel_with_alarm(&self, id: &str) -> Result<Option<AttachSnapshot>> {
+        timed("tunnel", self.read(id)).await
     }
 
     /// The tunnel and its alarm in one round trip, for an attach. Gives up after `limit`.
@@ -517,30 +522,116 @@ impl Store {
         id: &str,
         limit: Duration,
     ) -> Result<Option<AttachSnapshot>> {
-        timed_within("attach_snapshot", limit, async {
-            const SQL: &str = "SELECT record, revision, alarm_at FROM tunnels WHERE id = ";
-            let row = match literal(id) {
-                Some(id) => self
-                    .pool
-                    .fetch_optional(sqlx::AssertSqlSafe(format!("{SQL}{id}")))
+        timed_within("attach_snapshot", limit, self.read(id)).await
+    }
+
+    /// One tunnel with its alarm, read in the next batch.
+    async fn read(&self, id: &str) -> ReadResult {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let start = {
+            let mut reads = self.reads.lock().expect("reads lock");
+            reads.waiting.push((id.to_owned(), tx));
+            let start = reads.running < READ_BATCHES;
+            if start {
+                reads.running += 1;
+            }
+            start
+        };
+        if start {
+            tokio::spawn(self.clone().read_batches());
+        }
+        rx.await
+            .unwrap_or_else(|_| Err(anyhow!("storage read dropped").context("storage unavailable")))
+    }
+
+    /// Reads waiting tunnels in batches until none are left.
+    async fn read_batches(self) {
+        loop {
+            let batch: Vec<_> = {
+                let mut reads = self.reads.lock().expect("reads lock");
+                if reads.waiting.is_empty() {
+                    reads.running -= 1;
+                    return;
+                }
+                let take = reads.waiting.len().min(READ_BATCH);
+                reads.waiting.drain(..take).collect()
+            };
+            let ids: Vec<&str> = batch.iter().map(|(id, _)| id.as_str()).collect();
+            match timed("tunnel_batch", self.read_tunnels(&ids)).await {
+                Ok(found) => {
+                    for (id, tx) in batch {
+                        let _ = tx.send(match found.get(&id) {
+                            None => Ok(None),
+                            Some(Ok(snapshot)) => Ok(Some(snapshot.clone())),
+                            Some(Err(error)) => Err(anyhow!("{error}")),
+                        });
+                    }
+                }
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    let error = error
+                        .strip_prefix("storage unavailable: ")
+                        .unwrap_or(&error);
+                    for (_, tx) in batch {
+                        let _ = tx.send(Err(anyhow!("{error}").context("storage unavailable")));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The rows found, each decoded or the reason it could not be.
+    async fn read_tunnels(
+        &self,
+        ids: &[&str],
+    ) -> Result<HashMap<String, Result<AttachSnapshot, String>>> {
+        const SQL: &str = "SELECT id, record, revision, alarm_at FROM tunnels WHERE id ";
+        let mut literals = Vec::new();
+        let mut rows = Vec::new();
+        for id in ids {
+            match literal(id) {
+                Some(literal) => literals.push(literal),
+                // Bound alone: plain text needs no prepared statement per batch size.
+                None => rows.extend(
+                    sqlx::query(sqlx::AssertSqlSafe(format!("{SQL}= ?")))
+                        .bind(*id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(db)?,
+                ),
+            }
+        }
+        if !literals.is_empty() {
+            literals.sort_unstable();
+            literals.dedup();
+            let list = literals.join(",");
+            rows.extend(
+                self.pool
+                    // Every ID is a literal that needs no escaping.
+                    .fetch_all(sqlx::AssertSqlSafe(format!("{SQL}IN ({list})")))
                     .await
                     .map_err(db)?,
-                None => sqlx::query(sqlx::AssertSqlSafe(format!("{SQL}?")))
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(db)?,
-            };
-            let Some(row) = row else {
-                return Ok(None);
-            };
-            let alarm: Option<i64> = row.try_get(2)?;
-            Ok(Some(AttachSnapshot {
-                loaded: loaded_from_row(&row)?,
-                alarm: alarm.map(|alarm| alarm as u64),
-            }))
-        })
-        .await
+            );
+        }
+        let mut found = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get(0)?;
+            let decoded = (|| -> Result<AttachSnapshot> {
+                let record: String = row.try_get(1)?;
+                let revision: i64 = row.try_get(2)?;
+                let alarm: Option<i64> = row.try_get(3)?;
+                Ok(AttachSnapshot {
+                    loaded: Loaded {
+                        record: serde_json::from_str(&record)
+                            .context("decoding a stored tunnel")?,
+                        revision: revision as u64,
+                    },
+                    alarm: alarm.map(|alarm| alarm as u64),
+                })
+            })();
+            found.insert(id, decoded.map_err(|error| format!("{error:#}")));
+        }
+        Ok(found)
     }
 
     /// Writes a record read at `revision` (0: no row existed) and returns its new revision. Fails with

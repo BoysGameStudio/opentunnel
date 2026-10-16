@@ -52,10 +52,21 @@ pub const SAFETY_TTL_MS: u64 = 10 * MINUTE_MS;
 /// How long an attach waits for the database before it fails (or goes on with a cached record), well inside the
 /// client's 10 s connect timeout, so clients back off instead of reconnecting the moment they gave up.
 const ATTACH_STORAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+/// An attach uses the record (and alarm) read this recently instead of reading them again.
+const ATTACH_REREAD_MS: u64 = 2_000;
 /// `lastConnectedAt` is written on attach only when it is older than this (or the stored state is not online).
 /// It only decides whether a tunnel counts as active for renewals (90 days), so an hour is plenty precise, and
 /// reconnecting clients do not rewrite their record every time.
 pub const LAST_CONNECTED_INTERVAL_MS: u64 = HOUR_MS;
+/// Bridges told to reconnect per second at shutdown: about what a machine attaches in a second.
+const DRAIN_RATE: usize = 5_000;
+/// The longest a shutdown spreads telling bridges to reconnect, well inside `SHUTDOWN_DRAIN_MS` (10 s).
+const DRAIN_SPREAD: std::time::Duration = std::time::Duration::from_secs(5);
+const DRAIN_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+/// Attaches doing their bookkeeping (`lastConnectedAt`, the renewal check) in the database at once. In a
+/// reconnect storm nearly every attach writes (bridges stay up for hours, so their `lastConnectedAt` is old), and
+/// unbounded those writes took the whole pool from the reads attaches wait on. Bookkeeping may finish late.
+const BOOKKEEPING_WRITES: usize = 10;
 
 #[derive(Clone)]
 pub struct Service(Arc<Inner>);
@@ -83,6 +94,8 @@ pub struct Inner {
     timeouts: std::sync::OnceLock<crate::net::Timeouts>,
     /// Set once the server is shutting down: bridges that arrive are told to reconnect elsewhere.
     draining: AtomicBool,
+    /// Attach bookkeeping writing to the database at once.
+    bookkeeping: tokio::sync::Semaphore,
 }
 
 impl std::ops::Deref for Service {
@@ -111,6 +124,8 @@ pub struct EntryState {
     generation: u64,
     bridges: Vec<Arc<Bridge>>,
     sequence: u32,
+    /// The renewal alarm read with `record`, and `checked_at` then.
+    alarm: Option<(u64, Option<u64>)>,
 }
 
 impl EntryState {
@@ -128,6 +143,8 @@ impl EntryState {
 pub enum Outbound {
     Text(String),
     Binary(Bytes),
+    /// The answer to a WebSocket ping from the client.
+    Pong(Bytes),
     Close(u16, String),
 }
 
@@ -363,6 +380,7 @@ impl Service {
             generation: AtomicU64::new(0),
             timeouts: std::sync::OnceLock::new(),
             draining: AtomicBool::new(false),
+            bookkeeping: tokio::sync::Semaphore::new(BOOKKEEPING_WRITES),
         }))
     }
 
@@ -410,19 +428,24 @@ impl Service {
     ) -> Result<tokio::sync::MutexGuard<'a, EntryState>> {
         let mut state = entry.state.lock().await;
         if !state.loaded {
-            let mut loaded = self.store.tunnel(&entry.id).await?;
+            let mut loaded = self.store.tunnel_with_alarm(&entry.id).await?;
             if loaded.is_none()
                 && let Some(pull) = self.pull_through.get()
                 && pull.fetch(&entry.id).await
             {
-                loaded = self.store.tunnel(&entry.id).await?;
+                loaded = self.store.tunnel_with_alarm(&entry.id).await?;
             }
-            (state.record, state.revision) = match loaded {
-                Some(loaded) => (Some(loaded.record), loaded.revision),
-                None => (None, 0),
+            let now = self.now();
+            (state.record, state.revision, state.alarm) = match loaded {
+                Some(loaded) => (
+                    Some(loaded.loaded.record),
+                    loaded.loaded.revision,
+                    Some((now, loaded.alarm)),
+                ),
+                None => (None, 0, None),
             };
             state.loaded = true;
-            state.checked_at = self.now();
+            state.checked_at = now;
             state.stale = false;
             state.generation = self.generation.load(Ordering::SeqCst);
         }
@@ -509,6 +532,17 @@ impl Service {
             return Ok((state, unread));
         }
         let generation = self.generation.load(Ordering::SeqCst);
+        // Read moments ago, by the upgrade that let this bridge in (a tunnel new to this machine): reading it
+        // again would only double the attach's round trips to the database.
+        if let Some((read_at, alarm)) = state.alarm
+            && state.loaded
+            && !state.stale
+            && state.generation == generation
+            && read_at == state.checked_at
+            && now.saturating_sub(read_at) < ATTACH_REREAD_MS
+        {
+            return Ok((state, AttachFollowup { alarm: Some(alarm) }));
+        }
         let snapshot = self
             .store
             .attach_snapshot(&entry.id, ATTACH_STORAGE_TIMEOUT)
@@ -517,6 +551,7 @@ impl Service {
             Ok(Some(snapshot)) => {
                 state.record = Some(snapshot.loaded.record);
                 state.revision = snapshot.loaded.revision;
+                state.alarm = Some((now, snapshot.alarm));
                 state.loaded = true;
                 state.checked_at = now;
                 state.stale = false;
@@ -1431,8 +1466,28 @@ impl Service {
     /// (`lastConnectedAt`, at most every `LAST_CONNECTED_INTERVAL_MS`) and checks the renewal. None of it delays
     /// or fails the attach: a failed record write or renewal check happens again on the next attach or alarm.
     pub async fn after_attach(&self, id: &str, bridge: &Arc<Bridge>, followup: AttachFollowup) {
+        let recent = |record: &StoredTunnel, now: u64| {
+            record.state == TunnelState::Online
+                && record
+                    .last_connected_at
+                    .as_deref()
+                    .and_then(parse_iso)
+                    .is_some_and(|at| now.saturating_sub(at) < LAST_CONNECTED_INTERVAL_MS)
+        };
         let record = async {
             let entry = self.entry(id);
+            let writes = followup.alarm.is_none() || {
+                let state = entry.state.lock().await;
+                state
+                    .record()
+                    .is_some_and(|record| !recent(record, self.now()))
+            };
+            // Taken before the entry's lock, so routing never waits for a slot.
+            let _slot = if writes {
+                Some(self.bookkeeping.acquire().await)
+            } else {
+                None
+            };
             let mut state = entry.state.lock().await;
             let Some(record) = state.record().cloned() else {
                 return;
@@ -1441,12 +1496,7 @@ impl Service {
                 return;
             }
             let now = self.now();
-            let recent = record.state == TunnelState::Online
-                && record
-                    .last_connected_at
-                    .as_deref()
-                    .and_then(parse_iso)
-                    .is_some_and(|at| now.saturating_sub(at) < LAST_CONNECTED_INTERVAL_MS);
+            let recent = recent(&record, now);
             let record = if recent {
                 record
             } else {
@@ -1717,11 +1767,25 @@ impl Service {
     /// Closes every bridge, for shutdown. Clients treat `drain` as a reason to reconnect.
     /// Tells every bridge to reconnect elsewhere (`drain`, then close 1012), and every bridge that arrives from
     /// now on as soon as it registers.
+    /// Tells every bridge to reconnect elsewhere, and any that arrives from now on. Many bridges are told over up
+    /// to `DRAIN_SPREAD`, `DRAIN_RATE` a second: all at once, they all reached the machines they move to within
+    /// a quarter of a second (the clients' first retry), far more than one machine attaches at a time.
     pub async fn drain(&self) {
         self.draining.store(true, Ordering::SeqCst);
+        let mut bridges = Vec::new();
         for entry in self.entries() {
             let state = entry.state.lock().await;
-            for bridge in &state.bridges {
+            bridges.extend(state.bridges.iter().cloned());
+        }
+        let steps = (DRAIN_SPREAD.as_millis() / DRAIN_STEP.as_millis()) as usize;
+        let per_step = (DRAIN_RATE * DRAIN_STEP.as_millis() as usize / 1000)
+            .max(bridges.len().div_ceil(steps.max(1)))
+            .max(1);
+        for (index, chunk) in bridges.chunks(per_step).enumerate() {
+            if index > 0 {
+                tokio::time::sleep(DRAIN_STEP).await;
+            }
+            for bridge in chunk {
                 send_drain(bridge, DRAIN_REASON);
             }
         }

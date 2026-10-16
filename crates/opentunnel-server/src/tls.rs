@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use anyhow::{Result, anyhow};
+use rustls::CipherSuite;
 use rustls::crypto::ring::sign::any_supported_type;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -52,14 +53,34 @@ impl ResolvesServerCert for ServerCertificate {
 }
 
 pub fn acceptor(certificate: Arc<ServerCertificate>) -> tokio_rustls::TlsAcceptor {
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("ring supports the default protocol versions")
-    .with_no_client_auth()
-    .with_cert_resolver(certificate);
+    // SHA-256 suites first, AES-128-GCM before the rest: SHA-384's key schedule runs on SHA-512, which CPUs do
+    // not accelerate, and it was the largest cost of a handshake after the key exchange.
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.cipher_suites.sort_by_key(|suite| {
+        matches!(
+            suite.suite(),
+            CipherSuite::TLS13_AES_256_GCM_SHA384
+                | CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+                | CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        )
+    });
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
+        .with_no_client_auth()
+        .with_cert_resolver(certificate);
+    config.ignore_client_order = true;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // Stateless resumption tickets (keys rotated every 6 hours, per process), so a client reconnecting to this
+    // machine skips the certificate signature, and nothing is stored per session: the default stateful cache
+    // holds only 256 sessions, far fewer than the bridges reconnecting in a storm.
+    match rustls::crypto::ring::Ticketer::new() {
+        Ok(ticketer) => {
+            config.ticketer = ticketer;
+            config.send_tls13_tickets = 1;
+        }
+        Err(error) => tracing::warn!(%error, "TLS session tickets are off"),
+    }
     tokio_rustls::TlsAcceptor::from(Arc::new(config))
 }
 

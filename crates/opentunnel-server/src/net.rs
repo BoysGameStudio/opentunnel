@@ -31,6 +31,32 @@ pub fn keepalive(stream: &TcpStream) {
     let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&params);
 }
 
+/// Connections the kernel queues before they are accepted. Tokio's default of 1024 overflowed in reconnect
+/// storms (the kernel then drops handshakes, which the proxy reports as failed connections); the kernel caps
+/// this at `net.core.somaxconn`.
+const LISTEN_BACKLOG: u32 = 16 * 1024;
+
+/// Binds a listener with a backlog deep enough for reconnect storms.
+pub fn listen(address: std::net::SocketAddr) -> io::Result<tokio::net::TcpListener> {
+    let socket = if address.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    // As std's and Tokio's own bind do, so a restarted server can bind while old connections linger.
+    #[cfg(unix)]
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    socket.listen(LISTEN_BACKLOG)
+}
+
+/// TCP keepalive, and no Nagle delay: the server forwards whatever it has at once (control messages, data
+/// frames, TLS records), and Nagle's wait for an ACK held small writes back for the peer's delayed ACK (40 ms).
+pub fn tune(stream: &TcpStream) {
+    keepalive(stream);
+    let _ = stream.set_nodelay(true);
+}
+
 /// How long a carried connection may go without traffic.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {

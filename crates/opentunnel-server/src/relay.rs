@@ -145,7 +145,7 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
         crate::metrics::visitor("rejected_unknown_tunnel");
         bail!("SNI is not an OpenTunnel hostname");
     };
-    let route = match service.route(&id, &accepted.sni).await {
+    let route = match Box::pin(service.route(&id, &accepted.sni)).await {
         Ok(route) => route,
         Err(error) => {
             crate::metrics::visitor("error");
@@ -182,10 +182,7 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
                 && let Some(cluster) = cluster
                 && let Some(route) = route_name(&accepted.sni, &id, &service.domain)
             {
-                match cluster
-                    .forward(accepted, &id, &route, service.timeouts())
-                    .await
-                {
+                match Box::pin(cluster.forward(accepted, &id, &route, service.timeouts())).await {
                     None => {
                         crate::metrics::visitor("forwarded_out");
                         return Ok(());

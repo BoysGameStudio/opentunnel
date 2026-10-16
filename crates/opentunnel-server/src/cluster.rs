@@ -384,7 +384,7 @@ pub async fn serve_internal(listener: TcpListener, service: Service, cluster: Ar
                 continue;
             }
         };
-        net::keepalive(&stream);
+        net::tune(&stream);
         let service = service.clone();
         let cluster = cluster.clone();
         tokio::spawn(async move {

@@ -5,21 +5,17 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
 use opentunnel::protocol::bridge::{HEARTBEAT_MS, IDLE_TIMEOUT_MS};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::analytics::ClientInfo;
 use crate::service::{Attach, Bridge, Inbound, Outbound, Outcome, Service};
+use crate::websocket::{self, Message};
 
 /// The client must attach within this long after the upgrade.
 pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,16 +70,18 @@ pub fn data_frame(conn: u32, payload: &[u8]) -> Outbound {
 }
 
 /// Runs a bridge session on an upgraded socket until it closes.
-pub async fn run<S>(
+pub async fn run<R, W>(
     service: Service,
     tunnel_id: String,
-    socket: WebSocketStream<S>,
+    reader: websocket::Reader<R>,
+    writer: websocket::Writer<W>,
     client: ClientInfo,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
-    let bridge = match service.register_bridge(&tunnel_id, tx, client).await {
+    let bridge = match Box::pin(service.register_bridge(&tunnel_id, tx, client)).await {
         Ok(Some(bridge)) => bridge,
         Ok(None) => return,
         Err(error) => {
@@ -91,19 +89,13 @@ pub async fn run<S>(
             return;
         }
     };
-    let (sink, stream) = socket.split();
     let cancel = bridge.cancel.clone();
-    let mut writer = tokio::spawn(write(sink, rx, cancel.clone()));
+    let mut writer = tokio::spawn(write(writer, rx, cancel.clone()));
     let mut followup = None;
-    let (code, clean) = read(&service, &tunnel_id, &bridge, stream, &mut followup).await;
-    // The attach's bookkeeping finishes before the bridge is cleaned up.
-    if let Some(followup) = followup {
-        let _ = followup.await;
-    }
-    if let Err(error) = service
-        .bridge_closed(&tunnel_id, &bridge, code, clean)
-        .await
-    {
+    let (code, clean) = read(&service, &tunnel_id, &bridge, reader, &mut followup).await;
+    // Cleaned up at once, even while the attach's bookkeeping still waits for the database (it skips a bridge
+    // that is gone): a reconnecting client's new bridge would otherwise conflict with this one for its routes.
+    if let Err(error) = Box::pin(service.bridge_closed(&tunnel_id, &bridge, code, clean)).await {
         warn!(%error, tunnel = %tunnel_id, "failed to clean up a bridge");
     }
     drop(bridge);
@@ -115,14 +107,17 @@ pub async fn run<S>(
     {
         cancel.cancel();
     }
+    if let Some(followup) = followup {
+        let _ = followup.await;
+    }
 }
 
-async fn write<S>(
-    mut sink: futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
+async fn write<W>(
+    mut writer: websocket::Writer<W>,
     mut rx: mpsc::Receiver<Outbound>,
     cancel: CancellationToken,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
 {
     loop {
         let message = tokio::select! {
@@ -130,21 +125,25 @@ async fn write<S>(
             _ = cancel.cancelled() => None,
         };
         let Some(message) = message else {
-            let _ = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
+            // The session is over and the server sent no close: close the WebSocket, then the stream.
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                writer.close(None).await?;
+                writer.shutdown().await
+            })
+            .await;
             return;
         };
-        let (message, last) = match message {
-            Outbound::Text(text) => (Message::text(text), false),
-            Outbound::Binary(data) => (Message::Binary(data), false),
-            Outbound::Close(code, reason) => (
-                Message::Close(Some(CloseFrame {
-                    code: CloseCode::from(code),
-                    reason: reason.into(),
-                })),
-                true,
-            ),
-        };
-        match tokio::time::timeout(WRITE_TIMEOUT, sink.send(message)).await {
+        let last = matches!(message, Outbound::Close(..));
+        let sent = tokio::time::timeout(WRITE_TIMEOUT, async {
+            match &message {
+                Outbound::Text(text) => writer.text(text).await,
+                Outbound::Binary(data) => writer.binary(data).await,
+                Outbound::Pong(data) => writer.pong(data).await,
+                Outbound::Close(code, reason) => writer.close(Some((*code, reason))).await,
+            }
+        })
+        .await;
+        match sent {
             Ok(Ok(())) if !last => {}
             Ok(Ok(())) => return,
             Ok(Err(error)) => {
@@ -162,15 +161,15 @@ async fn write<S>(
 }
 
 /// Reads until the session ends. Returns the close code and whether the close handshake completed.
-async fn read<S>(
+async fn read<R>(
     service: &Service,
     tunnel_id: &str,
     bridge: &Arc<Bridge>,
-    mut stream: futures_util::stream::SplitStream<WebSocketStream<S>>,
+    mut reader: websocket::Reader<R>,
     followup: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> (u16, bool)
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
 {
     let attach_deadline = tokio::time::sleep(ATTACH_TIMEOUT);
     tokio::pin!(attach_deadline);
@@ -178,7 +177,7 @@ where
     let mut attach_expired = false;
     loop {
         let next = tokio::select! {
-            next = stream.next() => next,
+            next = reader.next() => next,
             _ = bridge.cancel.cancelled() => {
                 return (bridge.snapshot().server_close.unwrap_or(1006), false);
             }
@@ -189,19 +188,22 @@ where
             }
         };
         let message = match next {
-            Some(Ok(message)) => message,
-            Some(Err(error)) => {
+            Ok(Some(message)) => message,
+            Err(error) => {
                 debug!(%error, "bridge read failed");
                 return (1006, false);
             }
-            None => return (bridge.snapshot().server_close.unwrap_or(1006), false),
+            Ok(None) => return (bridge.snapshot().server_close.unwrap_or(1006), false),
         };
-        if let Message::Close(frame) = &message {
-            let code = frame.as_ref().map_or(1005, |frame| u16::from(frame.code));
+        if let Message::Close(code) = message {
             return (code, true);
         }
         // Once the server has closed the session, only the client's close matters.
         if bridge.is_closing() {
+            continue;
+        }
+        if let Message::Ping(data) = message {
+            let _ = bridge.tx.try_send(Outbound::Pong(data));
             continue;
         }
         bridge.touch(service.now());
@@ -215,19 +217,19 @@ where
             }
             Message::Text(text) => {
                 let control: Option<serde_json::Map<String, Value>> =
-                    serde_json::from_str(text.as_str()).ok();
+                    serde_json::from_str(&text).ok();
                 let Some(control) = control.filter(|control| control["type"].is_string()) else {
                     bridge.close(1008, "invalid control");
                     continue;
                 };
                 if !attached {
-                    *followup = attach(service, tunnel_id, bridge, &control).await;
+                    *followup = Box::pin(attach(service, tunnel_id, bridge, &control)).await;
                     attached = followup.is_some();
                     continue;
                 }
                 handle_control(service, tunnel_id, bridge, &control).await;
             }
-            Message::Close(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+            Message::Close(_) | Message::Ping(_) | Message::Pong(_) => {}
         }
     }
 }

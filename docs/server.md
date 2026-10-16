@@ -242,7 +242,10 @@ Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
   SIGINT) a machine announces `leaving` on the mesh (peers drop its bridges
   and stop forwarding visitors to it), sends every bridge `drain` and
   closes it with 1012 (clients reconnect with backoff, to the new machines),
-  and does the same at once to any bridge that arrives later. For
+  and does the same at once to any bridge that arrives later. Many bridges
+  are told over up to 5 s, 5,000 a second, so the machines they move to see
+  a stream they can attach rather than all of them within the clients' first
+  retry (a quarter of a second). For
   `SHUTDOWN_DRAIN_MS` (10 s) it keeps accepting connections and answering the
   API, since the proxy may still route new connections to it (a host migration
   stops a machine without cordoning it); HTTP/1.1 responses then carry
@@ -274,6 +277,7 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_uptime_seconds` | gauge | | |
 | `opentunnel_accept_errors_total` | counter | `error` (`emfile`, `other`) | failed accepts; `emfile` is running out of descriptors |
 | `opentunnel_api_tls_handshakes_total` | counter | `result` (`ok`, `failed`, `timeout`) | TLS for the API domain; through Cloudflare a failed handshake is a 525 |
+| `opentunnel_connections_shed_total` | counter | `reason` (`handshakes`, `connections`) | public connections closed unserved because the machine is saturated: no API TLS handshake slot within 1 s, or at the 60,000 connection limit ([Capacity](#capacity)) |
 | `opentunnel_bridges_attached` | gauge | | |
 | `opentunnel_bridge_attaches_total` | counter | `result` (`ok`, `bad_token`, `cert_not_ready`, `invalid_route`, `route_conflict`, `error`) | |
 | `opentunnel_bridge_detaches_total` | counter | `reason` (`client_close`, `drop`, `idle_retire`, `drain`, `delete`, `server_close`) | attached bridges that ended |
@@ -465,11 +469,20 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   `syd`) pay for every sequential statement, so the paths clients wait on take
   as few as possible. An attach reads the record and its renewal alarm in one
   query (sent as a plain text query, so it is one round trip even on a pooled
-  connection that has not prepared it), checks route conflicts in memory
+  connection that has not prepared it; for a tunnel new to the machine, the
+  upgrade's read of moments before, which brings the alarm too, is used
+  instead of a second one), checks route conflicts in memory
   (asking another machine only when the table says it holds a requested
   route), announces the bridge to the mesh, and answers `attached`. The rest
   runs afterwards without failing the attach: `lastConnectedAt` (at most
-  hourly) and the renewal check. Closing a bridge touches no database at all.
+  hourly) and the renewal check, at most 10 attaches' worth at once so a
+  storm's writes leave the pool to the reads attaches wait on. Closing a
+  bridge touches no database at all, and does not wait for that bookkeeping.
+  Reads of single tunnels (attaches, upgrades, visitors of tunnels not cached)
+  are batched: while reads are in flight, new ones queue, and the next takes
+  up to 200 queued IDs in one `WHERE id IN (...)` (at most 8 batches at once),
+  so a storm on a machine 150 ms from the database is not capped at the pool
+  size per round trip (~100 attaches a second before; see [Capacity](#capacity)).
   A database that does not answer an attach within 4 s (or a pool with no free
   connection within 3 s) fails it, or attaches from a cached record, well
   inside the clients' 10 s connect timeout, so they back off instead of
@@ -529,6 +542,105 @@ minute both run, a visitor on an old machine for a bridge on a new one is
 closed. A deletion through a new machine reaches old machines through their own
 heartbeat (within a minute). Old machines need nothing from new ones.
 
+## Capacity
+
+Per `performance-1x` machine (one dedicated core, 2 GB), measured with the
+load test below against the server confined to one core and 2 GB.
+
+**What a bridge costs.** Memory: ~22 KB per idle bridge for the connection
+itself (rustls with its 4 KB record buffer, the two tasks, the queue, the
+bridge state), plus its tunnel's cached record (~6 KB with a certificate,
+chain and CSR), so ~29 KB in all, against ~190 KB before October 2026. What
+went: tungstenite's 128 KiB read buffer per socket (and read and write
+buffers that stayed as large as the largest frame a socket ever carried,
+~100 KB more on a bridge that had carried visitors), replaced by
+`websocket.rs`, which keeps no buffer between messages and writes frames
+straight from their payload; 40 KB futures per connection task (the API
+handlers and storage calls inline), now boxed while they run; and memory
+glibc kept after bursts, now returned with `malloc_trim` every minute. CPU:
+an attach (TCP, TLS 1.3, upgrade, attach, mesh announce) is ~0.14 ms, mostly
+the X25519 key exchange; SHA-256 suites go first (SHA-384's key schedule runs
+on SHA-512, which is not accelerated) and stateless session tickets let a
+client resume. Holding 50,000 idle bridges (a ping each every 15 s) takes
+~5% of the core. Sockets have `TCP_NODELAY`: before, small writes waited for
+the peer's delayed ACK, 40 ms per attach and per visitor's first bytes.
+
+**Reconnect storms.** The listen backlog is 16,384 (capped by the kernel's
+`somaxconn`; Tokio's 1,024 overflowed). At most 256 API TLS handshakes run at
+once; a new API connection that gets no slot within 1 s is closed before its
+handshake (`opentunnel_connections_shed_total{reason="handshakes"}`), so its
+client retries after its backoff instead of waiting in a queue until its
+10 s timeout and retrying anyway. Clients (both) wait 125-250 ms after an
+attached session ends, then double each failed attempt's delay up to 30 s
+(equal jitter), and reset only after `attached`, so a storm drains at the
+rate the machine attaches instead of compounding. Attach reads are batched
+and bookkeeping writes bounded (see Round trips above).
+
+**Results** (`examples/loadtest.rs`, server on one core and 2 GB, MySQL 8
+local or behind a proxy adding 75 ms each way like `nrt`/`syd`, PROXY v2,
+mesh on, records of real size):
+
+| | Before (10,000 bridges) | After (50,000 bridges) |
+| --- | --- | --- |
+| Memory per bridge | 158 KB (190 KB with real records) | 22 KB (29 KB with real records) |
+| Memory at the bridge count, steady | 1.56 GB (1.86 GB) | 1.41 GB; 1.7 GB after visitors and storms |
+| Ramp, local DB | 1,980/s at 45% CPU, attach p50 41 ms | 2,990/s at 42% CPU, attach p50 < 1 ms |
+| Ramp, DB 150 ms away | 113/s (offered 1,000/s), 46,000 upgrades answered 503 | 2,950/s, attach p50 227 ms, no failures |
+| Idle CPU (pings) | 1.9% | 4.7% |
+| Visitors (50 at once: ClientHello echoed, 5 × 4 KB round trips) | 2,050/s, first byte 40 ms | 4,400/s at 64% CPU, first byte p50 1 ms / p99 10 ms |
+| Storm: all dropped at once, local DB | 3.8 s, 6,600 kernel resets | 16-19 s, peak 90% CPU, no client timeouts, attach p99 5.3 s |
+| Storm, DB 150 ms away | 6.5 s | 16-19 s, no client timeouts |
+
+**Limits.** Memory binds first: ~160 MB at rest on Fly (pool connections,
+mesh table, website) plus ~29 KB per bridge reaches 60% of 2 GB at ~37,000
+bridges, while CPU stays near 5% idle and a storm of all of them drains in
+~15 s at a full core. `fly.toml` therefore sets `[services.concurrency]` on
+:443 (connections: bridges plus visitors and API calls) to `soft_limit` 15,000
+and `hard_limit` 35,000. Fly's proxy sends a new connection to the closest
+machine in the region that is under `soft_limit`, so with two or more machines
+in a region they fill evenly from 15,000 on (smaller storms per machine);
+soft limits never move traffic to another region. Above `hard_limit` a
+machine gets no new connections, and only when every machine in the region
+is there does the proxy use another region (bridges then attach there, and
+the mesh forwards their visitors). Plan a second machine in a region before
+it holds ~25,000 bridges (`opentunnel_bridges_attached`), or when
+`fly_instance_memory` passes 60% or CPU stays above 50%. The server's own
+limit is 60,000 connections, closed at once beyond that.
+
+**The load test.** `crates/opentunnel-server/examples/loadtest.rs`: `seed`
+writes tunnels with ready certificates straight into a database, `run`
+attaches bridges like real clients (TCP from several loopback addresses, a
+PROXY v2 header, TLS to the API domain, the upgrade, `attach`, pings every
+15 s; the bridges echo visitor data), holds them, sends visitors through
+them, drops them all at once and waits for them to attach again with the
+clients' backoff, sampling the server's CPU and memory from `/proc`; `delay`
+is a TCP proxy that puts the database 150 ms away.
+
+```bash
+docker run -d --name ot-load-mysql --tmpfs /var/lib/mysql -e MYSQL_ROOT_PASSWORD=opentunnel \
+  -e MYSQL_DATABASE=lt -p 13306:3306 mysql:8.0 --max-connections=1000
+cargo build --release -p opentunnel-server --example loadtest
+LT=target/release/examples/loadtest
+$LT seed --database-url mysql://root:opentunnel@127.0.0.1:13306/lt --count 50000
+$LT delay --listen 127.0.0.1:13307 --target 127.0.0.1:13306 --delay-ms 75 &   # optional: a far database
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout key.pem -out cert.pem \
+  -days 30 -subj /CN=opentunnel.test -addext subjectAltName=DNS:opentunnel.test
+mkdir -p site && echo ok > site/index.html
+# One core and 2 GB, like performance-1x:
+systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0 env OPENTUNNEL_DOMAIN=opentunnel.test \
+  DATABASE_URL=mysql://root:opentunnel@127.0.0.1:13306/lt TLS_CERT_FILE=cert.pem TLS_KEY_FILE=key.pem \
+  WEBSITE_DIR=site ISSUER=local HTTP_LISTEN=off PROXY_PROTOCOL=true INTERNAL_LISTEN=127.0.0.1:9000 \
+  INTERNAL_TOKEN=loadtest MESH_DNS=off RUST_LOG=warn taskset -c 0 target/release/opentunnel-server &
+ulimit -n 500000
+taskset -c 2-23 $LT run --count 50000 --rate 3000 --sources 8 --proxy-protocol --pid $(pgrep -n opentunnel-serv)
+docker rm -f ot-load-mysql
+```
+
+`run --help` lists the phases' knobs (`--hold`, `--visitors`, `--echo-bytes`,
+`--storms`, `--no-resume`, ...). More than ~28,000 bridges need more loopback
+source addresses (`--sources`), and the kernel's `somaxconn` caps the server's
+backlog (4096 by default; resets in a storm are that queue overflowing).
+
 ## Tests
 
 The storage, service, API contract and end-to-end tests need a MySQL 8 server
@@ -543,7 +655,7 @@ docker rm -f ot-mysql    # when done; it holds the test databases
 ```
 
 - `cargo test -p opentunnel-server`: storage (revisions, imports, concurrent
-  alarms, job leases), unit tests (SNI, PROXY protocol, CSRs,
+  alarms, job leases), unit tests (SNI, PROXY protocol, CSRs, the bridge WebSocket codec,
   analytics, renewal scheduling with a manual clock, stale bridges, routing,
   cached answers and mesh events, imports), the API contract replay against the Worker's recorded responses,
   the Rust client end to end (provisioning, passthrough, shared tunnels,
