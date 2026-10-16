@@ -201,12 +201,11 @@ fn unmask(data: &mut [u8], mask: [u8; 4]) {
     let wide = u64::from_ne_bytes([
         mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
     ]);
-    let mut chunks = data.chunks_exact_mut(8);
-    for chunk in &mut chunks {
-        let value = u64::from_ne_bytes((&*chunk).try_into().expect("8 bytes")) ^ wide;
-        chunk.copy_from_slice(&value.to_ne_bytes());
+    let (chunks, rest) = data.as_chunks_mut::<8>();
+    for chunk in chunks {
+        *chunk = (u64::from_ne_bytes(*chunk) ^ wide).to_ne_bytes();
     }
-    for (index, byte) in chunks.into_remainder().iter_mut().enumerate() {
+    for (index, byte) in rest.iter_mut().enumerate() {
         *byte ^= mask[index % 4];
     }
 }
