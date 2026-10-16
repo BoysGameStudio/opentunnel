@@ -171,14 +171,14 @@ async fn hands_connections_without_a_local_bridge_to_the_worker() {
     relays_to_the_worker(&[], "stillonwrkr").await;
 }
 
-/// With other machines, the Worker gets what no machine has a bridge for, even when the registry still names a
-/// machine that is gone.
+/// With other machines, the Worker gets what no machine has a bridge for.
 #[tokio::test(flavor = "multi_thread")]
 async fn hands_connections_no_machine_serves_to_the_worker() {
     relays_to_the_worker(
         &[
             "--internal-listen=127.0.0.1:0",
             "--internal-token=cluster-secret",
+            "--mesh-dns=off",
         ],
         "migratedhere",
     )
@@ -200,7 +200,7 @@ async fn relays_to_the_worker(extra: &[&str], id: &str) {
     };
 
     if server.server.cluster.is_some() {
-        // Imported here, but its client is still on the Worker; a crashed machine's row remains.
+        // Imported here, but its client is still on the Worker.
         let record = serde_json::from_value(serde_json::json!({
             "version": 1,
             "id": id,
@@ -214,18 +214,7 @@ async fn relays_to_the_worker(extra: &[&str], id: &str) {
             } }
         }))
         .unwrap();
-        let store = &server.service().store;
-        store.put_tunnel(&record, 1).await.unwrap();
-        let gone = opentunnel_server::store::BridgeLocation {
-            tunnel_id: id.into(),
-            route: String::new(),
-            machine_id: "crashed".into(),
-            bridge_id: 1,
-            region: "sin".into(),
-            address: "127.0.0.1:1".into(),
-            updated_at: server.service().now(),
-        };
-        store.put_bridge(&gone, &["api".into()]).await.unwrap();
+        server.service().store.put_tunnel(&record, 1).await.unwrap();
     }
     let hello = client_hello(&format!("api.{id}.opentunnel.test"));
     let mut visitor = TcpStream::connect(server.tls).await.unwrap();
@@ -252,7 +241,7 @@ async fn relays_to_the_worker(extra: &[&str], id: &str) {
             stats
                 .forward_failures
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            0
         );
     }
     server.stop().await;

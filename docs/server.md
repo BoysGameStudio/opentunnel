@@ -1,8 +1,8 @@
 # The OpenTunnel server
 
 `crates/opentunnel-server` is the whole hosted service in one async Rust
-binary (Tokio, rustls with `ring`, hyper, MySQL on PlanetScale through sqlx), run as one machine per Fly
-region against one shared database ([Multiple regions](#multiple-regions)). It replaced the Cloudflare
+binary (Tokio, rustls with `ring`, hyper, MySQL on PlanetScale through sqlx), run as one or more machines per
+Fly region against one shared database, linked by a mesh ([Multiple regions](#multiple-regions)). It replaced the Cloudflare
 Worker, its Durable Objects, its certificate Workflow, and the TCP relay on
 AWS without changing anything clients see: the HTTP API, the bridge protocol
 ([protocol.md](protocol.md)), hostnames, tokens, and certificates are the same.
@@ -79,12 +79,12 @@ MySQL 8, in production the PlanetScale database `opentunnel` (org
   (`pending`, `done`, `failed`, `abandoned`), attempts, the next run time, and
   a lease (`lease_owner`, `lease_until`).
 - `server_certificates`: the domain's key, CSR, certificate and expiry.
-- `meta`: the API certificate's current job, the local test CA when
-  `ISSUER=local`, and one `machine:<id>` row per live machine (region,
-  internal address, `updatedAt`; [Multiple regions](#multiple-regions)).
-- `bridges` (schema 2): the registry of attached bridges, one row per tunnel,
-  route and machine (`bridge_id`, `region`, the machine's internal `address`,
-  `updated_at`).
+- `meta`: the API certificate's current job and the local test CA when
+  `ISSUER=local` (servers before the mesh also kept `machine:<id>` rows here).
+- `bridges` (schema 2): the bridge registry of servers before the mesh. The
+  mesh keeps that in memory ([Multiple regions](#multiple-regions)); this
+  version only reads it while a machine of the previous version is still
+  running (a deploy from it). TEMPORARY: drop it in a later schema version.
 - `schema_migrations`: the schema version.
 
 The schema keeps to what Vitess allows: a primary key on every table, no
@@ -199,11 +199,14 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `ISSUANCE_CONCURRENCY` | `4` | ACME orders at once |
 | `ANALYTICS_URL`, `ANALYTICS_TOKEN` | | the platform event stream's HTTP endpoint and bearer token; analytics are off without the URL |
 | `ADMIN_TOKEN` | | secret: enables `POST /api/admin/{import,export,stats}` |
-| `INTERNAL_LISTEN` | `off` | the internal listener for other machines (`[::]:9000` on Fly, bound to `FLY_PRIVATE_IP`); `off` runs a single machine without the registry |
+| `INTERNAL_LISTEN` | `off` | the internal listener for other machines: mesh links, forwarded visitors, route checks (`[::]:9000` on Fly, bound to `FLY_PRIVATE_IP`); `off` runs a single machine without the mesh |
 | `INTERNAL_TOKEN` | | secret shared by all machines, required with `INTERNAL_LISTEN` |
 | `INTERNAL_ADDRESS` | `[FLY_PRIVATE_IP]:<port>` | where other machines reach this one |
-| `FLY_MACHINE_ID`, `FLY_REGION`, `FLY_PRIVATE_IP` | random, `local`, | set by Fly: the registry's machine ID (also the job lease owner), region, and 6PN address |
-| `CLUSTER_HEARTBEAT_MS` | `60000` | registry heartbeat; rows older than three are ignored |
+| `FLY_MACHINE_ID`, `FLY_REGION`, `FLY_PRIVATE_IP`, `FLY_APP_NAME` | random, `local`, , | set by Fly: the machine's ID in the mesh (also the job lease owner), region, 6PN address, and app (for `MESH_DNS`) |
+| `MESH_DNS` | `<FLY_APP_NAME>.internal` | a name whose AAAA/A records are the other machines, at this machine's internal port; `off` disables it |
+| `MESH_PEERS` | | static peer addresses (`host:port`, comma-separated), in addition to `MESH_DNS` |
+| `MESH_DISCOVERY_MS` | `5000` | how often `MESH_DNS` is resolved again |
+| `MESH_PING_MS` / `MESH_DEAD_MS` | `1000` / `5000` | an idle link pings this often; a peer silent this long is down |
 | `CONNECTION_IDLE_TIMEOUT_MS` | `900000` | a tunnel connection with no traffic either way for this long is reset |
 | `HALF_CLOSE_TIMEOUT_MS` | `60000` | once either direction of a tunnel connection has ended, the other is reset after this long without traffic |
 | `METRICS_LISTEN` | `off` | Prometheus metrics at `/metrics` (`[::]:9091` on Fly, unauthenticated, not in `[[services]]`); see [Observability](#observability) |
@@ -222,16 +225,22 @@ Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
   bridge counts are the answering machine's; `machine` has its ID, region and
   forwarding counters (`forwarded_out`, `forwarded_in`, `forward_failures`)
   and live Tokio tasks and open file descriptors (`tasks`, `fds`, which should
-  follow open connections and bridges, not grow over time), and `cluster` the registry's view: bridges in total, per region, and per
-  machine. The request lands on the machine nearest the caller's Cloudflare
-  colo.
+  follow open connections and bridges, not grow over time), and `cluster` the
+  answering machine's mesh view: bridges in total and per region, every
+  machine it is linked to (itself as `link: "self"`) with its bridges, tunnels,
+  routes, epoch, sequence number and whether it is draining, the state of every
+  peer address (`peers`: `up`, `connecting`, `unreachable`, `legacy`), and
+  `complete` (every peer linked). The request lands on the machine nearest the
+  caller's Cloudflare colo; every machine should show the same machines and
+  bridge counts.
 - At startup the open file soft limit is raised to the hard limit (logged as
   `open file limit`); when it is reached anyway, accept loops pause 500 ms
   between attempts and log at most every 10 s.
 - Deploys are blue-green (`fly.toml`): a new machine starts next to each old
   one; once all are healthy, Fly cordons the old machines (the proxy stops
   sending them new connections), waits 10 s and stops them. On SIGTERM (or
-  SIGINT) a machine removes its registry rows, sends every bridge `drain` and
+  SIGINT) a machine announces `leaving` on the mesh (peers drop its bridges
+  and stop forwarding visitors to it), sends every bridge `drain` and
   closes it with 1012 (clients reconnect with backoff, to the new machines),
   and does the same at once to any bridge that arrives later. For
   `SHUTDOWN_DRAIN_MS` (10 s) it keeps accepting connections and answering the
@@ -273,7 +282,12 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_visitor_bytes_total` | counter | `direction` (`in`, `out`) | counted on the machine with the bridge |
 | `opentunnel_visitor_connection_duration_seconds` | histogram | | connections carried over a bridge here |
 | `opentunnel_cluster_forward_failures_total` | counter | `reason` (`refused`, `connect`, `timeout`, `io`) | |
-| `opentunnel_cluster_registry_lookups_total` | counter | `result` (`hit`, `miss`, `error`) | the route location cache |
+| `opentunnel_mesh_lookups_total` | counter | `result` (`hit`, `miss`) | a visitor without a local bridge: another machine holds the route, or none does |
+| `opentunnel_mesh_peers` | gauge | `state` (`up`, `connecting`, `unreachable`, `legacy`) | other machines this one knows by address; `legacy` answers without the mesh (the previous version) |
+| `opentunnel_mesh_links_total` | counter | `event` (`up`, `down`) | mesh links that came up or went down (reconnects) |
+| `opentunnel_mesh_table_bridges` | gauge | `machine` | bridges in this machine's table per machine holding them (itself included) |
+| `opentunnel_mesh_propagation_seconds` | histogram | `kind` (`attached`, `detached`, `event`) | from a peer announcing a change to this machine applying it, by the two machines' clocks |
+| `opentunnel_mesh_snapshot_bridges`, `opentunnel_mesh_snapshot_duration_seconds` | histogram | | snapshots received when links come up: their size, and from the peer taking it to applying it here |
 | `opentunnel_db_query_duration_seconds` | histogram | `operation` (the `Store` method) | |
 | `opentunnel_db_errors_total` | counter | `operation` | failed and timed out statements |
 | `opentunnel_db_pool_connections` | gauge | `state` (`idle`, `in_use`) | |
@@ -318,6 +332,12 @@ sum by (region, result) (rate(opentunnel_api_tls_handshakes_total{app="opentunne
 # Visitors turned away, by reason; forwarding between machines failing
 sum by (outcome) (rate(opentunnel_visitor_connections_total{app="opentunnel",outcome=~"rejected.*|error"}[5m]))
 sum by (region, reason) (rate(opentunnel_cluster_forward_failures_total{app="opentunnel"}[5m]))
+# The mesh: every machine should see all others up, and the same bridges per machine
+min(opentunnel_mesh_peers{app="opentunnel",state="up"})
+sum by (region, state) (opentunnel_mesh_peers{app="opentunnel",state!="up"}) > 0
+sum by (region) (increase(opentunnel_mesh_links_total{app="opentunnel",event="down"}[1h]))
+sum by (region) (opentunnel_mesh_table_bridges{app="opentunnel"})
+histogram_quantile(0.99, sum by (le, kind) (rate(opentunnel_mesh_propagation_seconds_bucket{app="opentunnel"}[5m])))
 # Slow storage, per operation
 histogram_quantile(0.99, sum by (le, operation) (rate(opentunnel_db_query_duration_seconds_bucket{app="opentunnel"}[5m])))
 ```
@@ -351,118 +371,135 @@ strips it.)
 
 ## Multiple regions
 
-Eleven machines, one in each of `iad`, `ord`, `sjc`, `gru`, `lhr`, `fra`, `cdg`, `jnb`,
-`sin`, `nrt` and `syd`, behind one anycast IPv4/IPv6. Fly sends each TCP
-connection to the nearest machine: a visitor to the one nearest the visitor,
-and a client's bridge (through Cloudflare, which proxies `opentunnel.xyz`) to
-the one nearest the client's Cloudflare colo. The two meet through a registry
-in MySQL and forwarding over Fly's private network (6PN). The code is
-`cluster.rs`; with `INTERNAL_LISTEN=off` none of it runs.
+Machines in `iad`, `ord`, `sjc`, `gru`, `lhr`, `fra`, `cdg`, `jnb`, `sin`, `nrt` and
+`syd` (one each today; busy regions may run several), behind one anycast
+IPv4/IPv6. Fly sends each TCP connection to the nearest machine: a visitor to
+the one nearest the visitor, and a client's bridge (through Cloudflare, which
+proxies `opentunnel.xyz`) to the one nearest the client's Cloudflare colo. The
+two meet through the mesh and forwarding over Fly's private network (6PN). The
+code is `mesh.rs` (links, table, events) and `cluster.rs` (forwarding, route
+checks, acting on events); with `INTERNAL_LISTEN=off` none of it runs.
 
 ```text
-visitor ─▶ machine B (syd) ── no bridge here ── registry: tunnel/route → machine A
-             │                                                     │
-             └── TCP over 6PN to A:9000 ──▶ "OPENTUNNEL-FORWARD/1 <secret> <id> <route> <visitor>\n"
-                                              + ClientHello ◀── "1" ── then raw bytes both ways
-client ─▶ Cloudflare ─▶ machine A (iad) ─▶ bridge attached, rows in `bridges`
+                    ┌── mesh link (TCP over 6PN, :9000): snapshot, attached/detached, events, pings ──┐
+client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "attached" to every peer         machine B (syd) ◀─ visitor
+                                 ▲                                                             │ table: tunnel/route → A
+                                 └──── TCP over 6PN to A:9000: "OPENTUNNEL-FORWARD/1 <secret> <id> <route> <visitor>\n"
+                                       + ClientHello ──▶ "1" ──▶ raw bytes both ways ──────────┘
 ```
 
-- **Registry.** On attach, the machine upserts one `bridges` row per route
-  (tunnel, route, machine, bridge ID, region, internal address) and deletes
-  them when the bridge closes or is retired as silent. Every heartbeat (60 s)
-  it refreshes `updated_at` on all its rows, records bridges whose upsert
-  failed (database outage), retries failed removals, and closes local bridges
-  of tunnels deleted elsewhere. Readers ignore rows older than three
-  heartbeats, so a crashed machine's rows expire after at most three minutes;
-  a machine deletes all rows with its own ID at startup and on clean shutdown,
-  and anyone deletes rows untouched for thirty heartbeats.
+- **Membership.** Peers are the addresses of `<FLY_APP_NAME>.internal`
+  (every started machine of the app), resolved every 5 s, plus `MESH_PEERS`.
+  Every machine keeps one long-lived TCP link to every other one, on the
+  internal listener. Both sides dial (the higher address waits 2 s first, so
+  usually the lower one's link is the only one); if two links to one machine
+  come up, both sides keep the same one: the newer life of the machine
+  (`started_at`, then a random `epoch`), then the link dialed by the lower
+  address. Failed dials back off from 200 ms to 5 s. An address that leaves DNS
+  is dialed for 30 s more.
+- **Links.** Both sides send `OPENTUNNEL-MESH/1 <INTERNAL_TOKEN>\n` (checked
+  in constant time), then frames: a big-endian `u32` length and a JSON object
+  with a `type`. First `hello` (format version, machine ID, region, internal
+  address, epoch, `started_at`, draining), then a `snapshot` of the sender's
+  own bridges with its sequence number, then `attached`/`detached` deltas
+  numbered by that per-machine sequence (a gap closes the link, which
+  reconnects with a fresh snapshot), `event`s, and a `ping` every second when
+  idle. Every frame carries the sender's clock (`sent_at`) for the propagation
+  metric. Unknown frame types and fields are ignored, so additions need no
+  version bump. A peer that sends nothing for 5 s is down, as is one whose link
+  closes or fails; a peer that falls 200,000 frames behind is disconnected and
+  starts over.
+- **The table.** Each machine is the only writer of its own entries (tunnel,
+  bridge ID, routes, attach time), so nothing needs consensus: it announces
+  `attached` before the client hears `attached` and `detached` when the bridge
+  closes or is retired as silent, and every peer applies them in order.
+  Lookups ("who holds tunnel X, route Y", "is tunnel X online elsewhere") are
+  local reads. When a peer goes down its entries are dropped at once; when it
+  comes back its snapshot replaces them, and a restarted machine (new epoch)
+  replaces its previous life's entries the moment its new link is up. A
+  draining machine's entries are dropped as soon as it announces `leaving`.
+- **Events** go to every linked peer on the same links: tunnel created,
+  certificate changed (bound, ready, renewed), tunnel deleted (the receiver
+  closes its bridges of the tunnel and forgets its record), leaving, and job
+  enqueued (wakes the job runners; leases still make each job run once).
+  Receivers mark the tunnel's cached record stale, so the next upgrade or
+  visitor reads it again. Events sent while a link is down are lost, so every
+  link that comes up (startup, a reconnect, a healed partition) makes the
+  receiver read cached "missing" and "not ready" answers again before trusting
+  them, and check, in one query,
+  whether any tunnel with a bridge here was deleted meanwhile. A link
+  subscribes to its sender's announcements before its `hello` goes out, so
+  anything announced after the receiver sees the link arrives over it, and
+  anything before was written to the database before the receiver's check.
+- **Cached records.** A machine caches tunnel records for routing, so the
+  database stays off the visitor path. API calls, attaches, alarms and
+  certificate updates read the record again (one query); routing re-reads a
+  cached record only while it is missing or its certificate is not ready, and
+  then only when told (an event, a new link), when the mesh is not complete (a
+  peer starting, unreachable or of the previous version: then after 30 s for
+  missing, 5 s for not ready, as before), or after a 10-minute safety TTL. Idle
+  entries without bridges are dropped after 30 s. During a database outage
+  the cached copy is used.
 - **Forwarding.** A visitor for a route with no local bridge: look up the
-  route's freshest row on another machine (cached 30 s, a miss 10 s), connect
-  to its internal address, send the header (shared secret, tunnel, route, the
-  visitor's address from PROXY v2) and the buffered ClientHello. The receiver
-  parses the ClientHello itself and routes it exactly like a local visitor
-  (`max_conns`, backpressure, analytics, the `open` message with the real
-  visitor address), but never forwards again. It answers `1` before the stream
-  or `0` when it has no bridge; on `0` or a failed connection the sender drops
-  its cache entry (and skips an unreachable machine for 30 s), looks up once
-  more, and otherwise falls back to the legacy Worker (if configured) or
-  closes. The sender then copies both directions (`net::splice`, 32 KiB
-  buffers, half-closes passed on, the same idle and half-close timeouts as
-  local visitors); a reset or timeout on one side resets the other.
-- **Control.** The internal listener also serves a small HTTP/1.1 API,
-  authenticated with `Authorization: Bearer <INTERNAL_TOKEN>` (compared in
-  constant time): `GET /internal/tunnel/<id>/routes` (the routes this
-  machine's live bridges hold, after retiring silent ones), `POST
-  /internal/tunnel/<id>/close` (a deletion) and `POST
-  /internal/tunnel/<id>/invalidate` (the tunnel changed: drop cached answers
-  for it). Deleting a tunnel on any machine closes its bridges on every
-  machine in the registry and removes its rows.
-  Attaching checks the registry for the requested routes on other machines
-  and asks those machines whether they still hold them; only a live answer is
-  a `route_conflict`, so a crashed or draining machine's leftover rows never
-  block a client that moved. Two machines accepting the same route in the same
-  instant is possible; visitors then go to the newer row and nothing breaks.
+  route in the table (the newest attach if two machines claim it), connect to
+  the holder's internal address, send the header (shared secret, tunnel,
+  route, the visitor's address from PROXY v2) and the buffered ClientHello.
+  The receiver parses the ClientHello itself and routes it exactly like a
+  local visitor (`max_conns`, backpressure, analytics, the `open` message with
+  the real visitor address), but never forwards again. It answers `1` before
+  the stream or `0` when it has no bridge; on `0` or a failed connection the
+  sender looks once more, skipping that machine, and otherwise falls back to
+  the legacy Worker (if configured) or closes. The sender then copies both
+  directions (`net::splice`, 32 KiB buffers, half-closes passed on, the same
+  idle and half-close timeouts as local visitors); a reset or timeout on one
+  side resets the other.
+- **Route conflicts.** Attaching checks the table for the requested routes on
+  other live machines and asks only those (`GET /internal/tunnel/<id>/routes`
+  on the internal listener, `Authorization: Bearer <INTERNAL_TOKEN>`, which
+  retires silent bridges before answering); only a live answer is a
+  `route_conflict`, so a machine that is down, draining or cannot be asked
+  never blocks a client that moved. Two machines accepting the same route in
+  the same instant is possible; visitors then go to the newer attach and
+  nothing breaks.
 - **Round trips.** Machines far from the database (~150 ms from `nrt`,
   `syd`) pay for every sequential statement, so the paths clients wait on take
-  as few as possible. An attach reads the record, its renewal alarm and the
-  tunnel's live registry rows on other machines in one query (sent as a plain
-  text query, so it is one round trip even on a pooled connection that has
-  not prepared it), checks route conflicts from those rows (asking another
-  machine only when it has a row for a requested route), and answers
-  `attached`. The rest runs afterwards, side by side and without failing the
-  attach: the registry upsert, `lastConnectedAt` (at most hourly) and the
-  renewal check. A visitor on another machine in the round trip before the row
-  lands is closed, as for a bridge still connecting; a failed upsert is retried
-  by the heartbeat. Closing a bridge touches no record; its registry removal is
-  queued and written with others in one statement within ~100 ms. A
-  database that does not answer an attach within 4 s (or a pool with no free
+  as few as possible. An attach reads the record and its renewal alarm in one
+  query (sent as a plain text query, so it is one round trip even on a pooled
+  connection that has not prepared it), checks route conflicts in memory
+  (asking another machine only when the table says it holds a requested
+  route), announces the bridge to the mesh, and answers `attached`. The rest
+  runs afterwards without failing the attach: `lastConnectedAt` (at most
+  hourly) and the renewal check. Closing a bridge touches no database at all.
+  A database that does not answer an attach within 4 s (or a pool with no free
   connection within 3 s) fails it, or attaches from a cached record, well
   inside the clients' 10 s connect timeout, so they back off instead of
   reconnecting at once. The job runner and the alarm loop each take one query
-  per wakeup, wake on local notifications and when the next job or alarm is
-  due, and otherwise poll every 30-60 s (jittered). Upgrades and visitors for
-  a missing or deleted tunnel trust that answer for 30 s, and a record whose
-  certificate is not ready is read again at most every 5 s, so scanners and
-  the clients of deleted tunnels do not query the database on every
-  connection. Those answers are not left to expire when the tunnel changes
-  elsewhere: see Invalidation below. `attaches_within_one_database_round_trip`
-  in `service.rs` checks the attach against a database 100 ms away.
-- **Invalidation.** Each machine records itself in `meta` (`machine:<id>`)
-  at startup and every heartbeat, with or without bridges, and removes the
-  row on a clean shutdown. When a tunnel is created, deleted, its certificate
-  bound, or its certificate (or renewal) becomes ready, the machine that wrote
-  it lists the live machines (one query) and sends each other one `POST
-  /internal/tunnel/<id>/invalidate`, concurrently and in the background (1 s
-  timeout), so the API call never waits for it and an unreachable machine
-  delays nothing. The receiver marks its cached entry (if it has one) stale,
-  and its next upgrade or visitor reads the record again; during a database
-  outage the cached copy is still used. So a client whose tunnel was just
-  created or issued through one machine is accepted at once by another, even
-  if that one had looked the ID up before. A lost invalidation (machine
-  restarting, 6PN trouble) only falls back to the TTLs above: 30 s for
-  missing, 5 s for not ready.
-- **Cached records.** A machine caches tunnel records for routing, so the
-  database stays off the visitor path. With other machines writing, API calls,
-  attaches, alarms and certificate updates read the record again (one query),
-  and routing re-reads a cached record only while it is missing or its
-  certificate is not ready. During a database outage the cached copy is used.
+  per wakeup, wake on local notifications (and `job enqueued` events) and when
+  the next job or alarm is due, and otherwise poll every 30-60 s (jittered).
+  `attaches_within_one_database_round_trip` in `service.rs` checks the attach
+  against a database 100 ms away.
 - **The internal port** binds only the machine's 6PN address and is not in
-  `fly.toml`'s services, so it is unreachable from the Internet.
+  `fly.toml`'s services, so it is unreachable from the Internet. Its first line
+  selects mesh link, forward, or HTTP.
 
 Failure modes:
 
 | What | Effect |
 | --- | --- |
-| A machine restarts (deploy) | Its rows are removed first, its bridges get `drain`/1012 and reattach to the new or next-nearest machine within seconds; forwards to it fail over to the new location after one refused attempt |
-| A machine crashes | Forwards to it fail fast (connection refused or 3 s timeout), the sender skips it for 30 s; its rows expire after three heartbeats; its clients reconnect elsewhere and attach at once (the route check cannot reach it, so it does not count) |
-| 6PN between two machines fails | Visitors for that pair are closed (or go to the legacy Worker); local traffic is unaffected |
-| Database unavailable | Local visitors and attached bridges keep working from memory; lookups for remote bridges fail (closed); registry changes are retried by the heartbeat |
-| A delete's close request does not arrive | The owning machine's heartbeat sees the tunnel deleted and closes its bridges within a minute |
+| A machine is deployed away (SIGTERM) | It announces `leaving`: peers drop its bridges at once and stop forwarding to it, while it keeps forwarding its own visitors to the others for the drain. Its bridges get `drain`/1012 and reattach to the new or next-nearest machine within seconds, which announces them |
+| New machines join (deploy, scaling) | They appear in DNS, link to every machine within seconds and receive snapshots; until all their links are up, machines trust cached "missing"/"not ready" answers only briefly |
+| A machine crashes | Its links close: peers drop its bridges at once (or within 5 s if it froze without closing them) and stop forwarding there; its clients reconnect elsewhere and attach at once (the route check does not count it) |
+| A machine restarts | Its new life (new epoch) replaces the old entries as soon as its new link is up |
+| 6PN between two machines fails (partition) | Each side drops the other's bridges within 5 s and serves its own; visitors for the other side's bridges are closed at once (no forward is tried). When the link heals, snapshots reconverge the tables and a check catches deletions made meanwhile |
+| Database unavailable | Local visitors, attached bridges, forwarding and the mesh keep working from memory; attaches use cached records; API calls answer 503 |
+| An event is lost (a link down at the time) | The receiver reads cached "missing"/"not ready" answers again and checks for deleted tunnels when the link comes back |
 
 Latency: PlanetScale is in us-east-1, ~200 ms from `syd`. The visitor path
-reads the database only on a tunnel's first visitor per machine (record load
-and, without a local bridge, one registry lookup per 30 s); an attach waits
-for one round trip (see Round trips above).
+reads the database only on a tunnel's first visitor per machine (the record);
+locating the bridge is a memory lookup. An attach waits for one round trip
+(see Round trips above). A change reaches the other machines in one 6PN
+one-way trip (well under 1 ms between machines on one host in the tests;
+`opentunnel_mesh_propagation_seconds` in production).
 
 ### Deploying
 
@@ -473,14 +510,24 @@ fly scale vm shared-cpu-1x --memory 1024 --app opentunnel   # if existing machin
 for region in ord sjc gru lhr fra cdg jnb sin nrt syd; do
   fly scale count 1 --region $region --app opentunnel --yes
 done                                         # or: fly machine clone <iad machine> --region <region>
-fly status --app opentunnel                  # ten machines, one per region, all passing checks
+fly status --app opentunnel                  # eleven machines, all passing checks
 curl -s -X POST https://opentunnel.xyz/api/admin/stats -H "authorization: Bearer $ADMIN_TOKEN" | jq .cluster
 ```
 
-`fly scale count` for a region keeps the other regions as they are. Every
-machine must have `INTERNAL_TOKEN` before it runs with `INTERNAL_LISTEN`
-(staged secrets apply on the next deploy), and the first deploy of this
-version creates the `bridges` table (schema 2; see [Storage](#storage)).
+`fly scale count` for a region keeps the other regions as they are, and
+`fly scale count 2 --region iad` adds a second machine there: it joins the mesh
+by itself. Every machine must have `INTERNAL_TOKEN` before it runs with
+`INTERNAL_LISTEN` (staged secrets apply on the next deploy).
+
+The deploy that introduced the mesh ran next to machines of the previous
+version, which keep their bridges in the `bridges` table and answer the mesh
+greeting with an HTTP 400. New machines count those as `legacy` peers and,
+while one answers, look a route the mesh does not know up in `bridges` too
+(TEMPORARY, `Cluster::locate_legacy`), and forward to it with the unchanged
+forward protocol; old machines do not see new machines' bridges, so for the
+minute both run, a visitor on an old machine for a bridge on a new one is
+closed. A deletion through a new machine reaches old machines through their own
+heartbeat (within a minute). Old machines need nothing from new ones.
 
 ## Tests
 
@@ -496,14 +543,20 @@ docker rm -f ot-mysql    # when done; it holds the test databases
 ```
 
 - `cargo test -p opentunnel-server`: storage (revisions, imports, concurrent
-  alarms, job leases, the registry), unit tests (SNI, PROXY protocol, CSRs,
+  alarms, job leases), unit tests (SNI, PROXY protocol, CSRs,
   analytics, renewal scheduling with a manual clock, stale bridges, routing,
-  imports), the API contract replay against the Worker's recorded responses,
+  cached answers and mesh events, imports), the API contract replay against the Worker's recorded responses,
   the Rust client end to end (provisioning, passthrough, shared tunnels,
   restarts, migrated tunnels, renewal on attach, a database outage), the
-  migration paths against a fake Worker, and two servers on one database
-  (`tests/cluster.rs`: forwarding, route conflicts and deletes across
-  machines, a crashed machine, a restart, and jobs running once), and
+  migration paths against a fake Worker, two and three servers on one database
+  linked by the mesh (`tests/cluster.rs`: forwarding right after an attach,
+  detaches, route conflicts and deletes across machines, machines in one region
+  holding different routes, a crashed machine, a frozen one dropped after 5 s,
+  a restart replacing its old entries, a partition healing, created and
+  certificate-ready tunnels routable at once, a machine of the previous
+  version, and jobs running once), the mesh alone (`tests/mesh.rs`: one link
+  per pair, replication, newer claims, leaving, events, bad tokens, the
+  previous version, and 20,000 bridges with 100 changes a second), and
   connections whose peers vanish (`tests/leaks.rs`: visitors that close while
   the target never ends, silent visitors, a bridge that goes away, partial
   ClientHellos; tasks and descriptors return to their baseline).

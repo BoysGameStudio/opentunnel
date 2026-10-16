@@ -181,8 +181,8 @@ impl Server {
                     config.internal_token.clone().unwrap_or_default(),
                     store.clone(),
                     clock.clone(),
-                    config.cluster_heartbeat_ms,
                     stats.clone(),
+                    config.mesh(),
                 )?);
                 service.set_cluster(cluster.clone());
                 Some(cluster)
@@ -276,12 +276,7 @@ impl Server {
             Err(error) => warn!(%error, "resuming certificate issuance failed"),
         }
         if let Some(cluster) = &self.cluster {
-            cluster.start().await?;
-            tasks.push(tokio::spawn(cluster::run_heartbeat(
-                service.clone(),
-                cluster.clone(),
-            )));
-            tasks.push(tokio::spawn(cluster::run_removals(cluster.clone())));
+            tasks.extend(cluster.start(&service));
         }
         tasks.push(tokio::spawn(self.jobs.clone().run()));
         tasks.push(tokio::spawn(jobs::run_alarms(service.clone())));
@@ -507,6 +502,9 @@ impl Server {
         self_jobs.release().await;
         if let Some(internal) = internal {
             internal.abort();
+        }
+        if let Some(cluster) = &server.cluster {
+            cluster.mesh.halt(false);
         }
         info!("shut down");
         Ok(())

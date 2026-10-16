@@ -91,28 +91,8 @@ impl Admin for TokenAdmin {
                                 // Open file descriptors: sockets, the database pool, and a few files.
                                 "fds": crate::net::open_fds(),
                             });
-                            // Every machine, from the registry.
-                            counts["cluster"] = match cluster.machines().await {
-                                Ok(machines) => {
-                                    let mut regions = serde_json::Map::new();
-                                    for machine in &machines {
-                                        let bridges = regions
-                                            .get(&machine.region)
-                                            .and_then(serde_json::Value::as_u64)
-                                            .unwrap_or(0);
-                                        regions.insert(
-                                            machine.region.clone(),
-                                            (bridges + machine.bridges).into(),
-                                        );
-                                    }
-                                    json!({
-                                        "bridges": machines.iter().map(|machine| machine.bridges).sum::<u64>(),
-                                        "regions": regions,
-                                        "machines": machines,
-                                    })
-                                }
-                                Err(error) => json!({ "error": format!("{error:#}") }),
-                            };
+                            // Every machine and link, from the mesh.
+                            counts["cluster"] = cluster.view();
                         }
                         json_response(StatusCode::OK, &counts)
                     }

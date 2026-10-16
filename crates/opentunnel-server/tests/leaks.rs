@@ -18,7 +18,6 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-const HEARTBEAT_MS: u64 = 300;
 const IDLE_MS: u64 = 2_000;
 const HALF_CLOSE_MS: u64 = 600;
 /// Visitors per scenario.
@@ -29,7 +28,7 @@ async fn machine(dir: &std::path::Path, name: &str, extra: &[&str]) -> Option<Te
         "--internal-listen=127.0.0.1:0".to_owned(),
         "--internal-token=cluster-secret".to_owned(),
         format!("--machine-id={name}"),
-        format!("--cluster-heartbeat-ms={HEARTBEAT_MS}"),
+        "--mesh-dns=off".to_owned(),
         format!("--connection-idle-timeout-ms={IDLE_MS}"),
         format!("--half-close-timeout-ms={HALF_CLOSE_MS}"),
     ];
@@ -220,6 +219,7 @@ async fn connections_whose_peers_vanish_are_released() {
         return;
     };
     let b = machine(dir.path(), "machine-b", &[]).await.unwrap();
+    common::link(&[&a, &b]).await;
     let (id, token, host) = provision(&a, dir.path()).await;
     let hello = client_hello(&host);
     let quickly = Duration::from_millis(IDLE_MS * 3);

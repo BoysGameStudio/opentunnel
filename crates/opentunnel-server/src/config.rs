@@ -141,7 +141,7 @@ pub struct Config {
 
     /// Running as one of many machines: the internal listener for forwarded visitors and control between
     /// machines, e.g. `[::]:9000` (bound to `FLY_PRIVATE_IP` on Fly, so only the private network reaches it).
-    /// `off` (the default) runs a single machine with no registry.
+    /// `off` (the default) runs a single machine without the mesh.
     #[arg(long, env = "INTERNAL_LISTEN", default_value = "off")]
     pub internal_listen: String,
 
@@ -154,7 +154,7 @@ pub struct Config {
     #[arg(long, env = "INTERNAL_TOKEN", hide_env_values = true)]
     pub internal_token: Option<String>,
 
-    /// This machine's name in the registry and on job leases (random when unset).
+    /// This machine's name in the mesh and on job leases (random when unset).
     #[arg(long, env = "FLY_MACHINE_ID")]
     pub machine_id: Option<String>,
 
@@ -165,9 +165,30 @@ pub struct Config {
     #[arg(long, env = "FLY_PRIVATE_IP")]
     pub private_ip: Option<std::net::IpAddr>,
 
-    /// How often this machine refreshes its registry rows; readers ignore rows older than three of these.
-    #[arg(long, env = "CLUSTER_HEARTBEAT_MS", default_value_t = 60_000)]
-    pub cluster_heartbeat_ms: u64,
+    /// The Fly app, set by Fly: peers are found as `<FLY_APP_NAME>.internal` unless `MESH_DNS` says otherwise.
+    #[arg(long, env = "FLY_APP_NAME")]
+    pub fly_app_name: Option<String>,
+
+    /// A DNS name whose addresses are the other machines (at this machine's internal port); `off` disables it.
+    /// Defaults to `<FLY_APP_NAME>.internal`.
+    #[arg(long, env = "MESH_DNS")]
+    pub mesh_dns: Option<String>,
+
+    /// Other machines' internal addresses (`host:port`, comma-separated), in addition to `MESH_DNS`.
+    #[arg(long, env = "MESH_PEERS", value_delimiter = ',')]
+    pub mesh_peers: Vec<String>,
+
+    /// How often the peers' DNS name is resolved again.
+    #[arg(long, env = "MESH_DISCOVERY_MS", default_value_t = 5_000)]
+    pub mesh_discovery_ms: u64,
+
+    /// How often a mesh link sends a ping when it has nothing else to send.
+    #[arg(long, env = "MESH_PING_MS", default_value_t = 1_000)]
+    pub mesh_ping_ms: u64,
+
+    /// A peer that sent nothing for this long is down: its link is closed and its bridges dropped.
+    #[arg(long, env = "MESH_DEAD_MS", default_value_t = 5_000)]
+    pub mesh_dead_ms: u64,
 
     /// A tunnel connection with no traffic in either direction for this long is closed.
     #[arg(long, env = "CONNECTION_IDLE_TIMEOUT_MS", default_value_t = 900_000)]
@@ -225,6 +246,31 @@ pub enum DnsKind {
 }
 
 impl Config {
+    pub fn mesh(&self) -> crate::mesh::MeshConfig {
+        let ms = |value: u64| std::time::Duration::from_millis(value.max(1));
+        let dns = match self.mesh_dns.as_deref() {
+            Some("" | "off") => None,
+            Some(name) => Some(name.to_owned()),
+            None => self
+                .fly_app_name
+                .as_deref()
+                .filter(|app| !app.is_empty())
+                .map(|app| format!("{app}.internal")),
+        };
+        crate::mesh::MeshConfig {
+            dns,
+            peers: self
+                .mesh_peers
+                .iter()
+                .filter(|peer| !peer.is_empty())
+                .cloned()
+                .collect(),
+            discovery: ms(self.mesh_discovery_ms),
+            ping: ms(self.mesh_ping_ms),
+            dead: ms(self.mesh_dead_ms),
+        }
+    }
+
     pub fn timeouts(&self) -> crate::net::Timeouts {
         crate::net::Timeouts {
             idle: std::time::Duration::from_millis(self.connection_idle_timeout_ms.max(1)),

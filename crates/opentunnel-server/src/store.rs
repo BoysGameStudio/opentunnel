@@ -78,7 +78,9 @@ const SCHEMA: &[&str] = &[
   name VARCHAR(191) NOT NULL PRIMARY KEY,
   value MEDIUMTEXT NOT NULL
 ) DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin"#,
-    // Version 2: where bridges are attached, so any machine can forward visitors to the one holding the bridge.
+    // Version 2: the bridge registry of servers before the cluster mesh (`mesh.rs`), which keeps that in memory.
+    // TEMPORARY: only read while machines of the previous version still run (a deploy); drop it in a later schema
+    // version once none are left.
     r#"CREATE TABLE IF NOT EXISTS bridges (
   tunnel_id VARCHAR(191) NOT NULL,
   route VARCHAR(63) NOT NULL,
@@ -128,14 +130,11 @@ pub struct Loaded {
     pub revision: u64,
 }
 
-/// What an attach needs from the database, read in one round trip: the tunnel, its renewal alarm, and the live
-/// registry rows of its bridges on other machines.
+/// What an attach needs from the database, read in one round trip: the tunnel and its renewal alarm.
 #[derive(Debug, Clone)]
 pub struct AttachSnapshot {
     pub loaded: Loaded,
     pub alarm: Option<u64>,
-    /// Newest first.
-    pub bridges: Vec<BridgeLocation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +198,7 @@ pub struct ServerCertificate {
     pub expiry: Option<String>,
 }
 
-/// A route a bridge serves on some machine (a `bridges` row).
+/// A route a bridge serves on a machine of the previous version (a `bridges` row). TEMPORARY, see the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeLocation {
     pub tunnel_id: String,
@@ -210,32 +209,6 @@ pub struct BridgeLocation {
     pub address: String,
     pub updated_at: u64,
 }
-
-/// What one machine holds, from the `bridges` table.
-#[derive(Debug, Clone, Serialize)]
-pub struct MachineBridges {
-    pub machine_id: String,
-    pub region: String,
-    pub address: String,
-    pub bridges: u64,
-    pub tunnels: u64,
-    pub routes: u64,
-    pub updated_at: u64,
-}
-
-/// A machine of the cluster, refreshed by its heartbeat whether or not it holds bridges. Kept in `meta` as
-/// `machine:<id>`, so finding the machines took no schema change.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Machine {
-    #[serde(skip)]
-    pub machine_id: String,
-    pub region: String,
-    pub address: String,
-    pub updated_at: u64,
-}
-
-const MACHINE_PREFIX: &str = "machine:";
 
 type BridgeRow = (String, String, String, i64, String, String, i64);
 
@@ -538,51 +511,33 @@ impl Store {
         .await
     }
 
-    /// The tunnel, its alarm, and the live registry rows (refreshed since `since`) of its bridges on machines
-    /// other than `machine_id`, in one round trip, for an attach. Gives up after `limit`.
+    /// The tunnel and its alarm in one round trip, for an attach. Gives up after `limit`.
     pub async fn attach_snapshot(
         &self,
         id: &str,
-        machine_id: &str,
-        since: u64,
         limit: Duration,
     ) -> Result<Option<AttachSnapshot>> {
         timed_within("attach_snapshot", limit, async {
-            let sql = |id: &str, machine: &str| {
-                format!(
-                    "SELECT t.record, t.revision, t.alarm_at,
-                       b.tunnel_id, b.route, b.machine_id, b.bridge_id, b.region, b.address, b.updated_at
-                     FROM tunnels t
-                     LEFT JOIN bridges b ON b.tunnel_id = t.id AND b.machine_id <> {machine} AND b.updated_at >= {since}
-                     WHERE t.id = {id}
-                     ORDER BY b.updated_at DESC"
-                )
-            };
-            let rows = match (literal(id), literal(machine_id)) {
-                (Some(id), Some(machine)) => self
+            const SQL: &str = "SELECT record, revision, alarm_at FROM tunnels WHERE id = ";
+            let row = match literal(id) {
+                Some(id) => self
                     .pool
-                    .fetch_all(sqlx::AssertSqlSafe(sql(&id, &machine)))
+                    .fetch_optional(sqlx::AssertSqlSafe(format!("{SQL}{id}")))
                     .await
                     .map_err(db)?,
-                _ => sqlx::query(sqlx::AssertSqlSafe(sql("?", "?")))
-                    .bind(machine_id)
+                None => sqlx::query(sqlx::AssertSqlSafe(format!("{SQL}?")))
                     .bind(id)
-                    .fetch_all(&self.pool)
+                    .fetch_optional(&self.pool)
                     .await
                     .map_err(db)?,
             };
-            let Some(first) = rows.first() else {
+            let Some(row) = row else {
                 return Ok(None);
             };
-            let alarm: Option<i64> = first.try_get(2)?;
-            let mut bridges = Vec::new();
-            for row in &rows {
-                bridges.extend(bridge_at(row, 3)?);
-            }
+            let alarm: Option<i64> = row.try_get(2)?;
             Ok(Some(AttachSnapshot {
-                loaded: loaded_from_row(first)?,
+                loaded: loaded_from_row(&row)?,
                 alarm: alarm.map(|alarm| alarm as u64),
-                bridges,
             }))
         })
         .await
@@ -1361,9 +1316,11 @@ impl Store {
         .await
     }
 
-    // --- Bridge locations (the cluster registry) -------------------------------------------------------------
+    // --- The previous version's bridge registry (TEMPORARY, see the schema) --------------------------------
 
-    /// Records that `machine_id` serves `routes` of a tunnel with one bridge, replacing older rows for them.
+    /// Records that `machine_id` serves `routes` of a tunnel, as the previous version did. Only for tests of the
+    /// mixed-version fallback.
+    #[doc(hidden)]
     pub async fn put_bridge(&self, location: &BridgeLocation, routes: &[String]) -> Result<()> {
         if routes.is_empty() {
             return Ok(());
@@ -1391,107 +1348,8 @@ impl Store {
         .await
     }
 
-    /// Removes one bridge's rows; a newer bridge that took the same routes on the machine keeps its rows.
-    pub async fn delete_bridge(
-        &self,
-        tunnel_id: &str,
-        machine_id: &str,
-        bridge_id: u64,
-    ) -> Result<()> {
-        timed("delete_bridge", async {
-            sqlx::query(
-                "DELETE FROM bridges WHERE tunnel_id = ? AND machine_id = ? AND bridge_id = ?",
-            )
-            .bind(tunnel_id)
-            .bind(machine_id)
-            .bind(bridge_id as i64)
-            .execute(&self.pool)
-            .await
-            .map_err(db)?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Removes the rows of many bridges of one machine (`(tunnel, bridge ID)` pairs) in few statements.
-    pub async fn delete_bridges(&self, machine_id: &str, bridges: &[(String, u64)]) -> Result<()> {
-        for chunk in bridges.chunks(200) {
-            timed("delete_bridges", async {
-                let mut query = sqlx::QueryBuilder::new("DELETE FROM bridges WHERE machine_id = ");
-                query.push_bind(machine_id).push(" AND (");
-                for (index, (tunnel_id, bridge_id)) in chunk.iter().enumerate() {
-                    if index > 0 {
-                        query.push(" OR ");
-                    }
-                    query
-                        .push("(tunnel_id = ")
-                        .push_bind(tunnel_id)
-                        .push(" AND bridge_id = ")
-                        .push_bind(*bridge_id as i64)
-                        .push(")");
-                }
-                query.push(")");
-                query.build().execute(&self.pool).await.map_err(db)?;
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(())
-    }
-
-    pub async fn delete_tunnel_bridges(&self, tunnel_id: &str) -> Result<()> {
-        timed("delete_tunnel_bridges", async {
-            sqlx::query("DELETE FROM bridges WHERE tunnel_id = ?")
-                .bind(tunnel_id)
-                .execute(&self.pool)
-                .await
-                .map_err(db)?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Removes every row of a machine, at its startup and clean shutdown.
-    pub async fn delete_machine_bridges(&self, machine_id: &str) -> Result<u64> {
-        timed("delete_machine_bridges", async {
-            let deleted = sqlx::query("DELETE FROM bridges WHERE machine_id = ?")
-                .bind(machine_id)
-                .execute(&self.pool)
-                .await
-                .map_err(db)?;
-            Ok(deleted.rows_affected())
-        })
-        .await
-    }
-
-    /// Removes rows nobody refreshed since `before`, left behind by machines that are gone.
-    pub async fn delete_expired_bridges(&self, before: u64) -> Result<u64> {
-        timed("delete_expired_bridges", async {
-            let deleted = sqlx::query("DELETE FROM bridges WHERE updated_at < ?")
-                .bind(before as i64)
-                .execute(&self.pool)
-                .await
-                .map_err(db)?;
-            Ok(deleted.rows_affected())
-        })
-        .await
-    }
-
-    /// The machine's heartbeat: marks its rows current.
-    pub async fn refresh_bridges(&self, machine_id: &str, now: u64) -> Result<u64> {
-        timed("refresh_bridges", async {
-            let refreshed = sqlx::query("UPDATE bridges SET updated_at = ? WHERE machine_id = ?")
-                .bind(now as i64)
-                .bind(machine_id)
-                .execute(&self.pool)
-                .await
-                .map_err(db)?;
-            Ok(refreshed.rows_affected())
-        })
-        .await
-    }
-
-    /// Rows for a tunnel (one route, or all) refreshed since `since`, newest first.
+    /// Rows of the previous version's registry for a tunnel (one route, or all) refreshed since `since`, newest
+    /// first. TEMPORARY: only read during a deploy from that version.
     pub async fn bridge_locations(
         &self,
         tunnel_id: &str,
@@ -1536,38 +1394,6 @@ impl Store {
         .await
     }
 
-    /// Bridges per machine, from rows refreshed since `since`.
-    pub async fn machine_bridges(&self, since: u64) -> Result<Vec<MachineBridges>> {
-        timed("machine_bridges", async {
-            let rows: Vec<(String, String, String, i64, i64, i64, i64)> = sqlx::query_as(
-                "SELECT machine_id, MAX(region), MAX(address), COUNT(DISTINCT tunnel_id, bridge_id),
-                   COUNT(DISTINCT tunnel_id), COUNT(*), MAX(updated_at)
-                 FROM bridges WHERE updated_at >= ? GROUP BY machine_id ORDER BY MAX(region), machine_id",
-            )
-            .bind(since as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db)?;
-            Ok(rows
-                .into_iter()
-                .map(
-                    |(machine_id, region, address, bridges, tunnels, routes, updated_at)| {
-                        MachineBridges {
-                            machine_id,
-                            region,
-                            address,
-                            bridges: bridges as u64,
-                            tunnels: tunnels as u64,
-                            routes: routes as u64,
-                            updated_at: updated_at as u64,
-                        }
-                    },
-                )
-                .collect())
-        })
-        .await
-    }
-
     /// Which of `ids` are deleted.
     pub async fn deleted_tunnels(&self, ids: &[String]) -> Result<Vec<String>> {
         let mut deleted = Vec::new();
@@ -1590,90 +1416,6 @@ impl Store {
             deleted.extend(found);
         }
         Ok(deleted)
-    }
-
-    // --- Machines ------------------------------------------------------------------------------------------
-
-    /// Records a machine as live, at startup and every heartbeat.
-    pub async fn put_machine(&self, machine: &Machine) -> Result<()> {
-        let value = serde_json::to_string(machine)?;
-        timed("put_machine", async {
-            sqlx::query(
-                "INSERT INTO meta (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
-            )
-            .bind(format!("{MACHINE_PREFIX}{}", machine.machine_id))
-            .bind(value)
-            .execute(&self.pool)
-            .await
-            .map_err(db)?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Removes a machine, on its clean shutdown.
-    pub async fn delete_machine(&self, machine_id: &str) -> Result<()> {
-        timed("delete_machine", async {
-            sqlx::query("DELETE FROM meta WHERE name = ?")
-                .bind(format!("{MACHINE_PREFIX}{machine_id}"))
-                .execute(&self.pool)
-                .await
-                .map_err(db)?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Every recorded machine, live or not.
-    async fn all_machines(&self) -> Result<Vec<Machine>> {
-        let rows: Vec<(String, String)> = timed("machines", async {
-            sqlx::query_as("SELECT name, value FROM meta WHERE name LIKE ?")
-                .bind(format!("{MACHINE_PREFIX}%"))
-                .fetch_all(&self.pool)
-                .await
-                .map_err(db)
-        })
-        .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(name, value)| {
-                let mut machine: Machine = serde_json::from_str(&value).ok()?;
-                machine.machine_id = name.strip_prefix(MACHINE_PREFIX)?.to_owned();
-                Some(machine)
-            })
-            .collect())
-    }
-
-    /// Machines refreshed since `since`.
-    pub async fn machines(&self, since: u64) -> Result<Vec<Machine>> {
-        let mut machines = self.all_machines().await?;
-        machines.retain(|machine| machine.updated_at >= since);
-        Ok(machines)
-    }
-
-    /// Removes machines nobody refreshed since `before`.
-    pub async fn delete_expired_machines(&self, before: u64) -> Result<u64> {
-        let expired: Vec<String> = self
-            .all_machines()
-            .await?
-            .into_iter()
-            .filter(|machine| machine.updated_at < before)
-            .map(|machine| format!("{MACHINE_PREFIX}{}", machine.machine_id))
-            .collect();
-        if expired.is_empty() {
-            return Ok(0);
-        }
-        timed("delete_expired_machines", async {
-            let mut query = sqlx::QueryBuilder::new("DELETE FROM meta WHERE name IN (");
-            let mut separated = query.separated(", ");
-            for name in &expired {
-                separated.push_bind(name);
-            }
-            query.push(")");
-            let deleted = query.build().execute(&self.pool).await.map_err(db)?;
-            Ok(deleted.rows_affected())
-        })
-        .await
     }
 }
 
@@ -1901,30 +1643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn machines_are_listed_until_they_expire() {
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let machine = |id: &str, updated_at| Machine {
-            machine_id: id.into(),
-            region: "iad".into(),
-            address: format!("[fdaa::{id}]:9000"),
-            updated_at,
-        };
-        store.put_machine(&machine("a", 100)).await.unwrap();
-        store.put_machine(&machine("b", 100)).await.unwrap();
-        store.put_machine(&machine("b", 300)).await.unwrap();
-        store.swap_meta("test_ca", None, "x").await.unwrap();
-        assert_eq!(store.machines(0).await.unwrap().len(), 2);
-        assert_eq!(store.machines(200).await.unwrap(), vec![machine("b", 300)]);
-        assert_eq!(store.delete_expired_machines(200).await.unwrap(), 1);
-        store.delete_machine("b").await.unwrap();
-        assert!(store.machines(0).await.unwrap().is_empty());
-        assert_eq!(store.meta("test_ca").await.unwrap().as_deref(), Some("x"));
-    }
-
-    #[tokio::test]
-    async fn registry_rows_expire_and_belong_to_one_bridge() {
+    async fn the_previous_registry_is_read_for_mixed_version_deploys() {
         let Some(store) = test_store().await else {
             return;
         };
@@ -1960,27 +1679,22 @@ mod tests {
                 .len(),
             1
         );
-        // A newer bridge on the machine takes the rows; the old one's late removal leaves them.
-        store
-            .put_bridge(&location("a", 2, 160), &routes)
-            .await
-            .unwrap();
-        store.delete_bridge("abcdefghijkl", "a", 1).await.unwrap();
+        // IDs that cannot be inlined as literals are bound instead.
         assert_eq!(
             store
-                .bridge_locations("abcdefghijkl", None, 0)
+                .bridge_locations("abcdefghijkl", Some("x'"), 0)
                 .await
                 .unwrap()
                 .len(),
-            3
+            0
         );
-        assert_eq!(store.refresh_bridges("a", 500).await.unwrap(), 2);
-        let machines = store.machine_bridges(400).await.unwrap();
-        assert_eq!(machines.len(), 1);
-        assert_eq!((machines[0].bridges, machines[0].routes), (1, 2));
-        assert_eq!(store.delete_expired_bridges(400).await.unwrap(), 1);
-        assert_eq!(store.delete_machine_bridges("a").await.unwrap(), 2);
+    }
 
+    #[tokio::test]
+    async fn lists_deleted_tunnels() {
+        let Some(store) = test_store().await else {
+            return;
+        };
         store.put_tunnel(&record("abcdefghijkl"), 1).await.unwrap();
         let mut deleted = record("deletedtunnl");
         deleted.deleted_at = Some(iso(1));
@@ -2000,115 +1714,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_snapshots_read_the_record_alarm_and_other_machines_rows_at_once() {
+    async fn attach_snapshots_read_the_record_and_alarm_at_once() {
         let Some(store) = test_store().await else {
             return;
         };
         let limit = Duration::from_secs(5);
         assert!(
             store
-                .attach_snapshot("abcdefghijkl", "a", 0, limit)
+                .attach_snapshot("abcdefghijkl", limit)
                 .await
                 .unwrap()
                 .is_none()
         );
         store.put_tunnel(&record("abcdefghijkl"), 1).await.unwrap();
         let snapshot = store
-            .attach_snapshot("abcdefghijkl", "a", 0, limit)
+            .attach_snapshot("abcdefghijkl", limit)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.loaded.revision, 1);
         assert_eq!(snapshot.loaded.record.id, "abcdefghijkl");
         assert_eq!(snapshot.alarm, None);
-        assert!(snapshot.bridges.is_empty());
-
         store.set_alarm("abcdefghijkl", Some(77)).await.unwrap();
-        let location = |machine: &str, bridge_id, updated_at| BridgeLocation {
-            tunnel_id: "abcdefghijkl".into(),
-            route: String::new(),
-            machine_id: machine.into(),
-            bridge_id,
-            region: "iad".into(),
-            address: "[fdaa::1]:9000".into(),
-            updated_at,
-        };
-        let routes = ["api".to_owned(), "@".to_owned()];
-        store
-            .put_bridge(&location("a", 1, 100), &routes)
-            .await
-            .unwrap();
-        store
-            .put_bridge(&location("b", 2, 100), &routes)
-            .await
-            .unwrap();
-        store
-            .put_bridge(&location("c", 3, 200), &routes[..1])
-            .await
-            .unwrap();
         let snapshot = store
-            .attach_snapshot("abcdefghijkl", "a", 0, limit)
+            .attach_snapshot("abcdefghijkl", limit)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.alarm, Some(77));
-        let mut rows: Vec<_> = snapshot
-            .bridges
-            .iter()
-            .map(|row| (row.machine_id.as_str(), row.route.as_str(), row.bridge_id))
-            .collect();
-        assert_eq!(rows[0], ("c", "api", 3));
-        rows.sort();
-        assert_eq!(rows, [("b", "@", 2), ("b", "api", 2), ("c", "api", 3)]);
-        // Rows not refreshed since `since` do not count.
-        let fresh = store
-            .attach_snapshot("abcdefghijkl", "a", 150, limit)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(fresh.bridges.len(), 1);
         // IDs that cannot be inlined as literals are bound instead, with the same result.
-        let bound = store
-            .attach_snapshot("abcdefghijkl", "a'b", 0, limit)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(bound.bridges.len(), 5);
+        assert!(
+            store
+                .attach_snapshot("abc'def", limit)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(store.tunnel("abc'def").await.unwrap().is_none());
-        assert_eq!(
-            store
-                .bridge_locations("abcdefghijkl", Some("@"), 0)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-        assert_eq!(
-            store
-                .bridge_locations("abcdefghijkl", Some("x'"), 0)
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
-
-        // Removals in one batch, only of the named bridges.
-        store
-            .delete_bridges(
-                "b",
-                &[("abcdefghijkl".into(), 2), ("abcdefghijkl".into(), 9)],
-            )
-            .await
-            .unwrap();
-        let left: Vec<_> = store
-            .bridge_locations("abcdefghijkl", None, 0)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.machine_id)
-            .collect();
-        assert_eq!(left.len(), 3);
-        assert!(!left.contains(&"b".to_owned()));
     }
 
     #[tokio::test]

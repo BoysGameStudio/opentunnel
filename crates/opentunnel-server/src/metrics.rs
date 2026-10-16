@@ -55,7 +55,13 @@ pub struct Metrics {
     visitor_duration: Histogram,
 
     forward_failures: Family<Labels, Counter>,
-    registry_lookups: Family<Labels, Counter>,
+    mesh_lookups: Family<Labels, Counter>,
+    mesh_peers: Family<Labels, Gauge>,
+    mesh_links: Family<Labels, Counter>,
+    mesh_table_bridges: Family<Vec<(String, String)>, Gauge>,
+    mesh_propagation: Histograms<Labels>,
+    mesh_snapshot_bridges: Histogram,
+    mesh_snapshot_duration: Histogram,
 
     db_duration: Histograms<Labels>,
     db_errors: Family<Labels, Counter>,
@@ -70,6 +76,12 @@ pub struct Metrics {
 
 fn db_histogram() -> Histogram {
     Histogram::new([0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0])
+}
+
+fn mesh_histogram() -> Histogram {
+    Histogram::new([
+        0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+    ])
 }
 
 fn acme_histogram() -> Histogram {
@@ -97,7 +109,15 @@ impl Metrics {
             visitor_bytes: Family::default(),
             visitor_duration: Histogram::new([0.1, 1.0, 10.0, 60.0, 300.0, 900.0, 3600.0, 14400.0]),
             forward_failures: Family::default(),
-            registry_lookups: Family::default(),
+            mesh_lookups: Family::default(),
+            mesh_peers: Family::default(),
+            mesh_links: Family::default(),
+            mesh_table_bridges: Family::default(),
+            mesh_propagation: Family::new_with_constructor(mesh_histogram),
+            mesh_snapshot_bridges: Histogram::new([
+                0.0, 10.0, 100.0, 1_000.0, 5_000.0, 10_000.0, 25_000.0, 50_000.0, 100_000.0,
+            ]),
+            mesh_snapshot_duration: mesh_histogram(),
             db_duration: Family::new_with_constructor(db_histogram),
             db_errors: Family::default(),
             db_connections: Family::default(),
@@ -180,9 +200,39 @@ impl Metrics {
             metrics.forward_failures.clone(),
         );
         r.register(
-            "cluster_registry_lookups",
-            "Route lookups in the registry cache, by result",
-            metrics.registry_lookups.clone(),
+            "mesh_lookups",
+            "Lookups of the machine holding a route in the mesh table, for visitors without a local bridge, by result (hit, miss)",
+            metrics.mesh_lookups.clone(),
+        );
+        r.register(
+            "mesh_peers",
+            "Other machines this one knows of, by state (up: linked; connecting, unreachable, legacy: answers without the mesh)",
+            metrics.mesh_peers.clone(),
+        );
+        r.register(
+            "mesh_links",
+            "Mesh links to other machines that came up or went down, by event",
+            metrics.mesh_links.clone(),
+        );
+        r.register(
+            "mesh_table_bridges",
+            "Bridges in the mesh table, by machine holding them (this one included)",
+            metrics.mesh_table_bridges.clone(),
+        );
+        r.register(
+            "mesh_propagation_seconds",
+            "From a peer announcing a change to this machine applying it (by the two clocks), by kind (attached, detached, event)",
+            metrics.mesh_propagation.clone(),
+        );
+        r.register(
+            "mesh_snapshot_bridges",
+            "Bridges in snapshots received from peers when a link came up",
+            metrics.mesh_snapshot_bridges.clone(),
+        );
+        r.register(
+            "mesh_snapshot_duration_seconds",
+            "From a peer taking a snapshot to this machine applying it",
+            metrics.mesh_snapshot_duration.clone(),
         );
         r.register(
             "db_query_duration_seconds",
@@ -370,12 +420,57 @@ pub fn forward_error_reason(error: &anyhow::Error) -> &'static str {
     }
 }
 
-/// A registry lookup: `hit` (cache), `miss` (database), or `error`.
-pub fn registry_lookup(result: &'static str) {
+/// A mesh table lookup for a visitor: `hit` (another machine holds the route) or `miss`.
+pub fn mesh_lookup(result: &'static str) {
     get()
-        .registry_lookups
+        .mesh_lookups
         .get_or_create(&[("result", result)])
         .inc();
+}
+
+/// Peers by state: up, connecting, unreachable, legacy.
+pub fn set_mesh_peers(counts: &[(&'static str, usize)]) {
+    let peers = &get().mesh_peers;
+    for (state, count) in counts {
+        peers
+            .get_or_create(&[("state", *state)])
+            .set(as_i64(*count));
+    }
+}
+
+/// A mesh link came `up` or went `down`.
+pub fn mesh_link(event: &'static str) {
+    get().mesh_links.get_or_create(&[("event", event)]).inc();
+}
+
+/// Bridges `machine` holds in the table; `None` removes the machine.
+pub fn set_mesh_table(machine: &str, bridges: Option<usize>) {
+    let labels = vec![("machine".to_owned(), machine.to_owned())];
+    let table = &get().mesh_table_bridges;
+    match bridges {
+        Some(bridges) => {
+            table.get_or_create(&labels).set(as_i64(bridges));
+        }
+        None => {
+            table.remove(&labels);
+        }
+    }
+}
+
+/// How long a change took from its announcement on `kind` (attached, detached, event) to being applied here.
+pub fn mesh_propagation(kind: &'static str, elapsed_ms: u64) {
+    get()
+        .mesh_propagation
+        .get_or_create(&[("kind", kind)])
+        .observe(elapsed_ms as f64 / 1000.0);
+}
+
+pub fn mesh_snapshot(bridges: usize, elapsed_ms: u64) {
+    let metrics = get();
+    metrics.mesh_snapshot_bridges.observe(bridges as f64);
+    metrics
+        .mesh_snapshot_duration
+        .observe(elapsed_ms as f64 / 1000.0);
 }
 
 pub fn db_operation(operation: &'static str, elapsed: Duration, ok: bool) {

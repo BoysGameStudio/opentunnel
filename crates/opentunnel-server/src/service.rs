@@ -40,13 +40,15 @@ pub const AUTHZ_PENDING_FIX_MS: u64 = 1_791_957_600_000;
 pub const STALE_BRIDGE_MS: u64 = IDLE_TIMEOUT_MS + HEARTBEAT_MS;
 /// After a failed refresh, cached records are used without asking the database for this long.
 const REFRESH_BACKOFF_MS: u64 = 5_000;
-/// Routing and bridge upgrades trust "no such tunnel" (missing or deleted) for this long before reading it again,
-/// so scanners and the clients of deleted tunnels do not read the database on every connection. The machine
-/// that creates or changes a tunnel tells the others at once (`Cluster::invalidate_elsewhere`); the TTL only
-/// bounds how long a lost notification can leave this machine wrong.
+/// Idle cached entries (no bridges) are dropped after this long, so a tunnel found missing is not read again on
+/// every connection from scanners or the clients of deleted tunnels.
 pub const MISSING_TTL_MS: u64 = 30_000;
-/// Routing reads a record whose certificate is not ready again at most this often (unless notified sooner).
+/// While the mesh is not complete (a peer starting, unreachable, or of the previous version), its events may be
+/// missed: routing then trusts "missing" for `MISSING_TTL_MS` and "certificate not ready" for this long.
 const NOT_READY_TTL_MS: u64 = 5_000;
+/// With every peer linked, the machine that creates or changes a tunnel tells the others at once (mesh events),
+/// so cached answers need no expiry for correctness; this only bounds a bug.
+pub const SAFETY_TTL_MS: u64 = 10 * MINUTE_MS;
 /// How long an attach waits for the database before it fails (or goes on with a cached record), well inside the
 /// client's 10 s connect timeout, so clients back off instead of reconnecting the moment they gave up.
 const ATTACH_STORAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
@@ -75,6 +77,8 @@ pub struct Inner {
     cluster: std::sync::OnceLock<Arc<Cluster>>,
     /// When refreshing a cached record last failed, Unix ms.
     refresh_failed_at: AtomicU64,
+    /// Bumped when mesh events may have been missed: routing reads cached entries of older generations again.
+    generation: AtomicU64,
     /// How long tunnel connections may stay quiet.
     timeouts: std::sync::OnceLock<crate::net::Timeouts>,
     /// Set once the server is shutting down: bridges that arrive are told to reconnect elsewhere.
@@ -103,6 +107,8 @@ pub struct EntryState {
     checked_at: u64,
     /// Another machine changed the tunnel since: routing reads it again before trusting the cached copy.
     stale: bool,
+    /// The service's generation when `record` was read.
+    generation: u64,
     bridges: Vec<Arc<Bridge>>,
     sequence: u32,
 }
@@ -133,8 +139,6 @@ pub struct Bridge {
     pub client: ClientInfo,
     /// Server time this bridge last sent anything, Unix ms.
     pub seen_at: AtomicU64,
-    /// Recorded in the cluster registry; retried by the heartbeat when the database was unavailable.
-    pub published: AtomicBool,
     pub state: Mutex<BridgeState>,
     pub channels: Mutex<HashMap<u32, ChannelHandle>>,
 }
@@ -356,6 +360,7 @@ impl Service {
             pull_through: std::sync::OnceLock::new(),
             cluster: std::sync::OnceLock::new(),
             refresh_failed_at: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             timeouts: std::sync::OnceLock::new(),
             draining: AtomicBool::new(false),
         }))
@@ -419,6 +424,7 @@ impl Service {
             state.loaded = true;
             state.checked_at = self.now();
             state.stale = false;
+            state.generation = self.generation.load(Ordering::SeqCst);
         }
         Ok(state)
     }
@@ -442,10 +448,10 @@ impl Service {
     }
 
     /// Locks a tunnel for routing. A cached record that is live with a ready certificate cannot be wrong about
-    /// routing (deletes elsewhere close bridges here), so only a missing or not yet ready one is read again, and
-    /// not more often than `MISSING_TTL_MS` and `NOT_READY_TTL_MS`, unless another machine said it changed
-    /// (created, deleted, certificate bound or ready): then it is read at once. The TTLs only matter when that
-    /// notification was lost (clients retry the upgrade with backoff).
+    /// routing (deletes elsewhere close bridges here), so only a missing or not yet ready one is read again: at
+    /// once when another machine said it changed (created, deleted, certificate bound or ready) or a mesh link
+    /// came up (events may have been missed), otherwise after `SAFETY_TTL_MS`, or the short TTLs while the mesh
+    /// is not complete.
     pub async fn lock_routable<'a>(
         &self,
         entry: &'a Entry,
@@ -461,8 +467,20 @@ impl Service {
         if state.stale {
             return Ok(self.refresh(entry, state).await);
         }
+        if state
+            .record()
+            .is_some_and(|record| record.certificate_ready())
+        {
+            return Ok(state);
+        }
+        if state.generation < self.generation.load(Ordering::SeqCst) {
+            return Ok(self.refresh(entry, state).await);
+        }
+        let complete = self
+            .cluster()
+            .is_some_and(|cluster| cluster.mesh.complete());
         let ttl = match state.record() {
-            Some(record) if record.certificate_ready() => return Ok(state),
+            _ if complete => SAFETY_TTL_MS,
             Some(_) => NOT_READY_TTL_MS,
             None => MISSING_TTL_MS,
         };
@@ -472,37 +490,28 @@ impl Service {
         Ok(self.refresh(entry, state).await)
     }
 
-    /// Locks a tunnel for an attach, with its record, alarm and registry rows read in one round trip (on many
-    /// machines). When the database does not answer in time, a cached record is used (the registry check is
-    /// then skipped, as when the other machine cannot be reached); without one the attach fails.
+    /// Locks a tunnel for an attach, with its record and alarm read in one round trip (on many machines). When
+    /// the database does not answer in time, a cached record is used; without one the attach fails.
     async fn lock_for_attach<'a>(
         &self,
         entry: &'a Entry,
-    ) -> Result<(
-        tokio::sync::MutexGuard<'a, EntryState>,
-        Option<Vec<crate::store::BridgeLocation>>,
-        AttachFollowup,
-    )> {
+    ) -> Result<(tokio::sync::MutexGuard<'a, EntryState>, AttachFollowup)> {
         let unread = AttachFollowup { alarm: None };
-        let Some(cluster) = self.cluster() else {
-            return Ok((self.lock(entry).await?, None, unread));
-        };
+        if self.cluster().is_none() {
+            return Ok((self.lock(entry).await?, unread));
+        }
         let mut state = entry.state.lock().await;
         let now = self.now();
         if state.loaded
             && now.saturating_sub(self.refresh_failed_at.load(Ordering::Relaxed))
                 < REFRESH_BACKOFF_MS
         {
-            return Ok((state, None, unread));
+            return Ok((state, unread));
         }
+        let generation = self.generation.load(Ordering::SeqCst);
         let snapshot = self
             .store
-            .attach_snapshot(
-                &entry.id,
-                &cluster.machine_id,
-                cluster.live_since(),
-                ATTACH_STORAGE_TIMEOUT,
-            )
+            .attach_snapshot(&entry.id, ATTACH_STORAGE_TIMEOUT)
             .await;
         match snapshot {
             Ok(Some(snapshot)) => {
@@ -511,9 +520,9 @@ impl Service {
                 state.loaded = true;
                 state.checked_at = now;
                 state.stale = false;
+                state.generation = generation;
                 Ok((
                     state,
-                    Some(snapshot.bridges),
                     AttachFollowup {
                         alarm: Some(snapshot.alarm),
                     },
@@ -523,7 +532,7 @@ impl Service {
             Ok(None) if self.pull_through.get().is_some() => {
                 state.loaded = false;
                 drop(state);
-                Ok((self.lock(entry).await?, None, unread))
+                Ok((self.lock(entry).await?, unread))
             }
             Ok(None) => {
                 state.record = None;
@@ -531,12 +540,13 @@ impl Service {
                 state.loaded = true;
                 state.checked_at = now;
                 state.stale = false;
-                Ok((state, None, unread))
+                state.generation = generation;
+                Ok((state, unread))
             }
             Err(error) if state.loaded => {
                 self.refresh_failed_at.store(now, Ordering::Relaxed);
                 warn!(tunnel = %entry.id, error = %format!("{error:#}"), "attaching with a cached record");
-                Ok((state, None, unread))
+                Ok((state, unread))
             }
             Err(error) => Err(error),
         }
@@ -551,6 +561,7 @@ impl Service {
         if now.saturating_sub(self.refresh_failed_at.load(Ordering::Relaxed)) < REFRESH_BACKOFF_MS {
             return state;
         }
+        let generation = self.generation.load(Ordering::SeqCst);
         match self.store.tunnel(&entry.id).await {
             Ok(loaded) => {
                 (state.record, state.revision) = match loaded {
@@ -559,6 +570,7 @@ impl Service {
                 };
                 state.checked_at = now;
                 state.stale = false;
+                state.generation = generation;
             }
             Err(error) => {
                 self.refresh_failed_at.store(now, Ordering::Relaxed);
@@ -596,11 +608,24 @@ impl Service {
         }
     }
 
-    /// Tells the other machines that a tunnel changed in a way routing cares about.
-    fn changed(&self, id: &str) {
+    /// Mesh events may have been missed (a link came up): cached "missing" and "not ready" answers are read again
+    /// before routing trusts them.
+    pub fn forget_cached_answers(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Tells the other machines something they act on: a tunnel changed in a way routing cares about, or a job
+    /// was added.
+    fn announce(&self, event: crate::mesh::Event) {
         if let Some(cluster) = self.cluster() {
-            cluster.invalidate_elsewhere(id);
+            cluster.mesh.publish(event);
         }
+    }
+
+    /// Wakes the job runner here, and on the other machines.
+    fn job_added(&self) {
+        self.jobs.notify_one();
+        self.announce(crate::mesh::Event::JobEnqueued);
     }
 
     /// Forgets the cached copy of a tunnel, after an import changed it underneath.
@@ -685,7 +710,7 @@ impl Service {
             renewal: None,
         };
         self.save(&mut state, record.clone()).await?;
-        self.changed(id);
+        self.announce(crate::mesh::Event::TunnelCreated { tunnel: id.into() });
         // A recreated ID must not inherit the deleted tunnel's alarm.
         self.store.set_alarm(id, None).await?;
         Ok(Some(self.view(&state, &record)))
@@ -704,7 +729,7 @@ impl Service {
         // A bridge on another machine counts too.
         if view.state == TunnelState::Offline
             && let Some(cluster) = self.cluster()
-            && cluster.online_elsewhere(id).await
+            && cluster.online_elsewhere(id)
         {
             view.state = TunnelState::Online;
         }
@@ -788,7 +813,7 @@ impl Service {
             ..record.clone()
         };
         self.save(&mut state, issuing.clone()).await?;
-        self.changed(id);
+        self.announce(crate::mesh::Event::CertificateChanged { tunnel: id.into() });
         if let Err(error) = self.ensure_issuance(&issuing, JobKind::Issue).await {
             let reason = error.to_string();
             self.analytics.publish(
@@ -830,18 +855,14 @@ impl Service {
             ..record.clone()
         };
         self.save(&mut state, deleted).await?;
-        self.changed(id);
+        // Bridges attached to other machines close too.
+        self.announce(crate::mesh::Event::TunnelDeleted { tunnel: id.into() });
         self.store.set_alarm(id, None).await?;
         let age = parse_iso(&record.created_at).map_or(0, |created| now.saturating_sub(created));
         self.analytics.publish(
             "tunnel.deleted",
             json!({ "tunnel_id": record.id, "age_ms": age }),
         );
-        drop(state);
-        // Bridges attached to other machines close too.
-        if let Some(cluster) = self.cluster() {
-            cluster.close_elsewhere(id).await;
-        }
         Ok(Lookup::Ok(()))
     }
 
@@ -882,7 +903,7 @@ impl Service {
             )
             .await?;
         if added {
-            self.jobs.notify_one();
+            self.job_added();
         }
         Ok(())
     }
@@ -918,7 +939,9 @@ impl Service {
                         ..record.clone()
                     };
                     self.save(&mut state, renewed.clone()).await?;
-                    self.changed(tunnel_id);
+                    self.announce(crate::mesh::Event::CertificateChanged {
+                        tunnel: tunnel_id.into(),
+                    });
                     self.schedule_renewal(&renewed).await?;
                     self.analytics.publish(
                         "certificate.renewed",
@@ -961,7 +984,9 @@ impl Service {
         };
         self.save(&mut state, updated.clone()).await?;
         if matches!(input, CertificateState::Ready { .. }) {
-            self.changed(tunnel_id);
+            self.announce(crate::mesh::Event::CertificateChanged {
+                tunnel: tunnel_id.into(),
+            });
         }
         self.schedule_renewal(&updated).await?;
         let previous = record
@@ -1274,7 +1299,7 @@ impl Service {
             requeued += 1;
         }
         if requeued > 0 {
-            self.jobs.notify_one();
+            self.job_added();
         }
         Ok(requeued)
     }
@@ -1306,7 +1331,6 @@ impl Service {
             cancel: CancellationToken::new(),
             client,
             seen_at: AtomicU64::new(self.now()),
-            published: AtomicBool::new(false),
             state: Mutex::new(BridgeState::default()),
             channels: Mutex::new(HashMap::new()),
         });
@@ -1328,7 +1352,7 @@ impl Service {
         max_conns: Option<u64>,
     ) -> Result<Attach> {
         let entry = self.entry(id);
-        let (mut state, elsewhere, followup) = self.lock_for_attach(&entry).await?;
+        let (mut state, followup) = self.lock_for_attach(&entry).await?;
         let Some(record) = state.record().cloned() else {
             return Ok(Attach::Error("bad_token", "bad token"));
         };
@@ -1352,13 +1376,11 @@ impl Service {
         if conflict {
             return Ok(Attach::Error("route_conflict", "route conflict"));
         }
-        // Routes are exclusive across machines too: the registry rows read with the record name the machines
-        // to ask, and only one of those still holding a route is a conflict. Two machines attaching the same
-        // route in the same instant may both succeed; visitors then reach the newer one, and the older keeps its
-        // own region's visitors.
+        // Routes are exclusive across machines too: the mesh table names the machines to ask, and only one of
+        // those still holding a route is a conflict. Two machines attaching the same route in the same instant
+        // may both succeed; visitors then reach the newer one, and the older keeps its own region's visitors.
         if let Some(cluster) = self.cluster()
-            && let Some(rows) = &elsewhere
-            && cluster.held_elsewhere(id, &routes, rows).await
+            && cluster.held_elsewhere(id, &routes).await
         {
             return Ok(Attach::Error("route_conflict", "route conflict"));
         }
@@ -1374,6 +1396,10 @@ impl Service {
             bridge_state.active_at = now;
         }
         bridge.touch(now);
+        // Every other machine can send visitors here from the moment the client hears `attached`.
+        if let Some(cluster) = self.cluster() {
+            cluster.mesh.attached(id, bridge.id, &routes, now);
+        }
         let mut connected_payload = json!({
             "tunnel_id": record.id,
             "session_id": session,
@@ -1401,24 +1427,10 @@ impl Service {
         })
     }
 
-    /// The bookkeeping of an attach, once the client has `attached`: records the bridge in the registry and,
-    /// at the same time, the connection on the record (`lastConnectedAt`, at most every
-    /// `LAST_CONNECTED_INTERVAL_MS`) and the renewal check. None of it delays or fails the attach: visitors on
-    /// other machines find the bridge once its row is written (one round trip later; until then they are closed,
-    /// as for a bridge that is still connecting), a failed registry write is retried by the heartbeat, and a
-    /// failed record write or renewal check happens again on the next attach or alarm. The bridge session runs
-    /// this alongside and waits for it before cleaning up, so the bridge's row is never removed before it was
-    /// written.
+    /// The bookkeeping of an attach, once the client has `attached`: records the connection on the record
+    /// (`lastConnectedAt`, at most every `LAST_CONNECTED_INTERVAL_MS`) and checks the renewal. None of it delays
+    /// or fails the attach: a failed record write or renewal check happens again on the next attach or alarm.
     pub async fn after_attach(&self, id: &str, bridge: &Arc<Bridge>, followup: AttachFollowup) {
-        let publish = async {
-            if let Some(cluster) = self.cluster()
-                && cluster
-                    .publish(id, bridge.id, &bridge.snapshot().routes)
-                    .await
-            {
-                bridge.published.store(true, Ordering::Relaxed);
-            }
-        };
         let record = async {
             let entry = self.entry(id);
             let mut state = entry.state.lock().await;
@@ -1453,7 +1465,7 @@ impl Service {
                 warn!(tunnel = %id, error = %format!("{error:#}"), "renewal check on attach failed");
             }
         };
-        tokio::join!(publish, record);
+        record.await;
     }
 
     /// Reports `tunnel.active` at most once per interval per bridge, piggybacking on the client's pings.
@@ -1519,7 +1531,7 @@ impl Service {
         crate::metrics::bridge_detach(crate::metrics::detach_reason(snapshot.server_close, clean));
         self.publish_disconnected(id, &snapshot, code, clean);
         if let Some(cluster) = self.cluster() {
-            cluster.unpublish(id, bridge.id);
+            cluster.mesh.detached(id, bridge.id);
         }
         Ok(())
     }
@@ -1553,7 +1565,7 @@ impl Service {
             if let Some(id) = &id {
                 self.publish_disconnected(id, &snapshot, 1001, false);
                 if let Some(cluster) = self.cluster() {
-                    cluster.unpublish(id, bridge.id);
+                    cluster.mesh.detached(id, bridge.id);
                 }
             }
         }
@@ -1648,9 +1660,13 @@ impl Service {
         })
     }
 
-    /// Closes this machine's bridges of a tunnel deleted elsewhere, and forgets its cached record.
-    pub async fn close_deleted(&self, id: &str) {
-        let entry = self.entry(id);
+    /// Closes this machine's bridges of a tunnel deleted elsewhere, and forgets its cached record. Returns
+    /// whether it had any.
+    pub async fn close_deleted(&self, id: &str) -> bool {
+        let entry = self.tunnels.lock().expect("tunnels lock").get(id).cloned();
+        let Some(entry) = entry else {
+            return false;
+        };
         let mut state = entry.state.lock().await;
         for bridge in &state.bridges {
             bridge.finish_channels(Outcome::Deleted);
@@ -1659,6 +1675,7 @@ impl Service {
         state.loaded = false;
         state.record = None;
         state.revision = 0;
+        !state.bridges.is_empty()
     }
 
     /// The routes this machine's live bridges hold for a tunnel, for another machine's attach.
@@ -1676,28 +1693,25 @@ impl Service {
             .collect())
     }
 
-    /// Records bridges the registry is missing (attached while the database was unavailable) and returns the
-    /// tunnels with live bridges here.
-    pub async fn republish(&self, cluster: &Cluster) -> Vec<String> {
+    /// Closes the bridges here of tunnels deleted while a deletion could have been missed (a mesh link was down).
+    pub async fn close_deleted_tunnels(&self) -> Result<()> {
         let mut live = Vec::new();
         for entry in self.entries() {
-            let state = entry.state.lock().await;
-            let mut any = false;
-            for bridge in state.attached().filter(|bridge| !bridge.is_closing()) {
-                any = true;
-                if !bridge.published.load(Ordering::Relaxed)
-                    && cluster
-                        .publish(&entry.id, bridge.id, &bridge.snapshot().routes)
-                        .await
-                {
-                    bridge.published.store(true, Ordering::Relaxed);
-                }
-            }
-            if any {
+            if entry.state.lock().await.attached().next().is_some() {
                 live.push(entry.id.clone());
             }
         }
-        live
+        if live.is_empty() {
+            return Ok(());
+        }
+        for tunnel in self.store.deleted_tunnels(&live).await? {
+            info!(
+                tunnel,
+                "closing the bridges of a tunnel deleted on another machine"
+            );
+            self.close_deleted(&tunnel).await;
+        }
+        Ok(())
     }
 
     /// Closes every bridge, for shutdown. Clients treat `drain` as a reason to reconnect.
@@ -1893,8 +1907,8 @@ mod tests {
             "secret".into(),
             store.clone(),
             clock,
-            60_000,
             Arc::new(crate::http::Stats::default()),
+            crate::mesh::MeshConfig::default(),
         )
         .unwrap()
     }
@@ -2533,7 +2547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trusts_a_missing_tunnel_for_a_while() {
+    async fn trusts_a_missing_tunnel_until_told_otherwise() {
         let Some(harness) = Harness::clustered().await else {
             return;
         };
@@ -2549,14 +2563,34 @@ mod tests {
         };
         assert!(missing().await);
         assert!(!harness.service.exists("abcdefghijkl").await.unwrap());
-        // Created on another machine: this one notices once its answer is old enough.
+        // Created behind this machine's back: with every peer linked (none here), the cached answer stands until
+        // an event says otherwise, and only the safety TTL ends it without one.
         harness.tunnel(T0 + 80 * DAY_MS, None).await;
         harness.service.collect_idle();
         assert!(missing().await);
-        assert!(!harness.service.exists("abcdefghijkl").await.unwrap());
         harness.advance(MISSING_TTL_MS);
+        assert!(!harness.service.exists("abcdefghijkl").await.unwrap());
+        harness.service.expire("abcdefghijkl").await;
         assert!(harness.service.exists("abcdefghijkl").await.unwrap());
         assert!(!missing().await);
+
+        // A link coming up (events may have been missed) makes every cached answer stale.
+        assert!(!harness.service.exists("otherone0000").await.unwrap());
+        let mut other = harness.record().await;
+        other.id = "otherone0000".into();
+        other.hostname = "otherone0000.opentunnel.test".into();
+        harness.service.store.put_tunnel(&other, T0).await.unwrap();
+        assert!(!harness.service.exists("otherone0000").await.unwrap());
+        harness.service.forget_cached_answers();
+        assert!(harness.service.exists("otherone0000").await.unwrap());
+
+        // And the safety TTL.
+        assert!(!harness.service.exists("thirdone0000").await.unwrap());
+        other.id = "thirdone0000".into();
+        other.hostname = "thirdone0000.opentunnel.test".into();
+        harness.service.store.put_tunnel(&other, T0).await.unwrap();
+        harness.advance(SAFETY_TTL_MS);
+        assert!(harness.service.exists("thirdone0000").await.unwrap());
     }
 
     /// A TCP proxy to the database that holds every client write for `delay`, like a database a round trip of
@@ -2661,13 +2695,9 @@ mod tests {
             let elapsed = started.elapsed();
             eprintln!("{attempt} attach bookkeeping took {elapsed:?}");
             assert!(elapsed < RTT * 4, "{attempt} bookkeeping took {elapsed:?}");
-            assert!(bridge.published.load(Ordering::Relaxed));
-            let rows = store
-                .bridge_locations("abcdefghijkl", None, 0)
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].bridge_id, bridge.id);
+            // Announced to the mesh, without the database.
+            let mesh = &harness.service.cluster().unwrap().mesh;
+            assert_eq!(mesh.table_sizes()[0].1, 1);
             // Closing does not wait for the database at all.
             let started = std::time::Instant::now();
             harness
@@ -2680,6 +2710,7 @@ mod tests {
                 "closing took {:?}",
                 started.elapsed()
             );
+            assert_eq!(mesh.table_sizes()[0].1, 0);
         }
         assert!(harness.record().await.last_connected_at.is_some());
     }

@@ -16,6 +16,7 @@ pub mod http;
 pub mod issuer;
 pub mod jobs;
 pub mod logging;
+pub mod mesh;
 pub mod metrics;
 pub mod migration;
 pub mod net;

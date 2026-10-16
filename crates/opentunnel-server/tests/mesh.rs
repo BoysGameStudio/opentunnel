@@ -1,0 +1,336 @@
+//! The mesh on its own, without servers or a database: links between several machines, duplicate links, the
+//! previous version, bad tokens, and a table of 20,000 bridges under churn.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use opentunnel_server::clock::Clock;
+use opentunnel_server::mesh::{Event, MESH_MAGIC, Mesh, MeshConfig, Notice};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+
+struct Node {
+    mesh: Arc<Mesh>,
+    address: String,
+    notices: mpsc::UnboundedReceiver<Notice>,
+}
+
+fn config() -> MeshConfig {
+    MeshConfig {
+        ping: Duration::from_millis(200),
+        dead: Duration::from_millis(1000),
+        ..MeshConfig::default()
+    }
+}
+
+/// A machine: a mesh behind its own internal listener, which only takes mesh links.
+async fn node(name: &str, token: &str) -> Node {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let (mesh, notices) = Mesh::new(
+        name.into(),
+        "local".into(),
+        token.into(),
+        Clock::system(),
+        config(),
+    );
+    mesh.set_address(address.clone());
+    let accepting = mesh.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mesh = accepting.clone();
+            tokio::spawn(async move {
+                let mut line = Vec::new();
+                let mut byte = [0u8; 1];
+                while stream.read_exact(&mut byte).await.is_ok() && byte[0] != b'\n' {
+                    line.push(byte[0]);
+                }
+                let Some(token) = line.strip_prefix(MESH_MAGIC) else {
+                    return;
+                };
+                let token = String::from_utf8_lossy(token).into_owned();
+                let _ = mesh
+                    .accept(
+                        opentunnel_server::tls::Replay::new(Vec::new(), stream),
+                        &token,
+                    )
+                    .await;
+            });
+        }
+    });
+    tokio::spawn(mesh.clone().run());
+    Node {
+        mesh,
+        address,
+        notices,
+    }
+}
+
+async fn wait(what: &str, limit: Duration, mut check: impl FnMut() -> bool) -> Duration {
+    let started = Instant::now();
+    while !check() {
+        assert!(started.elapsed() < limit, "{what} took over {limit:?}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    started.elapsed()
+}
+
+fn size(node: &Node, machine: &str) -> Option<usize> {
+    node.mesh
+        .table_sizes()
+        .into_iter()
+        .find(|(id, _)| id == machine)
+        .map(|(_, size)| size)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn links_every_pair_once_and_replicates_the_table() {
+    let nodes = [
+        node("m1", "secret").await,
+        node("m2", "secret").await,
+        node("m3", "secret").await,
+    ];
+    // Everyone knows everyone, so both sides of each pair dial; one link per pair stays.
+    for node in &nodes {
+        for other in &nodes {
+            if other.address != node.address {
+                node.mesh.add_peer(&other.address);
+            }
+        }
+    }
+    wait("every link", Duration::from_secs(5), || {
+        nodes.iter().all(|node| node.mesh.peers().len() == 2)
+    })
+    .await;
+    // Through the duplicate-link delay: still exactly one link per pair, and stable.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for node in &nodes {
+        assert_eq!(node.mesh.peers().len(), 2);
+        assert_eq!(node.mesh.view()["complete"], true);
+    }
+
+    nodes[0]
+        .mesh
+        .attached("abcdefghijkl", 1, &["api".into(), "@".into()], 10);
+    nodes[1]
+        .mesh
+        .attached("abcdefghijkl", 1, &["web".into()], 20);
+    wait("the table to replicate", Duration::from_secs(1), || {
+        nodes[2].mesh.locate("abcdefghijkl", "api", None).is_some()
+            && nodes[2].mesh.locate("abcdefghijkl", "web", None).is_some()
+    })
+    .await;
+    let located = nodes[2].mesh.locate("abcdefghijkl", "api", None).unwrap();
+    assert_eq!(located.machine_id, "m1");
+    assert_eq!(located.address, nodes[0].address);
+    assert_eq!(
+        nodes[2]
+            .mesh
+            .locate("abcdefghijkl", "web", None)
+            .unwrap()
+            .machine_id,
+        "m2"
+    );
+    assert!(nodes[0].mesh.locate("abcdefghijkl", "api", None).is_none());
+    // Two machines claiming one route: the newer attach wins, and the other is found when it is excluded.
+    nodes[1]
+        .mesh
+        .attached("abcdefghijkl", 2, &["api".into()], 30);
+    wait("the newer claim", Duration::from_secs(1), || {
+        nodes[2]
+            .mesh
+            .locate("abcdefghijkl", "api", None)
+            .is_some_and(|location| location.machine_id == "m2")
+    })
+    .await;
+    assert_eq!(
+        nodes[2]
+            .mesh
+            .locate("abcdefghijkl", "api", Some("m2"))
+            .unwrap()
+            .machine_id,
+        "m1"
+    );
+    assert_eq!(nodes[2].mesh.holders("abcdefghijkl", &[]).len(), 2);
+    nodes[1].mesh.detached("abcdefghijkl", 2);
+    nodes[1].mesh.detached("abcdefghijkl", 1);
+    wait("the detaches", Duration::from_secs(1), || {
+        size(&nodes[2], "m2") == Some(0)
+    })
+    .await;
+
+    // A leaving machine's bridges are dropped at once, and its later claims ignored.
+    nodes[0].mesh.leave();
+    wait(
+        "the leaving machine to be dropped",
+        Duration::from_secs(1),
+        || nodes[2].mesh.locate("abcdefghijkl", "api", None).is_none(),
+    )
+    .await;
+    nodes[0]
+        .mesh
+        .attached("abcdefghijkl", 3, &["late".into()], 40);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(nodes[2].mesh.locate("abcdefghijkl", "late", None).is_none());
+    assert!(nodes[2].mesh.is_up("m1"));
+    for node in &nodes {
+        node.mesh.halt(false);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn events_reach_every_peer_and_a_new_link_is_announced() {
+    let mut a = node("a", "secret").await;
+    let mut b = node("b", "secret").await;
+    a.mesh.add_peer(&b.address);
+    wait("the link", Duration::from_secs(3), || b.mesh.is_up("a")).await;
+    assert_eq!(a.notices.recv().await, Some(Notice::LinkUp));
+    assert_eq!(b.notices.recv().await, Some(Notice::LinkUp));
+    a.mesh.publish(Event::TunnelDeleted {
+        tunnel: "gonetunnel00".into(),
+    });
+    a.mesh.publish(Event::JobEnqueued);
+    let received = tokio::time::timeout(Duration::from_secs(1), b.notices.recv())
+        .await
+        .unwrap();
+    assert_eq!(
+        received,
+        Some(Notice::Event(Event::TunnelDeleted {
+            tunnel: "gonetunnel00".into()
+        }))
+    );
+    assert_eq!(
+        b.notices.recv().await,
+        Some(Notice::Event(Event::JobEnqueued))
+    );
+    a.mesh.halt(false);
+    b.mesh.halt(false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refuses_a_peer_with_another_token_and_recognises_the_previous_version() {
+    let a = node("a", "secret").await;
+    let stranger = node("stranger", "other").await;
+    a.mesh.add_peer(&stranger.address);
+    stranger.mesh.add_peer(&a.address);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(a.mesh.peers().is_empty());
+    assert!(stranger.mesh.peers().is_empty());
+    assert_eq!(a.mesh.view()["complete"], false);
+
+    // The previous version's internal listener answers anything but a forward with HTTP.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n")
+                .await;
+        }
+    });
+    assert!(!a.mesh.legacy_present());
+    a.mesh.add_peer(&old);
+    wait(
+        "the previous version to be recognised",
+        Duration::from_secs(3),
+        || a.mesh.legacy_present(),
+    )
+    .await;
+    assert_eq!(a.mesh.view()["peers"]["legacy"], 1);
+    a.mesh.halt(false);
+    stranger.mesh.halt(false);
+}
+
+/// 20,000 bridges, then 100 attaches and detaches per second for 10 seconds on one machine while another
+/// follows: every change arrives, quickly, and memory stays modest. A third machine joining late gets the
+/// whole table in one snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_table_under_churn() {
+    const BRIDGES: u64 = 20_000;
+    let a = node("a", "secret").await;
+    let b = node("b", "secret").await;
+    a.mesh.add_peer(&b.address);
+    wait("the link", Duration::from_secs(3), || b.mesh.is_up("a")).await;
+    let resident = || opentunnel_server::metrics::resident_memory().unwrap_or(0);
+    let before = resident();
+
+    let started = Instant::now();
+    for bridge in 0..BRIDGES {
+        let tunnel = format!("tunnel{bridge:06}");
+        a.mesh
+            .attached(&tunnel, bridge, &["@".into(), "api".into()], bridge);
+    }
+    let announced = started.elapsed();
+    let took = wait("20,000 attaches to arrive", Duration::from_secs(10), || {
+        size(&b, "a") == Some(BRIDGES as usize)
+    })
+    .await;
+    eprintln!("20,000 attaches announced in {announced:?}, all applied after {took:?} more");
+
+    // Churn: each tick detaches one bridge and attaches a new one, and measures how long until the peer
+    // sees the new one.
+    let mut latencies = Vec::new();
+    let churn_started = Instant::now();
+    let mut ticker = tokio::time::interval(Duration::from_millis(10));
+    for round in 0..1000u64 {
+        let next = BRIDGES + round;
+        ticker.tick().await;
+        let old = round * 7 % BRIDGES;
+        a.mesh.detached(&format!("tunnel{old:06}"), old);
+        let tunnel = format!("tunnel{next:06}");
+        a.mesh.attached(&tunnel, next, &["@".into()], next);
+        if round % 10 == 0 {
+            let sent = Instant::now();
+            while b.mesh.locate(&tunnel, "@", None).is_none() {
+                assert!(
+                    sent.elapsed() < Duration::from_secs(2),
+                    "a change took over 2 s"
+                );
+                tokio::task::yield_now().await;
+            }
+            latencies.push(sent.elapsed());
+        }
+    }
+    let churn = churn_started.elapsed();
+    let last = format!("tunnel{:06}", BRIDGES + 999);
+    wait("the churn to settle", Duration::from_secs(5), || {
+        b.mesh.locate(&last, "@", None).is_some() && size(&b, "a") == size(&a, "a")
+    })
+    .await;
+    latencies.sort();
+    let p50 = latencies[latencies.len() / 2];
+    let p99 = latencies[latencies.len() * 99 / 100];
+    let max = *latencies.last().unwrap();
+    eprintln!(
+        "2,000 changes over {churn:?}: propagation p50 {p50:?}, p99 {p99:?}, max {max:?}; table {:?} here, {:?} there",
+        size(&a, "a"),
+        size(&b, "a")
+    );
+    assert_eq!(size(&b, "a"), Some(BRIDGES as usize));
+    assert!(p99 < Duration::from_millis(100), "p99 {p99:?}");
+
+    // A late joiner gets everything in one snapshot.
+    let c = node("c", "secret").await;
+    let joined = Instant::now();
+    c.mesh.add_peer(&a.address);
+    a.mesh.add_peer(&c.address);
+    let took = wait("the snapshot", Duration::from_secs(10), || {
+        size(&c, "a") == size(&a, "a")
+    })
+    .await;
+    eprintln!(
+        "a snapshot of {:?} bridges applied {took:?} after the join was requested ({:?} total)",
+        size(&c, "a"),
+        joined.elapsed()
+    );
+    let grown = resident().saturating_sub(before);
+    eprintln!(
+        "resident memory grew by {} MiB for three copies of the table",
+        grown >> 20
+    );
+    assert!(grown < 512 << 20, "memory grew by {grown} bytes");
+    for node in [&a, &b, &c] {
+        node.mesh.halt(false);
+    }
+}

@@ -96,7 +96,7 @@ pub async fn run<S>(
     let mut writer = tokio::spawn(write(sink, rx, cancel.clone()));
     let mut followup = None;
     let (code, clean) = read(&service, &tunnel_id, &bridge, stream, &mut followup).await;
-    // The attach's registry write lands before the removal is queued.
+    // The attach's bookkeeping finishes before the bridge is cleaned up.
     if let Some(followup) = followup {
         let _ = followup.await;
     }

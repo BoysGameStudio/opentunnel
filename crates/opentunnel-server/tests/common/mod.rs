@@ -150,14 +150,41 @@ impl TestServer {
         self.server.app.service.drain().await;
         self.server.jobs.release().await;
         tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Some(cluster) = &self.server.cluster {
+            cluster.mesh.halt(false);
+        }
     }
 
-    /// Stops every listener and background task without any cleanup, like a machine that crashed. Bridges
-    /// already attached stay open, but nothing else reaches the server.
+    /// Stops every listener, background task and mesh link without any cleanup, like a machine that crashed
+    /// (its links close, as the kernel closes a dead process's sockets). Bridges already attached stay open,
+    /// but nothing else reaches the server.
     pub fn crash(&self) {
         for task in &self.tasks {
             task.abort();
         }
+        if let Some(cluster) = &self.server.cluster {
+            cluster.mesh.halt(false);
+        }
+    }
+
+    /// Like [`crash`](Self::crash), but the mesh links stay open and silent, like a machine that froze or a
+    /// network that drops everything: peers notice only when its pings stop.
+    pub fn freeze(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        if let Some(cluster) = &self.server.cluster {
+            cluster.mesh.halt(true);
+        }
+    }
+
+    pub fn mesh(&self) -> &std::sync::Arc<opentunnel_server::mesh::Mesh> {
+        &self.server.cluster.as_ref().expect("a cluster").mesh
+    }
+
+    /// The internal listener other machines reach.
+    pub fn internal(&self) -> String {
+        self.mesh().address().to_owned()
     }
 
     pub fn service(&self) -> &opentunnel_server::service::Service {
@@ -235,6 +262,22 @@ pub async fn app(body: &'static str) -> String {
         }
     });
     address
+}
+
+/// Tells every server about every other one and waits until all links are up.
+pub async fn link(servers: &[&TestServer]) {
+    for (index, server) in servers.iter().enumerate() {
+        for other in &servers[index + 1..] {
+            server.mesh().add_peer(&other.internal());
+            other.mesh().add_peer(&server.internal());
+        }
+    }
+    eventually("the mesh links", || async {
+        servers
+            .iter()
+            .all(|server| server.mesh().peers().len() == servers.len() - 1)
+    })
+    .await;
 }
 
 pub async fn eventually<F, Fut>(what: &str, mut check: F)
