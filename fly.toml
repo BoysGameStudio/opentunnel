@@ -98,9 +98,7 @@ kill_timeout = "30s"
     path = "/health"
     protocol = "http"
 
-# A dedicated core per machine: shared CPUs run on burst credits, and reconnect storms after deploys or
-# incidents used them up (cdg hit a full core on 2026-10-15). Busy regions get more machines rather than
-# bigger ones.
+# One size everywhere; busy regions get more machines rather than bigger ones.
 [[vm]]
-  size = "performance-1x"
-  memory = "2gb"
+  size = "shared-cpu-1x"
+  memory = "1gb"
