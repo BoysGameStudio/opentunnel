@@ -27,8 +27,8 @@ use crate::store::Store;
 use crate::tls;
 use crate::website::Website;
 
-/// What one public connection may cost, for the connection limit: a bridge is ~30 KB with its tunnel's record.
-const CONNECTION_MEMORY: u64 = 32 * 1024;
+/// What one public connection may cost, for the connection limit: a bridge is ~50 KB in production.
+const CONNECTION_MEMORY: u64 = 64 * 1024;
 /// The most public connections handled at once, whatever the memory.
 const MAX_CONNECTIONS: usize = 60_000;
 /// API TLS handshakes at once. A handshake is ~0.1 ms of CPU (the key exchange and signature) plus a round trip

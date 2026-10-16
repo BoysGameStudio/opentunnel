@@ -277,7 +277,7 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_uptime_seconds` | gauge | | |
 | `opentunnel_accept_errors_total` | counter | `error` (`emfile`, `other`) | failed accepts; `emfile` is running out of descriptors |
 | `opentunnel_api_tls_handshakes_total` | counter | `result` (`ok`, `failed`, `timeout`) | TLS for the API domain; through Cloudflare a failed handshake is a 525 |
-| `opentunnel_connections_shed_total` | counter | `reason` (`handshakes`, `connections`) | public connections closed unserved because the machine is saturated: no API TLS handshake slot within 1 s, or at the connection limit (as many as three quarters of the memory hold at ~32 KB each, at most 60,000; logged at startup) ([Capacity](#capacity)) |
+| `opentunnel_connections_shed_total` | counter | `reason` (`handshakes`, `connections`) | public connections closed unserved because the machine is saturated: no API TLS handshake slot within 1 s, or at the connection limit (as many as three quarters of the memory hold at 64 KB each, at most 60,000; logged at startup) ([Capacity](#capacity)) |
 | `opentunnel_bridges_attached` | gauge | | |
 | `opentunnel_bridge_attaches_total` | counter | `result` (`ok`, `bad_token`, `cert_not_ready`, `invalid_route`, `route_conflict`, `error`) | |
 | `opentunnel_bridge_detaches_total` | counter | `reason` (`client_close`, `drop`, `idle_retire`, `drain`, `delete`, `server_close`) | attached bridges that ended |
@@ -552,8 +552,10 @@ balance left it bursts to the whole core).
 **What a bridge costs.** Memory: ~22 KB per idle bridge for the connection
 itself (rustls with its 4 KB record buffer, the two tasks, the queue, the
 bridge state), plus its tunnel's cached record (~6 KB with a certificate,
-chain and CSR), so ~29 KB in all, against ~190 KB before October 2026. What
-went: tungstenite's 128 KiB read buffer per socket (and read and write
+chain and CSR), so ~29 KB in all, against ~190 KB before October 2026. In
+production, where bridges carry traffic, it is ~50 KB (~250 KB before: cdg
+went from 160 MB with 569 bridges to 37 MB with 456; an idle machine is
+~16 MB). What went: tungstenite's 128 KiB read buffer per socket (and read and write
 buffers that stayed as large as the largest frame a socket ever carried,
 ~100 KB more on a bridge that had carried visitors), replaced by
 `websocket.rs`, which keeps no buffer between messages and writes frames
@@ -599,17 +601,16 @@ the core, 4,000 bridges attach at 420/s (71/s before, with 1,650 client
 timeouts) and a storm of them drains in 14 s (18 s before); a storm of 10,000
 takes ~80 s, many attempts timing out while the core is starved.
 
-**Limits.** Memory: ~160 MB at rest on Fly (pool connections, mesh table,
-website) plus ~29 KB per bridge, so 60% memory is ~37,000 bridges on 2 GB and
-~15,000 on 1 GB. CPU: ~1% of a core per 10,000 idle bridges, ~0.14 ms per
+**Limits.** Memory: ~20 MB at rest plus ~50 KB per bridge in production, so
+60% memory is ~24,000 bridges on 2 GB and ~12,000 on 1 GB. CPU: ~1% of a core per 10,000 idle bridges, ~0.14 ms per
 attach, ~0.15 ms per visitor connection. On a dedicated core memory binds
 first; on `shared-cpu-1x` the storm a machine must absorb on a starved core
 does (it should stay at a few thousand bridges).
 
 | Machine | Bridges at ~60% memory | Recommended `soft_limit` / `hard_limit` (connections on :443) |
 | --- | --- | --- |
-| `shared-cpu-1x`, 1 GB (`fly.toml` today) | ~15,000 | 5,000 / 10,000 |
-| `performance-1x`, 2 GB | ~37,000 | 15,000 / 35,000 |
+| `shared-cpu-1x`, 1 GB (`fly.toml` today) | ~12,000 | 5,000 / 10,000 |
+| `performance-1x`, 2 GB | ~24,000 | 15,000 / 25,000 |
 
 The limits count every connection on :443 (bridges, visitors, API calls).
 Fly's proxy sends a new connection to the closest machine in the region that
