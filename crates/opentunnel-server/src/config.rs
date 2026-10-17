@@ -37,6 +37,11 @@ pub struct Config {
     #[arg(long, env = "DATABASE_POOL_SIZE", default_value_t = 50)]
     pub database_pool_size: u32,
 
+    /// At startup, how long to keep retrying an unreachable database before exiting with an error, so the
+    /// platform restarts the machine. 0 waits forever. Only startup: a running server rides out outages.
+    #[arg(long, env = "STARTUP_DB_TIMEOUT_MS", default_value_t = 120_000)]
+    pub startup_db_timeout_ms: u64,
+
     /// The built website (`vite build` output).
     #[arg(long, env = "WEBSITE_DIR", default_value = "/app/website")]
     pub website_dir: PathBuf,

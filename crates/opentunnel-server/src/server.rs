@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::acme::{Acme, AcmeConfig};
 use crate::admin::TokenAdmin;
@@ -81,7 +81,15 @@ impl Server {
             .filter(|url| !url.is_empty())
             .context("DATABASE_URL is not set")?;
         let store = Store::connect(url, config.database_pool_size)?;
-        store.wait_ready().await?;
+        // Nothing listens until the database answers, so health checks fail and Fly routes elsewhere. A machine
+        // that cannot reach it for STARTUP_DB_TIMEOUT_MS exits non-zero so Fly restarts it (`[[restart]]`).
+        let limit = Some(config.startup_db_timeout_ms)
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis);
+        if let Err(error) = store.wait_ready(limit).await {
+            error!(error = %format!("{error:#}"), "the database is not available, exiting");
+            return Err(error);
+        }
         Self::with_store(config, clock, store).await
     }
 

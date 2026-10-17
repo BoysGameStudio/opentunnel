@@ -158,15 +158,44 @@ Nothing assumes a single writer, so two servers on one database stay correct:
   compare-and-set on `meta`.
 
 When the database is unavailable the server keeps running: the pool
-(`DATABASE_POOL_SIZE` connections, 50 by default, 8 kept open while idle, a
-3 s acquire timeout, no check before use, idle ones closed after a minute and
-all recycled after 30 minutes) reconnects on its own, every statement gives up
-after 10 s (an attach's read after 4 s), and API calls that need storage answer 503
+(`DATABASE_POOL_SIZE` connections, 50 by default, 8 kept open while idle and
+topped up in the background every 10 s, no check before use, idle ones closed
+after a minute and all recycled after 30 minutes) reconnects on its own, every
+statement gives up after 10 s (an attach's read after 4 s), and API calls that need storage answer 503
 (`{"_tag":"ServiceUnavailableError","message":"storage unavailable"}`). Tunnels
 with an attached bridge keep their record in memory, so visitor traffic and
 token checks for them never touch the database; a bridge that attaches during
-an outage is accepted from a cached record. At startup the server waits,
-retrying, until the database answers.
+an outage is accepted from a cached record.
+
+Opening a connection may take up to 20 s (`CONNECT_TIMEOUT` in `store.rs`):
+TCP and TLS to PlanetScale's nearest edge, then the MySQL handshake, which the
+edge relays to us-east-1, several round trips from far regions (`jnb`
+logged 2.6 s acquires). sqlx bounds a new connection by the pool's
+acquire timeout, so that timeout is 20 s too; statements stay bounded by their
+own limits above. Until 2026-10-16 the acquire timeout was 3 s, which aborted
+every connection that took longer: machines in `gru` that hit slow connects
+logged `pool timed out while waiting for an open connection` at startup
+forever and never served. Idle connections are opened in the background
+(`opened idle database connections`, with the time it took, or the error).
+
+At startup the server listens on nothing until the database answers: it
+connects once outside the pool (logging `connected to the database` with
+`connect_ms`, or the real error, followed by `database probe:` lines with the
+time to resolve the host and a TCP connect to each address) and migrates,
+retrying with backoff up to 15 s apart. So a machine without the
+database fails its health checks and Fly sends its traffic and clients to
+other machines. If the database is still unreachable after
+`STARTUP_DB_TIMEOUT_MS` (2 minutes), it logs `the database is not available,
+exiting` with the last error and exits with status 1; `fly.toml`'s
+`[[restart]]` policy (`on-failure`, 10 retries) restarts it (for a machine whose host
+has lost its path to PlanetScale while every other region reaches it, as `gru`
+on 2026-10-16). Each attempt takes the full 2 minutes, so a
+crash-looping machine costs little; after the retries Fly leaves it stopped
+(`fly machine start`, or clone it to another host with `fly machine clone`).
+Only startup gives up: a running machine never exits over the database, so a
+whole-database outage does not restart machines that were already serving.
+During a deploy in such an outage the new machines never pass their checks,
+the deploy fails, and the old machines keep serving.
 
 Back it up with `opentunnel-server export <file>` (or
 `POST /api/admin/export`); `opentunnel-server import <file>` writes an export
@@ -183,6 +212,7 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `HTTP_MODE` | `redirect` | `serve` runs the whole app on plain HTTP (development, tests) |
 | `PROXY_PROTOCOL` | `false` | require a PROXY v1/v2 header on :443 (`true` on Fly) |
 | `DATABASE_URL` | | secret: `mysql://user:password@host/opentunnel?ssl-mode=VERIFY_IDENTITY` (PlanetScale's "MySQL" connection string). TLS with certificate checks is the default and is required unless the host is loopback |
+| `STARTUP_DB_TIMEOUT_MS` | `120000` | at startup, exit with status 1 if the database is still unreachable after this long (Fly restarts the machine); 0 waits forever |
 | `WEBSITE_DIR` | `/app/website` | |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | | serve this certificate for the domain instead of issuing one |
 | `ISSUER` | `acme` | `local` is an insecure built-in CA for development and tests |
@@ -504,7 +534,8 @@ Failure modes:
 | A machine crashes | Its links close: peers drop its bridges at once (or within 5 s if it froze without closing them) and stop forwarding there; its clients reconnect elsewhere and attach at once (the route check does not count it) |
 | A machine restarts | Its new life (new epoch) replaces the old entries as soon as its new link is up |
 | 6PN between two machines fails (partition) | Each side drops the other's bridges within 5 s and serves its own; visitors for the other side's bridges are closed at once (no forward is tried). When the link heals, snapshots reconverge the tables and a check catches deletions made meanwhile |
-| Database unavailable | Local visitors, attached bridges, forwarding and the mesh keep working from memory; attaches use cached records; API calls answer 503 |
+| Database unavailable | Local visitors, attached bridges, forwarding and the mesh keep working from memory; attaches use cached records; API calls answer 503. A machine that starts meanwhile serves nothing and fails its checks, and exits after `STARTUP_DB_TIMEOUT_MS` so Fly restarts it ([Storage](#storage)) |
+| One machine cannot reach the database (its host's network) | At startup: as above, it fails its checks and restarts every 2 minutes, up to 10 times. While running: its API calls answer 503 while bridges and visitors of tunnels it already knows keep working |
 | An event is lost (a link down at the time) | The receiver reads cached "missing"/"not ready" answers again and checks for deleted tunnels when the link comes back |
 
 Latency: PlanetScale is in us-east-1, ~200 ms from `syd`. The visitor path

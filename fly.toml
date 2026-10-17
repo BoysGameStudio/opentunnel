@@ -22,6 +22,12 @@ kill_timeout = "30s"
 [deploy]
   strategy = "bluegreen"
 
+# A machine that cannot reach the database for STARTUP_DB_TIMEOUT_MS (2 minutes) at startup exits with status 1,
+# and Fly restarts it; a clean exit after SIGTERM (status 0) is not restarted. See docs/server.md, "Storage".
+[[restart]]
+  policy = "on-failure"
+  retries = 10
+
 [env]
   OPENTUNNEL_DOMAIN = "opentunnel.xyz"
   # Fly's proxy_proto handler below prepends a PROXY v2 header with the visitor's address.

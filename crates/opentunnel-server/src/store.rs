@@ -12,10 +12,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::{
-    MySqlConnectOptions, MySqlDatabaseError, MySqlPool, MySqlPoolOptions, MySqlRow, MySqlSslMode,
+    MySqlConnectOptions, MySqlConnection, MySqlDatabaseError, MySqlPool, MySqlPoolOptions,
+    MySqlRow, MySqlSslMode,
 };
-use sqlx::{Executor, Row};
-use tracing::warn;
+use sqlx::{ConnectOptions, Connection, Executor, Row};
+use tracing::{info, warn};
 
 use crate::record::StoredTunnel;
 
@@ -102,9 +103,16 @@ const SCHEMA: &[&str] = &[
 
 /// Every statement gives up after this long, so a stalled database cannot hang a request.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a statement waits for a pooled connection. Well inside a client's 10 s bridge connect timeout, so a
-/// saturated pool fails an attach while the client can still back off, instead of after it gave up.
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long opening a connection may take: TCP, TLS to PlanetScale's nearest edge and the MySQL handshake, which
+/// the edge relays to the database (us-east-1), several round trips from far regions. sqlx bounds a new
+/// connection by the pool's acquire timeout, so this is also that timeout; a statement on the request path is
+/// still bounded by its own limit (`timed`, and 4 s for an attach), which fails an attach while the client can
+/// back off. A 3 s acquire timeout aborted every connection that took longer, at startup forever (gru).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Each address's TCP connect in the diagnostics after a failed startup connection.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the pool is topped up to `MIN_CONNECTIONS` in the background.
+const WARM_INTERVAL: Duration = Duration::from_secs(10);
 /// Connections kept open while idle, so a burst after a quiet spell does not wait for TLS handshakes (several
 /// round trips each from regions far from the database).
 const MIN_CONNECTIONS: u32 = 8;
@@ -123,6 +131,7 @@ const READ_BATCHES: usize = 8;
 #[derive(Clone)]
 pub struct Store {
     pool: MySqlPool,
+    options: MySqlConnectOptions,
     reads: Arc<Mutex<Reads>>,
 }
 
@@ -341,6 +350,41 @@ fn literal(value: &str) -> Option<String> {
 }
 
 /// Runs one storage operation with the statement timeout, recording its duration and failure as `operation`.
+/// Creates the tables unless the database is already at this version.
+async fn migrate(connection: &mut MySqlConnection) -> Result<()> {
+    let version: Option<i64> =
+        match sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
+            .fetch_one(&mut *connection)
+            .await
+        {
+            Ok(version) => version,
+            // 1146: the table does not exist yet.
+            Err(error) if mysql_code(&error) == Some(1146) => None,
+            Err(error) => return Err(db(error)),
+        };
+    if let Some(version) = version {
+        if version > SCHEMA_VERSION {
+            return Err(NewerSchema(version).into());
+        }
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+    }
+    for statement in SCHEMA {
+        connection.execute(*statement).await.map_err(db)?;
+    }
+    sqlx::query(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE version = version",
+    )
+    .bind(SCHEMA_VERSION)
+    .bind(crate::clock::Clock::system().now_ms() as i64)
+    .execute(&mut *connection)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
 async fn timed<T>(operation: &'static str, future: impl Future<Output = Result<T>>) -> Result<T> {
     timed_within(operation, QUERY_TIMEOUT, future).await
 }
@@ -421,15 +465,16 @@ impl Store {
         let pool = MySqlPoolOptions::new()
             .max_connections(max_connections)
             .min_connections(MIN_CONNECTIONS.min(max_connections))
-            .acquire_timeout(ACQUIRE_TIMEOUT)
+            .acquire_timeout(CONNECT_TIMEOUT)
             // Shorter than PlanetScale's idle cutoff, so pooled connections are rarely dead. Pinging before every
             // acquire would double each query's round trip from regions far from the database.
             .idle_timeout(Duration::from_secs(60))
             .max_lifetime(Duration::from_secs(30 * 60))
             .test_before_acquire(false)
-            .connect_lazy_with(options);
+            .connect_lazy_with(options.clone());
         Ok(Self {
             pool,
+            options,
             reads: Arc::default(),
         })
     }
@@ -441,56 +486,139 @@ impl Store {
         Ok(store)
     }
 
-    /// Migrates, retrying with backoff until the database answers. Only an incompatible schema is an error.
-    pub async fn wait_ready(&self) -> Result<()> {
+    /// Connects (outside the pool, with the full `CONNECT_TIMEOUT`) and migrates, retrying with backoff until the
+    /// database answers, then opens the pool's idle connections in the background. An incompatible schema is an
+    /// error, and so is a database still unreachable after `limit` (`None` waits forever), with the last error.
+    pub async fn wait_ready(&self, limit: Option<Duration>) -> Result<()> {
+        let started = tokio::time::Instant::now();
         let mut delay = Duration::from_millis(500);
         loop {
-            match self.migrate().await {
-                Ok(()) => return Ok(()),
+            match self.ready().await {
+                Ok(()) => {
+                    self.keep_warm();
+                    return Ok(());
+                }
                 Err(error) if error.downcast_ref::<NewerSchema>().is_some() => return Err(error),
                 Err(error) => {
-                    warn!(error = %format!("{error:#}"), retry_in = ?delay, "the database is not ready");
-                    tokio::time::sleep(delay).await;
+                    let waited = started.elapsed();
+                    let sleep = match limit {
+                        Some(limit) if waited >= limit => {
+                            return Err(error.context(format!(
+                                "the database was unreachable for {}s at startup",
+                                waited.as_secs()
+                            )));
+                        }
+                        Some(limit) => delay.min(limit - waited),
+                        None => delay,
+                    };
+                    warn!(error = %format!("{error:#}"), retry_in = ?sleep, "the database is not ready");
+                    tokio::time::sleep(sleep).await;
                     delay = (delay * 2).min(Duration::from_secs(15));
                 }
             }
         }
     }
 
+    async fn ready(&self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let connected = match tokio::time::timeout(CONNECT_TIMEOUT, self.options.connect()).await {
+            Ok(result) => result.map_err(db),
+            Err(_) => Err(anyhow!("connecting timed out after {CONNECT_TIMEOUT:?}")
+                .context("storage unavailable")),
+        };
+        let connect_ms = started.elapsed().as_millis() as u64;
+        let mut connection = match connected {
+            Ok(connection) => connection,
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), connect_ms, "connecting to the database failed");
+                self.probe().await;
+                return Err(error);
+            }
+        };
+        info!(connect_ms, "connected to the database");
+        let result = timed("migrate", migrate(&mut connection)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), connection.close()).await;
+        result
+    }
+
+    /// Logs how long resolving the database host and a TCP connect to each of its addresses take, to tell a
+    /// slow resolver or an unreachable address from a slow TLS or MySQL handshake.
+    async fn probe(&self) {
+        if self.options.get_socket().is_some() {
+            return;
+        }
+        let host = self.options.get_host().trim_matches(['[', ']']).to_owned();
+        let port = self.options.get_port();
+        let started = std::time::Instant::now();
+        let resolved = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await;
+        let resolve_ms = started.elapsed().as_millis() as u64;
+        let addresses: Vec<std::net::SocketAddr> = match resolved {
+            Ok(Ok(addresses)) => addresses.collect(),
+            Ok(Err(error)) => {
+                warn!(host, resolve_ms, error = %error, "database probe: resolving failed");
+                return;
+            }
+            Err(_) => {
+                warn!(host, resolve_ms, "database probe: resolving timed out");
+                return;
+            }
+        };
+        info!(host, resolve_ms, addresses = ?addresses, "database probe: resolved");
+        for address in addresses {
+            let started = std::time::Instant::now();
+            let outcome =
+                match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(address))
+                    .await
+                {
+                    Ok(Ok(_)) => "ok".to_owned(),
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "timed out".to_owned(),
+                };
+            info!(%address, connect_ms = started.elapsed().as_millis() as u64, outcome, "database probe: TCP connect");
+        }
+    }
+
+    /// Opens the pool's idle connections now, and tops them up every `WARM_INTERVAL`, in the background with the
+    /// full `CONNECT_TIMEOUT`: sqlx only replaces them when it closes one, and a connection a request opens is
+    /// lost when the request gives up first.
+    fn keep_warm(&self) {
+        let pool = self.pool.clone();
+        let target = MIN_CONNECTIONS.min(pool.options().get_max_connections());
+        tokio::spawn(async move {
+            while !pool.is_closed() {
+                let missing = target.saturating_sub(pool.size());
+                if missing > 0 {
+                    let started = std::time::Instant::now();
+                    // Each goes back to the pool at once, so the request path never waits for them.
+                    let results = futures_util::future::join_all(
+                        (0..missing).map(|_| async { pool.acquire().await.map(drop) }),
+                    )
+                    .await;
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    let opened = results.iter().filter(|result| result.is_ok()).count();
+                    match results.into_iter().find_map(Result::err) {
+                        Some(sqlx::Error::PoolClosed) => return,
+                        Some(error) => warn!(
+                            opened, missing, elapsed_ms, error = %error,
+                            "opening idle database connections failed"
+                        ),
+                        None => info!(opened, elapsed_ms, "opened idle database connections"),
+                    }
+                }
+                tokio::time::sleep(WARM_INTERVAL).await;
+            }
+        });
+    }
+
     /// Creates the tables unless the database is already at this version. Safe to run from several servers.
     pub async fn migrate(&self) -> Result<()> {
         timed("migrate", async {
-            let version: Option<i64> =
-                match sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
-                    .fetch_one(&self.pool)
-                    .await
-                {
-                    Ok(version) => version,
-                    // 1146: the table does not exist yet.
-                    Err(error) if mysql_code(&error) == Some(1146) => None,
-                    Err(error) => return Err(db(error)),
-                };
-            if let Some(version) = version {
-                if version > SCHEMA_VERSION {
-                    return Err(NewerSchema(version).into());
-                }
-                if version == SCHEMA_VERSION {
-                    return Ok(());
-                }
-            }
-            for statement in SCHEMA {
-                self.pool.execute(*statement).await.map_err(db)?;
-            }
-            sqlx::query(
-                "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)
-                 ON DUPLICATE KEY UPDATE version = version",
-            )
-            .bind(SCHEMA_VERSION)
-            .bind(crate::clock::Clock::system().now_ms() as i64)
-            .execute(&self.pool)
-            .await
-            .map_err(db)?;
-            Ok(())
+            let mut connection = self.pool.acquire().await.map_err(db)?;
+            migrate(&mut connection).await
         })
         .await
     }

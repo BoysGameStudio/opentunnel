@@ -172,7 +172,7 @@ fn iso(ms: u64) -> String {
 
 async fn seed(database_url: &str, count: usize, domain: &str) -> Result<()> {
     let store = Store::connect(database_url, 32)?;
-    store.wait_ready().await?;
+    store.wait_ready(None).await?;
     let connected = iso(now_ms());
     // As large as real records: a certificate, its chain and the CSR in PEM are ~6 KB, cached per attached tunnel.
     let pem = |bytes: usize| {
