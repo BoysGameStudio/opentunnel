@@ -41,10 +41,11 @@ pub fn parse(content: &str) -> Result<Config> {
 pub fn save(profile: &str, config: &Config) -> Result<()> {
     let path = path(profile);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        crate::private::create_dir(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(&path, render(config)).with_context(|| format!("writing {}", path.display()))
+    crate::private::write(&path, render(config).as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Writes the config with one line per route: the plain `host:port` string, or an inline

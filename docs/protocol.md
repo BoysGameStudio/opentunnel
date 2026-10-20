@@ -255,7 +255,13 @@ Profile names match `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`.
 
 ### Route config
 
-The CLI keeps each profile's routes in `$XDG_CONFIG_HOME/opentunnel/<profile>.toml`.
+The CLI keeps each profile's routes in `$XDG_CONFIG_HOME/opentunnel/<profile>.toml`
+(0600, in a 0700 directory). Route names are the only secret in a route's URL,
+so the config, and the CLI service's log under
+`$XDG_STATE_HOME/opentunnel/<profile>/` (0700; `daemon.log` and
+`last-error.json` are 0600, and the log records route names with visitor
+addresses), must be readable only by their owner. Writers create them that way
+and remove group and other access from existing ones.
 A route is a `host:port` string, or a table with `target` and options
 ([Route options](#route-options)):
 

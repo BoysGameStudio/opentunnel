@@ -2,7 +2,7 @@
 //! to the routes in its config file.
 
 use std::fs::{self, File, TryLockError};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 
 use crate::config;
 use crate::control::{self, Command, DaemonStatus, Phase, Request, Response};
+use crate::private;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -47,13 +48,13 @@ fn now_ms() -> u64 {
 }
 
 pub async fn serve(client: Client, profile: String) -> Result<()> {
+    // Everything the service writes (logs, renewed certificates) is private.
+    // SAFETY: umask has no preconditions and cannot fail.
+    unsafe {
+        libc::umask(0o077);
+    }
+    control::runtime_dir()?;
     let paths = control::paths(&profile);
-    let runtime = paths.socket.parent().expect("socket has a parent");
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(runtime)
-        .with_context(|| format!("creating {}", runtime.display()))?;
 
     let lock = File::options()
         .create(true)
@@ -259,9 +260,9 @@ impl Daemon {
         error!(error = %message);
         let record = serde_json::json!({ "time": now_ms(), "message": message });
         if let Some(parent) = self.paths.last_error.parent() {
-            let _ = fs::create_dir_all(parent);
+            let _ = private::create_dir(parent);
         }
-        let _ = fs::write(&self.paths.last_error, format!("{record}\n"));
+        let _ = private::write(&self.paths.last_error, format!("{record}\n").as_bytes());
         self.last_error = Some(message);
     }
 }

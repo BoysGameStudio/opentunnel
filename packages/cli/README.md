@@ -117,7 +117,14 @@ $XDG_RUNTIME_DIR/opentunnel/<profile>.lock   single-instance lock
 ```
 
 Without XDG variables, the defaults are `~/.config`, `~/.local/share`, and
-`~/.local/state`.
+`~/.local/state`; without `XDG_RUNTIME_DIR`, the socket and lock live in a
+per-user `opentunnel-<uid>` directory in the system temporary directory, which
+the CLI refuses to use unless it is a 0700 directory owned by you.
+
+Route names are the only secret in route URLs, so the profile config, the
+service log (which records route names and visitor addresses), and their
+directories are readable only by you (0600 files, 0700 directories). The CLI
+tightens files created by older versions when it runs.
 
 ## Development
 
@@ -129,11 +136,14 @@ per platform into `dist/cli-<os>-<arch>/bin/opentunnel`, then:
 - `script/publish.ts` publishes each `@opentunnel/cli-<os>-<arch>` package and
   the `opentunnel` launcher with those packages as `optionalDependencies`;
 - `script/release.ts` creates the GitHub release with one tarball per platform
-  (used by the install script at `packages/website/public/install`), updates
-  the formula in `anomalyco/homebrew-tap` (with that repository's deploy key,
-  the org-level `HOMEBREW_TAP_KEY` secret), and pushes the `opentunnel-bin`
-  AUR package (the org-level `AUR_KEY` secret);
+  and a `SHA256SUMS` file (the install script at
+  `packages/website/public/install` verifies downloads against it);
 - `script/crates.ts` publishes the `opentunnel` and `opentunnel-cli` crates
-  through crates.io trusted publishing.
+  through crates.io trusted publishing;
+- `script/distribute.ts`, in a separate job that is the only one given the
+  deploy keys, updates the formula in `anomalyco/homebrew-tap` (that
+  repository's deploy key, the org-level `HOMEBREW_TAP_KEY` secret) and pushes
+  the `opentunnel-bin` AUR package (the org-level `AUR_KEY` secret) with the
+  release's checksums.
 
 Steps without credentials are skipped.

@@ -4,6 +4,7 @@ compile_error!("opentunnel-cli currently supports Unix platforms only");
 mod config;
 mod control;
 mod daemon;
+mod private;
 mod service;
 
 use std::io::{IsTerminal, Write};
@@ -118,6 +119,7 @@ async fn run(cli: Cli) -> Result<()> {
     if !names::is_valid_profile(&cli.profile) {
         bail!("profile names must contain only lowercase letters, numbers, and hyphens");
     }
+    private::tighten(&cli.profile);
     let ca_cert = cli
         .ca_cert
         .as_deref()

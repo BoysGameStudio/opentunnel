@@ -12,10 +12,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::control::{self, Command, DaemonStatus, Request, Response};
+use crate::private;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub async fn request(profile: &str, command: Command) -> Result<Response> {
+    control::runtime_dir()?;
     let socket = control::paths(profile).socket;
     let exchange = async {
         let mut stream = UnixStream::connect(&socket).await?;
@@ -47,13 +49,7 @@ async fn ensure_running(profile: &str, args: &[String]) -> Result<bool> {
         return Ok(false);
     }
     let paths = control::paths(profile);
-    let log_dir = paths.log.parent().expect("log has a parent");
-    fs::create_dir_all(log_dir).with_context(|| format!("creating {}", log_dir.display()))?;
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.log)
-        .with_context(|| format!("opening {}", paths.log.display()))?;
+    let log = open_log(&paths.log)?;
 
     let mut command = Process::new(std::env::current_exe()?);
     command.args(["--profile", profile]).args(args);
@@ -66,6 +62,14 @@ async fn ensure_running(profile: &str, args: &[String]) -> Result<bool> {
         .process_group(0);
     command.spawn().context("starting background service")?;
     wait_until_running(profile).await.map(|()| true)
+}
+
+/// Creates the service log readable only by the current user, so the file a
+/// service manager appends to is never created world-readable.
+fn open_log(log: &std::path::Path) -> Result<fs::File> {
+    let dir = log.parent().expect("log has a parent");
+    private::create_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
+    private::open_append(log).with_context(|| format!("opening {}", log.display()))
 }
 
 async fn wait_until_running(profile: &str) -> Result<()> {
@@ -85,6 +89,7 @@ async fn wait_until_running(profile: &str) -> Result<()> {
 /// on macOS) so it starts at login. Where neither is available it runs as a
 /// plain background process until the next reboot.
 pub async fn up(profile: &str, args: &[String]) -> Result<()> {
+    control::runtime_dir()?;
     if !platform::supported() {
         if !ensure_running(profile, args).await? {
             request(profile, Command::Reload).await?;
@@ -213,7 +218,7 @@ mod platform {
     pub fn install(profile: &str, arguments: &[String]) -> Result<PathBuf> {
         let path = unit_path(profile);
         let log = control::paths(profile).log;
-        fs::create_dir_all(log.parent().expect("log has a parent"))?;
+        open_log(&log)?;
         let exec: Vec<String> = arguments.iter().map(|argument| quote(argument)).collect();
         let unit = format!(
             "[Unit]\n\
@@ -225,6 +230,7 @@ mod platform {
              ExecStart={}\n\
              Restart=on-failure\n\
              RestartSec=5\n\
+             UMask=0077\n\
              StandardOutput=append:{log}\n\
              StandardError=append:{log}\n\
              \n\
@@ -302,7 +308,7 @@ mod platform {
     pub fn install(profile: &str, arguments: &[String]) -> Result<PathBuf> {
         let path = plist_path(profile);
         let log = control::paths(profile).log;
-        fs::create_dir_all(log.parent().expect("log has a parent"))?;
+        open_log(&log)?;
         let arguments: String = arguments
             .iter()
             .map(|argument| format!("    <string>{}</string>\n", escape(argument)))
@@ -323,6 +329,8 @@ mod platform {
     <key>OPENTUNNEL_DAEMON</key>
     <string>1</string>
   </dict>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
