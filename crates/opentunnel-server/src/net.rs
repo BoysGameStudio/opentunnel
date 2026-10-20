@@ -175,6 +175,52 @@ where
     }
 }
 
+/// Keeps at most `bytes` not yet sent in a socket's send buffer (`TCP_NOTSENT_LOWAT`, Linux): data in flight
+/// is not limited, so throughput is not either, but data for a peer that stopped reading waits in the server's
+/// budgeted queue rather than in megabytes of kernel memory, and writes complete as the peer reads instead of
+/// once half of a large buffer is free.
+pub fn limit_unsent(stream: &TcpStream, bytes: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let value = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+        // SAFETY: setsockopt reads one int from the pointer, which outlives the call; the descriptor is open while
+        // `stream` is borrowed.
+        unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NOTSENT_LOWAT,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (stream, bytes);
+    }
+}
+
+/// Bytes in a socket's send queue that the peer has not acknowledged yet (Linux; `None` elsewhere). Falling,
+/// it shows the peer reading even while a write waits: the kernel wakes writers only once much of a large send
+/// buffer is free.
+pub fn unacked(socket: std::os::fd::RawFd) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: TIOCOUTQ writes one int to the pointer, which outlives the call. The caller keeps the socket
+        // open.
+        let result = unsafe { libc::ioctl(socket, libc::TIOCOUTQ, &mut queued) };
+        (result == 0).then(|| usize::try_from(queued).unwrap_or(0))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = socket;
+        None
+    }
+}
+
 /// Open file descriptors of this process (Linux), for `/api/admin/stats`.
 pub fn open_fds() -> Option<usize> {
     std::fs::read_dir("/proc/self/fd").ok().map(Iterator::count)

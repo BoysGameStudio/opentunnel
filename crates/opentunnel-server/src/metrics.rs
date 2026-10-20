@@ -50,6 +50,7 @@ pub struct Metrics {
     bridges_attached: Gauge,
     bridge_attaches: Family<Labels, Counter>,
     bridge_detaches: Family<Labels, Counter>,
+    bridge_backpressure: Family<Labels, Counter>,
 
     visitors_open: Gauge,
     visitor_connections: Family<Labels, Counter>,
@@ -108,6 +109,7 @@ impl Metrics {
             bridges_attached: Gauge::default(),
             bridge_attaches: Family::default(),
             bridge_detaches: Family::default(),
+            bridge_backpressure: Family::default(),
             visitors_open: Gauge::default(),
             visitor_connections: Family::default(),
             visitor_bytes: Family::default(),
@@ -187,6 +189,11 @@ impl Metrics {
             "bridge_detaches",
             "Attached bridges that ended, by reason",
             metrics.bridge_detaches.clone(),
+        );
+        r.register(
+            "bridge_backpressure",
+            "Bridge readers that waited the longest allowed for visitors to take data (stall), and connections reset because their visitor did not keep up (reset)",
+            metrics.bridge_backpressure.clone(),
         );
         r.register(
             "visitor_connections_open",
@@ -349,6 +356,15 @@ pub fn bridge_detach(reason: &'static str) {
         .inc();
 }
 
+/// A bridge reader waited the longest allowed for visitors (`stall`), or reset a connection whose visitor did not
+/// keep up (`reset`).
+pub fn bridge_backpressure(event: &'static str) {
+    get()
+        .bridge_backpressure
+        .get_or_create(&[("event", event)])
+        .inc();
+}
+
 /// Why an attached bridge's session ended, from the close the server sent (if any) and whether the client
 /// completed the close handshake.
 pub fn detach_reason(server_close: Option<u16>, clean: bool) -> &'static str {
@@ -364,7 +380,7 @@ pub fn detach_reason(server_close: Option<u16>, clean: bool) -> &'static str {
 
 /// A visitor connection was served or turned away. Outcomes: `served_local`, `forwarded_out`,
 /// `forwarded_in`, `legacy_relay`, `rejected_unknown_tunnel`, `rejected_unknown_route`, `rejected_no_bridge`,
-/// `rejected_cert_not_ready`, `rejected_bad_hello`, `rejected_timeout`, `error`.
+/// `rejected_cert_not_ready`, `rejected_too_many_connections`, `rejected_bad_hello`, `rejected_timeout`, `error`.
 pub fn visitor(outcome: &'static str) {
     get()
         .visitor_connections
@@ -378,6 +394,7 @@ pub fn rejected_outcome(tunnel_exists: bool, outcome: &str) -> &'static str {
         (false, _) => "rejected_unknown_tunnel",
         (_, "certificate_not_ready") => "rejected_cert_not_ready",
         (_, "unknown_route") => "rejected_unknown_route",
+        (_, "too_many_connections") => "rejected_too_many_connections",
         _ => "rejected_no_bridge",
     }
 }

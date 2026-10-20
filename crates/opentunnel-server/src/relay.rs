@@ -13,12 +13,12 @@ use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::sync::watch;
 use tracing::debug;
 
-use crate::bridge::{ServerControl, data_frame};
+use crate::bridge::{PROGRESS, ServerControl, data_frame, data_message, hold_outbound, ticks};
 use crate::cluster::{Cluster, FORWARD_ACCEPTED, FORWARD_REFUSED};
 use crate::net::Activity;
 use crate::proxy_protocol;
 use crate::service::{Inbound, Outcome, Route, Service};
-use crate::sni::{CLIENT_HELLO_LIMIT, Hello, parse_client_hello};
+use crate::sni::{CLIENT_HELLO_LIMIT, Hello, HelloParser};
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PAYLOAD: usize = opentunnel::protocol::bridge::MAX_PAYLOAD_SIZE;
@@ -68,8 +68,9 @@ pub async fn accept_with(
                 }
             }
         }
+        let mut parser = HelloParser::default();
         loop {
-            match parse_client_hello(&buffer[start..]) {
+            match parser.parse(&buffer[start..]) {
                 Hello::Complete { server_name, alpn } => {
                     buffer.drain(..start);
                     return Ok(Accepted {
@@ -152,7 +153,7 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
             return Err(error);
         }
     };
-    let (bridge, conn, tunnel_id, finish, mut abort, inbound, bytes_out) = match route {
+    let (bridge, conn, tunnel_id, finish, mut abort, inbound, bytes_out, _slot) = match route {
         Route::Bridge {
             bridge,
             conn,
@@ -161,7 +162,10 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
             abort,
             inbound,
             bytes_out,
-        } => (bridge, conn, tunnel_id, finish, abort, inbound, bytes_out),
+            slot,
+        } => (
+            bridge, conn, tunnel_id, finish, abort, inbound, bytes_out, slot,
+        ),
         Route::Rejected {
             tunnel_exists,
             outcome,
@@ -244,6 +248,7 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
     let bytes_in = initial.len() as u64;
 
     let _ = stream.set_nodelay(true);
+    crate::net::limit_unsent(&stream, UNSENT_LIMIT);
     let activity = Activity::default();
     let uploaded = AtomicU64::new(0);
     let (read, write) = stream.split();
@@ -357,8 +362,12 @@ async fn upload(
             Ok(read) => {
                 total.fetch_add(read as u64, Ordering::Relaxed);
                 activity.touch();
+                // Waits while the bridge's or the machine's budget is spent: the backpressure on visitors.
                 let sent = tokio::select! {
-                    sent = bridge.tx.send(data_frame(conn, &buffer[..read])) => sent.is_ok(),
+                    sent = async {
+                        let held = hold_outbound(bridge, read).await?;
+                        bridge.tx.send(data_message(conn, &buffer[..read], held)).await.ok()
+                    } => sent.is_some(),
                     _ = abort.wait_for(|aborted| *aborted) => return,
                 };
                 if !sent {
@@ -385,7 +394,7 @@ async fn upload(
 /// Tunnel client to visitor, until the client ends its side.
 async fn download(
     mut write: WriteHalf<'_>,
-    mut inbound: tokio::sync::mpsc::Receiver<Inbound>,
+    mut inbound: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
     bridge: &crate::service::Bridge,
     conn: u32,
     finish: &crate::service::Finish,
@@ -398,11 +407,13 @@ async fn download(
             _ = abort.wait_for(|aborted| *aborted) => return,
         };
         match item {
-            Some(Inbound::Data(data)) => {
+            Some(Inbound::Data(data, held)) => {
                 let written = tokio::select! {
-                    written = write.write_all(&data) => written,
+                    written = write_watched(&mut write, &data, held.drained_at()) => written,
                     _ = abort.wait_for(|aborted| *aborted) => return,
                 };
+                // Its budget is given back once the visitor's socket took it.
+                drop(held);
                 if written.is_err() {
                     bridge.channels.lock().expect("channels lock").remove(&conn);
                     let _ = bridge.tx.try_send(
@@ -421,6 +432,50 @@ async fn download(
                 activity.half_close();
                 let _ = write.shutdown().await;
                 return;
+            }
+        }
+    }
+}
+
+/// Bytes a visitor's socket keeps unsent in the kernel ([`crate::net::limit_unsent`]).
+const UNSENT_LIMIT: u32 = 128 * 1024;
+
+/// How often a write that waits checks whether the visitor is reading.
+const PROGRESS_CHECK: Duration = Duration::from_secs(1);
+
+/// Writes `data` to the visitor. While the write waits, notes in `drained_at` each time the visitor acknowledged
+/// another `PROGRESS` bytes: it is reading, only slower than the bridge, and must not be taken for stalled.
+async fn write_watched(
+    write: &mut WriteHalf<'_>,
+    data: &[u8],
+    drained_at: Option<&AtomicU64>,
+) -> std::io::Result<()> {
+    let Some(drained_at) = drained_at else {
+        return write.write_all(data).await;
+    };
+    let socket = std::os::fd::AsRawFd::as_raw_fd(AsRef::<TcpStream>::as_ref(write));
+    let writing = write.write_all(data);
+    tokio::pin!(writing);
+    let start = tokio::time::Instant::now() + PROGRESS_CHECK;
+    let mut check = tokio::time::interval_at(start, PROGRESS_CHECK);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut previous = None;
+    let mut acked = 0;
+    loop {
+        tokio::select! {
+            written = &mut writing => return written,
+            _ = check.tick() => {
+                let Some(queued) = crate::net::unacked(socket) else { continue };
+                if let Some(previous) = previous
+                    && queued < previous
+                {
+                    acked += previous - queued;
+                }
+                previous = Some(queued);
+                if acked >= PROGRESS {
+                    drained_at.store(ticks(), Ordering::Relaxed);
+                    acked = 0;
+                }
             }
         }
     }

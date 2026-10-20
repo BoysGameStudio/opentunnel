@@ -239,6 +239,19 @@ pub struct Config {
     #[arg(long, env = "TRUSTED_PROXY_RANGES", value_delimiter = ',')]
     pub trusted_proxy_ranges: Vec<String>,
 
+    /// Public connections one bridge carries at once; a client advertising a lower `max_conns` gets that.
+    #[arg(long, env = "MAX_CONNS_PER_BRIDGE", default_value_t = 256)]
+    pub max_conns_per_bridge: usize,
+
+    /// Public connections one tunnel carries at once on this machine, over all its bridges.
+    #[arg(long, env = "MAX_CONNS_PER_TUNNEL", default_value_t = 1024)]
+    pub max_conns_per_tunnel: usize,
+
+    /// Bytes of connection data this machine holds in memory at once, both directions and all bridges
+    /// together, on top of each bridge's and connection's own budget.
+    #[arg(long, env = "BUFFERED_BYTES_LIMIT", default_value_t = 256 * 1024 * 1024)]
+    pub buffered_bytes_limit: usize,
+
     /// Serves Prometheus metrics at `/metrics`, e.g. `[::]:9091` (Fly's scraper; no `[[services]]` entry exposes
     /// it). `off` (the default) disables it.
     #[arg(long, env = "METRICS_LISTEN", default_value = "off")]
@@ -309,6 +322,14 @@ impl Config {
             ping: ms(self.mesh_ping_ms),
             dead: ms(self.mesh_dead_ms),
             accept_v1: self.mesh_accept_v1,
+        }
+    }
+
+    pub fn bridge_limits(&self) -> crate::service::BridgeLimits {
+        crate::service::BridgeLimits {
+            conns_per_bridge: self.max_conns_per_bridge.max(1),
+            conns_per_tunnel: self.max_conns_per_tunnel.max(1),
+            buffered_bytes: self.buffered_bytes_limit.max(1024 * 1024),
         }
     }
 

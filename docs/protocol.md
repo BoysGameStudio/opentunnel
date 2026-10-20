@@ -113,7 +113,10 @@ subprotocol, at `wss://<api host>/api/tunnel/:id/connect`.
 
 - Text frames carry JSON control messages.
 - Binary frames carry connection data: a big-endian `u32` connection ID
-  followed by payload bytes. Payloads should not exceed 32 KiB.
+  followed by payload bytes. Payloads must not exceed 32 KiB.
+- The server closes a session with `1009` when a message is larger than
+  64 KiB before `attach`, or larger than a data frame with a 32 KiB payload
+  after it.
 
 ### Control messages
 
@@ -157,16 +160,22 @@ The server keeps accepting older versions so installed clients keep working.
    server closes sessions that do not with `1008`.
 2. The server replies `attached` or `attach_error` and closes.
    `bad_token` and `cert_not_ready` are fatal. Other errors, including
-   `route_conflict`, may be retried.
+   `route_conflict` and `too_many_routes`, may be retried. An `attach` claims
+   at most 128 routes, and all bridges of a tunnel together at most 256
+   (`too_many_routes`).
 3. For each public TCP connection the server sends `open`, then binary frames
    for that `conn`, starting with the TLS ClientHello.
 4. The client resolves the route from `sni`, terminates TLS with the tunnel
    certificate, and connects to the route target. If no route matches it
    sends `reset` with `unknown_route`. If it already holds the `max_conns`
    it advertised on attach, it sends `reset` with `too_many_connections`.
+   The server enforces `max_conns` too (at most 256 per bridge): it closes
+   public connections beyond it without sending `open`.
 5. Either side sends `end` to half-close a connection and `reset` to abort it.
 6. The client sends `ping` every `heartbeat_ms` and closes the session when
-   nothing is received for `idle_timeout_ms`.
+   nothing is received for `idle_timeout_ms`. The server may send `ping`
+   (while it is not reading, see [Backpressure](#backpressure)); the client
+   answers `pong` with the same `time_sent`.
 
 ### Routes
 
@@ -244,8 +253,20 @@ to 30 s with jitter, resetting after a successful attach.
 
 Clients bound the bytes queued on the WebSocket and stop reading from local
 sockets until the queue drains. There is no per-connection flow control on
-the wire yet, so one slow public reader can delay other connections that
-share the bridge.
+the wire yet. The server holds at most 512 KiB of data for one connection
+and 4 MiB for one bridge's connections; beyond that it stops reading the
+bridge until visitors take data, for at most 5 s per frame, and then sends
+`reset` (`client_io_error`) for every connection whose visitor took nothing
+in that time. A slow public reader can thus delay other connections that
+share the bridge, but a stalled one cannot hold it.
+
+Because the server may pause reading, a client's read loop must never wait
+on its own send queue: control messages it answers or sends (`pong`, `ping`,
+`reset`) must not queue behind connection data, and a full local connection
+may hold the read loop only briefly (the Rust client waits at most 5 s, the
+SDK never waits and resets beyond a byte budget; both send `reset` with
+`upstream_io_error`). Otherwise the client stops reading the bridge
+while the server waits, and the server's write timeout closes it.
 
 ## Local storage
 

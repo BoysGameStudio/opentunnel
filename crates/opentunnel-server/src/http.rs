@@ -28,9 +28,6 @@ pub type Body = Full<Bytes>;
 
 const OPENAPI: &str = include_str!("openapi.json");
 const MAX_BODY: usize = 1024 * 1024;
-/// The largest bridge message accepted. Frames carry at most 32 KiB of data; this leaves room for any client.
-const MAX_MESSAGE: usize = 1024 * 1024;
-
 /// Subprotocols this server speaks, newest first.
 const SUBPROTOCOLS: &[&str] = &["opentunnel"];
 
@@ -621,7 +618,7 @@ impl App {
                 }
             };
             let (read, write) = tokio::io::split(TokioIo::new(upgraded));
-            let reader = websocket::Reader::new(read, MAX_MESSAGE);
+            let reader = websocket::Reader::new(read, crate::bridge::MAX_MESSAGE);
             crate::bridge::run(service, id, reader, websocket::Writer::new(write), client).await;
         });
         let mut response = response(StatusCode::SWITCHING_PROTOCOLS);

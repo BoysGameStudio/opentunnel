@@ -36,6 +36,9 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("WebSocket protocol error: {0}")]
     Protocol(&'static str),
+    /// A frame or message larger than the reader's limit (close code 1009).
+    #[error("WebSocket protocol error: {0}")]
+    TooLarge(&'static str),
 }
 
 struct Frame {
@@ -64,6 +67,22 @@ impl<R: AsyncRead + Unpin> Reader<R> {
             max_message,
             partial: None,
         }
+    }
+
+    /// Changes the largest frame or message accepted from now on.
+    pub fn set_max_message(&mut self, max_message: usize) {
+        self.max_message = max_message;
+    }
+
+    /// Reads and drops whatever arrives for up to `duration` or until the connection ends, after an error.
+    pub async fn discard(&mut self, duration: std::time::Duration) {
+        self.buffer = BytesMut::new();
+        self.partial = None;
+        let mut scratch = [0u8; READ_CHUNK];
+        let _ = tokio::time::timeout(duration, async {
+            while let Ok(1..) = self.io.read(&mut scratch).await {}
+        })
+        .await;
     }
 
     /// Bytes held for frames not complete yet (0 between messages, when nothing more has arrived).
@@ -117,7 +136,7 @@ impl<R: AsyncRead + Unpin> Reader<R> {
                 (TEXT | BINARY, None) => (frame.opcode == TEXT, frame.payload),
                 (CONTINUATION, Some((text, mut data))) => {
                     if data.len() + frame.payload.len() > self.max_message {
-                        return Err(Error::Protocol("message too large"));
+                        return Err(Error::TooLarge("message too large"));
                     }
                     data.extend_from_slice(&frame.payload);
                     (text, data)
@@ -171,7 +190,7 @@ impl<R: AsyncRead + Unpin> Reader<R> {
             length => (u64::from(length), 2),
         };
         if length > self.max_message as u64 {
-            return Err(Error::Protocol("frame too large"));
+            return Err(Error::TooLarge("frame too large"));
         }
         let length = length as usize;
         self.wanted = offset + 4 + length;

@@ -22,48 +22,55 @@ fn u16_at(data: &[u8], offset: usize) -> usize {
 
 /// Parses the TLS records at the start of a connection, which may split the ClientHello across records.
 pub fn parse_client_hello(data: &[u8]) -> Hello {
-    let mut handshake: Vec<u8> = Vec::new();
-    let mut record_offset = 0;
-    let mut handshake_length: Option<usize> = None;
+    HelloParser::default().parse(data)
+}
 
-    while record_offset < data.len() {
-        if data.len() - record_offset < 5 {
-            return Hello::Incomplete;
-        }
-        if data[record_offset] != 0x16 {
-            return Hello::Invalid("expected TLS handshake record");
-        }
-        let record_length = u16_at(data, record_offset + 3);
-        if data.len() - record_offset - 5 < record_length {
-            return Hello::Incomplete;
-        }
-        let start = record_offset + 5;
-        handshake.extend_from_slice(&data[start..start + record_length]);
-        record_offset = start + record_length;
+/// Parses a ClientHello while it arrives: each call takes the connection's bytes so far and only looks at the
+/// records completed since the last call, so a hello trickling in byte by byte costs linear work, not quadratic.
+#[derive(Default)]
+pub struct HelloParser {
+    /// Where the next record starts.
+    record_offset: usize,
+    handshake: Vec<u8>,
+    handshake_length: Option<usize>,
+}
 
-        if handshake.len() >= 4 {
-            if handshake[0] != 0x01 {
-                return Hello::Invalid("expected TLS ClientHello");
+impl HelloParser {
+    /// `data` must start with the bytes given to the previous calls.
+    pub fn parse(&mut self, data: &[u8]) -> Hello {
+        loop {
+            if let Some(length) = self.handshake_length
+                && self.handshake.len() >= length + 4
+            {
+                return parse_hello_body(&self.handshake[4..length + 4]);
             }
-            let length = *handshake_length.get_or_insert(
-                ((handshake[1] as usize) << 16)
-                    | ((handshake[2] as usize) << 8)
-                    | handshake[3] as usize,
-            );
-            if handshake.len() >= length + 4 {
-                break;
+            let offset = self.record_offset;
+            if data.len().saturating_sub(offset) < 5 {
+                return Hello::Incomplete;
+            }
+            if data[offset] != 0x16 {
+                return Hello::Invalid("expected TLS handshake record");
+            }
+            let record_length = u16_at(data, offset + 3);
+            if data.len() - offset - 5 < record_length {
+                return Hello::Incomplete;
+            }
+            let start = offset + 5;
+            self.handshake
+                .extend_from_slice(&data[start..start + record_length]);
+            self.record_offset = start + record_length;
+            if self.handshake.len() >= 4 {
+                if self.handshake[0] != 0x01 {
+                    return Hello::Invalid("expected TLS ClientHello");
+                }
+                self.handshake_length.get_or_insert(
+                    ((self.handshake[1] as usize) << 16)
+                        | ((self.handshake[2] as usize) << 8)
+                        | self.handshake[3] as usize,
+                );
             }
         }
     }
-
-    let Some(length) = handshake_length else {
-        return Hello::Incomplete;
-    };
-    if handshake.len() < length + 4 {
-        return Hello::Incomplete;
-    }
-    let hello = &handshake[4..length + 4];
-    parse_hello_body(hello)
 }
 
 fn parse_hello_body(hello: &[u8]) -> Hello {
@@ -229,6 +236,28 @@ pub(crate) mod tests {
             Hello::Complete {
                 server_name: "split.example.test".into(),
                 alpn: "http/1.1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_hello_arriving_byte_by_byte_once() {
+        // Many one-byte records: each call must only look at what is new.
+        let hello = client_hello("trickle.example.test", &["h2"]);
+        let mut data = Vec::new();
+        for byte in &hello[5..] {
+            data.extend([0x16, 3, 1, 0, 1, *byte]);
+        }
+        let mut parser = HelloParser::default();
+        for end in 1..data.len() {
+            assert_eq!(parser.parse(&data[..end]), Hello::Incomplete, "at {end}");
+        }
+        assert_eq!(parser.record_offset, data.len() - 6);
+        assert_eq!(
+            parser.parse(&data),
+            Hello::Complete {
+                server_name: "trickle.example.test".into(),
+                alpn: "h2".into()
             }
         );
     }

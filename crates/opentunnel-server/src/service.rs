@@ -2,7 +2,7 @@
 //! serializes its record changes, as the Durable Object's single thread did, and which holds its live bridges.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -10,7 +10,7 @@ use bytes::Bytes;
 use opentunnel::protocol::api::{CertificateInfo, CertificateState, TunnelState};
 use opentunnel::protocol::bridge::{HEARTBEAT_MS, IDLE_TIMEOUT_MS};
 use serde_json::json;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -98,7 +98,31 @@ pub struct Inner {
     draining: AtomicBool,
     /// Attach bookkeeping writing to the database at once.
     bookkeeping: tokio::sync::Semaphore,
+    bridge_limits: std::sync::OnceLock<BridgeLimits>,
+    /// Bytes of connection data held in memory on this machine, as permits taken from `Limits::buffered_bytes`.
+    buffer: std::sync::OnceLock<Arc<Semaphore>>,
 }
+
+/// What one bridge, tunnel, or this machine may hold.
+#[derive(Debug, Clone, Copy)]
+pub struct BridgeLimits {
+    pub conns_per_bridge: usize,
+    pub conns_per_tunnel: usize,
+    pub buffered_bytes: usize,
+}
+
+impl Default for BridgeLimits {
+    fn default() -> Self {
+        Self {
+            conns_per_bridge: 256,
+            conns_per_tunnel: 1024,
+            buffered_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// Routes one tunnel's bridges on this machine may claim together.
+pub const MAX_TUNNEL_ROUTES: usize = 256;
 
 impl std::ops::Deref for Service {
     type Target = Inner;
@@ -145,6 +169,8 @@ impl EntryState {
 pub enum Outbound {
     Text(String),
     Binary(Bytes),
+    /// A visitor's data, holding its share of the bridge's and the machine's budget until written.
+    Data(Bytes, crate::bridge::Held),
     /// The answer to a WebSocket ping from the client.
     Pong(Bytes),
     Close(u16, String),
@@ -160,6 +186,26 @@ pub struct Bridge {
     pub seen_at: AtomicU64,
     pub state: Mutex<BridgeState>,
     pub channels: Mutex<HashMap<u32, ChannelHandle>>,
+    /// Bytes from the client waiting for visitors, at most `bridge::BRIDGE_BUDGET`.
+    pub inbound_budget: Arc<Semaphore>,
+    /// Bytes from visitors waiting for the client's socket, at most `bridge::OUTBOUND_BUDGET`.
+    pub outbound_budget: Arc<Semaphore>,
+    /// The machine's budget, shared by every bridge.
+    pub buffer: Arc<Semaphore>,
+    /// When the writer last sent the client anything, in `bridge::ticks`.
+    pub sent_at: Arc<AtomicU64>,
+    /// Public connections carried, from routing until both their directions ended: unlike `channels`, which a
+    /// connection leaves once the client ends or resets it.
+    pub visitors: Arc<AtomicUsize>,
+}
+
+/// A public connection's place in its bridge's `visitors`, given back when dropped.
+pub struct VisitorSlot(Arc<AtomicUsize>);
+
+impl Drop for VisitorSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default, Clone)]
@@ -231,20 +277,34 @@ impl Bridge {
     pub fn open_channels(&self) -> usize {
         self.channels.lock().expect("channels lock").len()
     }
+
+    /// The public connections this bridge may carry at once: what its client advertised, at most `limit`.
+    pub fn conn_limit(&self, limit: usize) -> usize {
+        match self.state.lock().expect("bridge lock").max_conns {
+            Some(max_conns) => usize::try_from(max_conns).unwrap_or(limit).clamp(1, limit),
+            None => limit,
+        }
+    }
 }
 
 /// Data from a tunnel client for one public connection.
 #[derive(Debug)]
 pub enum Inbound {
-    Data(Bytes),
+    /// Data, holding its share of the connection's, the bridge's and the machine's budget until written.
+    Data(Bytes, crate::bridge::Held),
     End,
 }
 
 #[derive(Clone)]
 pub struct ChannelHandle {
-    pub inbound: mpsc::Sender<Inbound>,
+    /// Unbounded in messages: bounded in bytes by `budget`.
+    pub inbound: mpsc::UnboundedSender<Inbound>,
     pub finish: Arc<Finish>,
     pub bytes_out: Arc<AtomicU64>,
+    /// Bytes from the client waiting for this visitor, at most `bridge::CHANNEL_BUDGET`.
+    pub budget: Arc<Semaphore>,
+    /// When this visitor last took data, or when data started waiting for it, in `bridge::ticks`.
+    pub drained_at: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,8 +419,9 @@ pub enum Route {
         tunnel_id: String,
         finish: Arc<Finish>,
         abort: watch::Receiver<bool>,
-        inbound: mpsc::Receiver<Inbound>,
+        inbound: mpsc::UnboundedReceiver<Inbound>,
         bytes_out: Arc<AtomicU64>,
+        slot: VisitorSlot,
     },
     /// Nothing serves it here; the outcome is reported if the tunnel exists.
     Rejected {
@@ -368,9 +429,6 @@ pub enum Route {
         outcome: &'static str,
     },
 }
-
-/// Frames queued per public connection before the bridge reader waits for the visitor.
-pub const INBOUND_QUEUE: usize = 64;
 
 impl Service {
     pub fn new(domain: String, store: Store, clock: Clock, analytics: Analytics) -> Self {
@@ -391,11 +449,33 @@ impl Service {
             timeouts: std::sync::OnceLock::new(),
             draining: AtomicBool::new(false),
             bookkeeping: tokio::sync::Semaphore::new(BOOKKEEPING_WRITES),
+            bridge_limits: std::sync::OnceLock::new(),
+            buffer: std::sync::OnceLock::new(),
         }))
     }
 
     pub fn set_timeouts(&self, timeouts: crate::net::Timeouts) {
         let _ = self.timeouts.set(timeouts);
+    }
+
+    /// Must be called before the first bridge registers.
+    pub fn set_bridge_limits(&self, limits: BridgeLimits) {
+        let _ = self.bridge_limits.set(limits);
+    }
+
+    pub fn bridge_limits(&self) -> BridgeLimits {
+        self.bridge_limits.get().copied().unwrap_or_default()
+    }
+
+    fn buffer(&self) -> Arc<Semaphore> {
+        self.buffer
+            .get_or_init(|| Arc::new(Semaphore::new(self.bridge_limits().buffered_bytes)))
+            .clone()
+    }
+
+    /// Bytes of connection data held in memory now, both directions.
+    pub fn buffered_bytes(&self) -> usize {
+        self.bridge_limits().buffered_bytes - self.buffer().available_permits()
     }
 
     pub fn timeouts(&self) -> crate::net::Timeouts {
@@ -1395,6 +1475,11 @@ impl Service {
             seen_at: AtomicU64::new(self.now()),
             state: Mutex::new(BridgeState::default()),
             channels: Mutex::new(HashMap::new()),
+            inbound_budget: Arc::new(Semaphore::new(crate::bridge::BRIDGE_BUDGET)),
+            outbound_budget: Arc::new(Semaphore::new(crate::bridge::OUTBOUND_BUDGET)),
+            buffer: self.buffer(),
+            sent_at: Arc::new(AtomicU64::new(crate::bridge::ticks())),
+            visitors: Arc::new(AtomicUsize::new(0)),
         });
         state.bridges.push(bridge.clone());
         // Checked under the entry lock that `drain` also takes, so no bridge is missed.
@@ -1432,6 +1517,14 @@ impl Service {
             return Ok(Attach::Error("invalid_route", "invalid route"));
         }
         self.retire_stale(&mut state);
+        let held: usize = state
+            .attached()
+            .filter(|candidate| candidate.id != bridge.id)
+            .map(|candidate| candidate.snapshot().routes.len())
+            .sum();
+        if held + routes.len() > MAX_TUNNEL_ROUTES {
+            return Ok(Attach::Error("too_many_routes", "too many routes"));
+        }
         let conflict = state.bridges.iter().any(|candidate| {
             candidate.id != bridge.id && routes.iter().any(|route| candidate.claims(route))
         });
@@ -1700,6 +1793,20 @@ impl Service {
                 outcome,
             });
         };
+        let limits = self.bridge_limits();
+        let tunnel_conns: usize = state
+            .bridges
+            .iter()
+            .map(|bridge| bridge.visitors.load(Ordering::Relaxed))
+            .sum();
+        if bridge.visitors.load(Ordering::Relaxed) >= bridge.conn_limit(limits.conns_per_bridge)
+            || tunnel_conns >= limits.conns_per_tunnel
+        {
+            return Ok(Route::Rejected {
+                tunnel_exists: true,
+                outcome: "too_many_connections",
+            });
+        }
         let conn = loop {
             let candidate = state.sequence;
             state.sequence = state.sequence.wrapping_add(1);
@@ -1715,8 +1822,10 @@ impl Service {
                 break candidate;
             }
         };
+        bridge.visitors.fetch_add(1, Ordering::Relaxed);
+        let slot = VisitorSlot(bridge.visitors.clone());
         let (finish, abort) = Finish::new();
-        let (inbound_tx, inbound) = mpsc::channel(INBOUND_QUEUE);
+        let (inbound_tx, inbound) = mpsc::unbounded_channel();
         let bytes_out = Arc::new(AtomicU64::new(0));
         bridge.channels.lock().expect("channels lock").insert(
             conn,
@@ -1724,6 +1833,8 @@ impl Service {
                 inbound: inbound_tx,
                 finish: finish.clone(),
                 bytes_out: bytes_out.clone(),
+                budget: Arc::new(Semaphore::new(crate::bridge::CHANNEL_BUDGET)),
+                drained_at: Arc::new(AtomicU64::new(crate::bridge::ticks())),
             },
         );
         Ok(Route::Bridge {
@@ -1734,6 +1845,7 @@ impl Service {
             abort,
             inbound,
             bytes_out,
+            slot,
         })
     }
 

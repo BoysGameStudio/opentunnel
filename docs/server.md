@@ -18,15 +18,18 @@ visitor ──TLS──▶ :443 ─┬─ SNI <route>.<id>.opentunnel.xyz ─▶
 1. `relay::accept` reads an optional PROXY protocol header (Fly's
    `proxy_proto` handler supplies the visitor's address) and then TLS records
    until the ClientHello is complete (64 KiB and 10 s limits), without
-   consuming anything it cannot replay.
+   consuming anything it cannot replay. The parser only looks at the TLS
+   records completed since its last look, so a ClientHello trickling in byte
+   by byte costs linear work.
 2. SNI equal to the domain: the bytes already read are replayed into rustls,
    which serves HTTP/1.1 and HTTP/2 (ALPN) with the server's own certificate.
 3. SNI `<id>.<domain>` or `<route>.<id>.<domain>`: the tunnel picks the bridge
    that claimed the route, sends `open` and the ClientHello as data frames,
-   then copies both directions in 32 KiB frames. Visitor reads wait while the
-   bridge's send queue is full (backpressure); a visitor that stops reading for
-   30 s is reset so it cannot stall the bridge. `end` half-closes, `reset`
-   aborts with an RST. A connection with no traffic either way for 15 minutes,
+   then copies both directions in 32 KiB frames, within the limits in
+   [Bridge limits](#bridge-limits): visitor reads wait while the bridge's
+   outbound budget is spent, and a visitor that stops reading is reset after
+   at most 5 s without ever holding the bridge longer. `end` half-closes,
+   `reset` aborts with an RST. A connection with no traffic either way for 15 minutes,
    or for 60 s once either direction has ended (a visitor that closed while the
    target never ends, or the reverse), is reset on both sides, and every socket
    has TCP keepalive, so peers that vanish without a FIN never hold a
@@ -35,6 +38,50 @@ visitor ──TLS──▶ :443 ─┬─ SNI <route>.<id>.opentunnel.xyz ─▶
 4. No bridge for the route on this machine: the visitor is forwarded to the
    machine that has one ([Multiple regions](#multiple-regions)), and only if
    no machine has it, to the legacy Worker (migration) or closed.
+
+## Bridge limits
+
+What one bridge, tunnel or visitor may cost a machine, so that no tenant and
+no visitor can exhaust its memory or take another tenant's bridge down.
+
+| Limit | Value | When exceeded |
+| --- | --- | --- |
+| Message before `attach` | 64 KiB | close `1009`; the read buffer never grows past it before the token is checked |
+| Message after `attach` | 4 + 32 KiB (a data frame with the protocol's largest payload, what both clients send at most) | close `1009` |
+| Routes per `attach` | 128 (checked before anything else) | `attach_error` `too_many_routes`; routes are deduplicated in linear time, and the token is checked before they are validated |
+| Routes per tunnel on a machine | 256, over all its bridges | `attach_error` `too_many_routes` |
+| Connections per bridge | the `max_conns` the client advertised, at most `MAX_CONNS_PER_BRIDGE` (256, what both clients advertise) | the visitor is closed before the client hears of it; `opentunnel_visitor_connections_total{outcome="rejected_too_many_connections"}` |
+| Connections per tunnel on a machine | `MAX_CONNS_PER_TUNNEL` (1024), over all its bridges | as above |
+| Client data waiting for one visitor | 512 KiB | the bridge reader waits (below) |
+| Client data waiting for one bridge's visitors | 4 MiB | the bridge reader waits |
+| Visitor data waiting for one bridge's socket | 1 MiB | visitor reads wait |
+| Connection data held by the machine, both directions | `BUFFERED_BYTES_LIMIT` (256 MiB) | the bridge reader or visitor reads wait |
+
+Data from a client is queued for its visitor without waiting until a budget
+is spent. Then the bridge reader stops reading (TCP backpressure on the
+client, as before, so a fast client and a slow visitor still work) and waits
+for visitors to take data, but never longer than 5 s for one frame: then it
+resets (`reset` with `client_io_error`) every connection of that bridge whose
+visitor took nothing in those 5 s (less than 64 KiB acknowledged, read from the
+socket's send queue), and the one it waited for if its data still does not
+fit. Stalled visitors are thus reset together after one wait, whatever their
+number. Visitor sockets keep at most 128 KiB unsent in the kernel
+(`TCP_NOTSENT_LOWAT`): a stalled visitor holds little kernel memory, and
+writes complete as a slow visitor reads instead of only once half of a
+multi-megabyte send buffer is free. A visitor reading slower than about
+6 KiB/s while it lags behind its budget is reset.
+
+The bound on the wait matters beyond the bridge's visitors: a client whose
+bridge the server stops reading fills its own send queue with uploads, and
+released clients (before the changeset `bridge-read-loop`) then stop reading
+the bridge too, since their read loop waits to queue a ping or a pong; the
+server's 30 s write timeout then closed the bridge and every connection on
+it. Before, one visitor that uploaded and never read its answers did this in
+about 30 s, again and again. While the reader waits, a client that has heard
+nothing from the server for 15 s gets a `ping`. Waits and resets are counted
+in `opentunnel_bridge_backpressure_total`. What remains without
+per-connection flow control on the wire: a visitor reading slowly while it
+lags behind its budget slows the bridge to its pace, at most 5 s per frame.
 
 ## Where each Worker feature went
 
@@ -250,6 +297,9 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `MESH_PING_MS` / `MESH_DEAD_MS` | `1000` / `5000` | an idle link pings this often; a peer silent this long is down |
 | `CONNECTION_IDLE_TIMEOUT_MS` | `900000` | a tunnel connection with no traffic either way for this long is reset |
 | `HALF_CLOSE_TIMEOUT_MS` | `60000` | once either direction of a tunnel connection has ended, the other is reset after this long without traffic |
+| `MAX_CONNS_PER_BRIDGE` | `256` | public connections one bridge carries at once; a client advertising a lower `max_conns` gets that ([Bridge limits](#bridge-limits)) |
+| `MAX_CONNS_PER_TUNNEL` | `1024` | public connections one tunnel carries at once on a machine, over all its bridges |
+| `BUFFERED_BYTES_LIMIT` | `268435456` | bytes of connection data a machine holds in memory at once (256 MiB), on top of each bridge's and connection's budget |
 | `METRICS_LISTEN` | `off` | Prometheus metrics at `/metrics` (`[::]:9091` on Fly: every interface, as Fly's scraper does not reach the 6PN address; unauthenticated, not in `[[services]]`); see [Observability](#observability) |
 | `SHUTDOWN_DRAIN_MS` | `10000` | after SIGTERM, how long the server keeps accepting and serving while bridges move elsewhere |
 | `LOG_FORMAT` | `text` | `json` writes one JSON object per line (`json` on Fly) |
@@ -374,10 +424,11 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_connections_shed_total` | counter | `reason` (`handshakes`, `connections`) | public connections closed unserved because the machine is saturated: no API TLS handshake slot within 1 s, or at the connection limit (as many as three quarters of the memory hold at 64 KB each, at most 60,000; logged at startup) ([Capacity](#capacity)) |
 | `opentunnel_requests_limited_total` | counter | `limit` (`create_rate`, `issuance_rate`, `issuance_backlog`) | API requests refused by a [limit](#limits) |
 | `opentunnel_bridges_attached` | gauge | | |
-| `opentunnel_bridge_attaches_total` | counter | `result` (`ok`, `bad_token`, `cert_not_ready`, `invalid_route`, `route_conflict`, `error`) | |
+| `opentunnel_bridge_attaches_total` | counter | `result` (`ok`, `bad_token`, `cert_not_ready`, `invalid_route`, `too_many_routes`, `route_conflict`, `error`) | |
+| `opentunnel_bridge_backpressure_total` | counter | `event` (`stall`, `reset`) | a bridge reader waited 5 s for visitors to take data; a connection reset because its visitor did not keep up ([Bridge limits](#bridge-limits)) |
 | `opentunnel_bridge_detaches_total` | counter | `reason` (`client_close`, `drop`, `idle_retire`, `drain`, `delete`, `server_close`) | attached bridges that ended |
 | `opentunnel_visitor_connections_open` | gauge | | public tunnel connections held here (including forwarded ones) |
-| `opentunnel_visitor_connections_total` | counter | `outcome` (`served_local`, `forwarded_out`, `forwarded_in`, `legacy_relay`, `rejected_unknown_tunnel`, `rejected_unknown_route`, `rejected_no_bridge`, `rejected_cert_not_ready`, `rejected_bad_hello`, `rejected_timeout`, `error`) | a forwarded visitor counts on both machines (`forwarded_out`, `forwarded_in`) |
+| `opentunnel_visitor_connections_total` | counter | `outcome` (`served_local`, `forwarded_out`, `forwarded_in`, `legacy_relay`, `rejected_unknown_tunnel`, `rejected_unknown_route`, `rejected_no_bridge`, `rejected_cert_not_ready`, `rejected_too_many_connections`, `rejected_bad_hello`, `rejected_timeout`, `error`) | a forwarded visitor counts on both machines (`forwarded_out`, `forwarded_in`) |
 | `opentunnel_visitor_bytes_total` | counter | `direction` (`in`, `out`) | counted on the machine with the bridge |
 | `opentunnel_visitor_connection_duration_seconds` | histogram | | connections carried over a bridge here |
 | `opentunnel_cluster_forward_failures_total` | counter | `reason` (`refused`, `connect`, `timeout`, `io`) | |
@@ -823,7 +874,11 @@ docker rm -f ot-mysql    # when done; it holds the test databases
   keys; `store.rs` for GCRA under concurrency), and
   connections whose peers vanish (`tests/leaks.rs`: visitors that close while
   the target never ends, silent visitors, a bridge that goes away, partial
-  ClientHellos; tasks and descriptors return to their baseline).
+  ClientHellos; tasks and descriptors return to their baseline), and the
+  bridge limits (`tests/bridge_limits.rs`: message sizes before and after attach,
+  route lists, connections per bridge, many stalled visitors holding at most
+  one bridge's budget, stalled visitors reset within one wait while pings and
+  other visitors go on, a slow visitor getting a whole download).
 - ACME against Pebble with external account binding and DNS-01 through
   pebble-challtestsrv:
 

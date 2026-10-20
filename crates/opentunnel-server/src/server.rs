@@ -117,6 +117,7 @@ impl Server {
             store.clone(),
             clock.clone(),
         )?));
+        service.set_bridge_limits(config.bridge_limits());
 
         let (issuer, local_ca) = match config.issuer {
             IssuerKind::Local => {
