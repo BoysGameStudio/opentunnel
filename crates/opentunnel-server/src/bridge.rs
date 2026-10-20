@@ -216,9 +216,11 @@ where
                 data(bridge, frame).await;
             }
             Message::Text(text) => {
-                let control: Option<serde_json::Map<String, Value>> =
-                    serde_json::from_str(&text).ok();
-                let Some(control) = control.filter(|control| control["type"].is_string()) else {
+                // A `Value` (not a `Map`): indexing a missing key yields `Null` instead of panicking.
+                let control: Option<Value> = serde_json::from_str(&text).ok();
+                let Some(control) =
+                    control.filter(|control| control.is_object() && control["type"].is_string())
+                else {
                     bridge.close(1008, "invalid control");
                     continue;
                 };
@@ -244,7 +246,7 @@ async fn attach(
     service: &Service,
     tunnel_id: &str,
     bridge: &Arc<Bridge>,
-    control: &serde_json::Map<String, Value>,
+    control: &Value,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let (Some("attach"), Some(token)) = (control["type"].as_str(), control["token"].as_str())
     else {
@@ -311,12 +313,7 @@ async fn attach(
     }
 }
 
-async fn handle_control(
-    service: &Service,
-    tunnel_id: &str,
-    bridge: &Arc<Bridge>,
-    control: &serde_json::Map<String, Value>,
-) {
+async fn handle_control(service: &Service, tunnel_id: &str, bridge: &Arc<Bridge>, control: &Value) {
     match control["type"].as_str() {
         Some("ping") if control["time_sent"].is_number() => {
             send(
