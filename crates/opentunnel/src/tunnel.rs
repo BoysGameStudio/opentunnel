@@ -34,13 +34,15 @@ use crate::storage::Storage;
 pub type Routes = BTreeMap<String, Route>;
 
 const MAX_CONNS: u32 = 256;
-/// Frames queued for the WebSocket before local sockets stop being read.
+/// Frames queued for the WebSocket before local sockets stop being read. Control messages from the bridge
+/// reader have their own queue, which never makes it wait.
 const OUTBOUND_QUEUE: usize = 256;
 /// Frames queued per public connection before the bridge reader waits.
 const INBOUND_QUEUE: usize = 64;
 const DUPLEX_BUFFER: usize = 64 * 1024;
-/// How long the bridge reader waits for a full connection before resetting it.
-const STALLED_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest the bridge reader waits for a full connection before resetting it. While it waits it reads
+/// nothing, pings and pongs included, so this stays far below the server's write timeout (30 s).
+const STALLED_CHANNEL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often to check for a renewed certificate: rarely while the current one
 /// is fresh, every minute once renewal is due (it completes within minutes).
 const CERTIFICATE_CHECK_FRESH: Duration = Duration::from_secs(12 * 60 * 60);
@@ -490,8 +492,17 @@ impl Supervisor {
 
         let (mut sink, mut stream) = socket.split();
         let (outbound, mut outbound_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE);
+        // Control messages from the bridge reader: it must never wait for the data queue, or a server that stops
+        // reading for a while (backpressure from a slow visitor) would stop this client reading too.
+        let (controls, mut controls_rx) = mpsc::unbounded_channel::<Message>();
         let writer = tokio::spawn(async move {
-            while let Some(message) = outbound_rx.recv().await {
+            loop {
+                let message = tokio::select! {
+                    biased;
+                    Some(message) = controls_rx.recv() => message,
+                    Some(message) = outbound_rx.recv() => message,
+                    else => break,
+                };
                 if let Err(error) = sink.send(message).await {
                     return Err(error.to_string());
                 }
@@ -521,17 +532,8 @@ impl Supervisor {
                             let Some((conn, payload)) = bridge::decode_data_frame(&frame) else { continue };
                             let Some(channel) = channels.get(&conn) else { continue };
                             let payload = Inbound::Data(Bytes::copy_from_slice(payload));
-                            if tokio::time::timeout(STALLED_CHANNEL_TIMEOUT, channel.inbound.send(payload)).await.is_err() {
-                                // A local socket that stops reading would otherwise stall every
-                                // connection sharing this bridge.
-                                let channel = channels.remove(&conn).expect("channel exists");
-                                channel.abort.abort();
-                                let _ = outbound.send(control(&ClientMessage::Reset {
-                                    conn,
-                                    code: codes::UPSTREAM_IO_ERROR.into(),
-                                })).await;
-                                self.status.send_modify(|status| status.connections = channels.len());
-                                self.emit(Event::ConnectionClosed { conn, route: channel.route, error: Some("local connection stalled".into()) });
+                            if !deliver(&channel.inbound, payload).await {
+                                self.stalled(&mut channels, conn, &controls);
                             }
                         }
                         Message::Text(text) => {
@@ -550,18 +552,18 @@ impl Supervisor {
                                         targets.read().expect("targets lock").get(route).cloned()
                                     });
                                     let (Some(route), Some(Route { target, proxy_protocol })) = (route, target) else {
-                                        let _ = outbound.send(control(&ClientMessage::Reset {
+                                        let _ = controls.send(control(&ClientMessage::Reset {
                                             conn,
                                             code: codes::UNKNOWN_ROUTE.into(),
-                                        })).await;
+                                        }));
                                         continue;
                                     };
                                     // max_conns is advertised on attach; refuse before starting another TLS channel.
                                     if channels.len() >= MAX_CONNS as usize {
-                                        let _ = outbound.send(control(&ClientMessage::Reset {
+                                        let _ = controls.send(control(&ClientMessage::Reset {
                                             conn,
                                             code: codes::TOO_MANY_CONNECTIONS.into(),
-                                        })).await;
+                                        }));
                                         continue;
                                     }
                                     let (inbound, inbound_rx) = mpsc::channel(INBOUND_QUEUE);
@@ -580,8 +582,10 @@ impl Supervisor {
                                     self.emit(Event::ConnectionOpened { conn, route, peer });
                                 }
                                 ServerMessage::End { conn } => {
-                                    if let Some(channel) = channels.get(&conn) {
-                                        let _ = channel.inbound.send(Inbound::End).await;
+                                    if let Some(channel) = channels.get(&conn)
+                                        && !deliver(&channel.inbound, Inbound::End).await
+                                    {
+                                        self.stalled(&mut channels, conn, &controls);
                                     }
                                 }
                                 ServerMessage::Reset { conn, code } => {
@@ -592,7 +596,7 @@ impl Supervisor {
                                     }
                                 }
                                 ServerMessage::Ping { time_sent } => {
-                                    let _ = outbound.send(control(&ClientMessage::Pong { time_sent })).await;
+                                    let _ = controls.send(control(&ClientMessage::Pong { time_sent }));
                                 }
                                 ServerMessage::Drain { reason } => break retry(format!("server draining: {reason}")),
                                 ServerMessage::Pong { .. }
@@ -618,7 +622,7 @@ impl Supervisor {
                     if last_received.elapsed() > idle_timeout {
                         break retry("bridge idle timeout".into());
                     }
-                    let _ = outbound.send(control(&ClientMessage::Ping { time_sent: now_ms() })).await;
+                    let _ = controls.send(control(&ClientMessage::Ping { time_sent: now_ms() }));
                 }
                 changed = self.routes.changed() => {
                     if changed.is_err() {
@@ -648,6 +652,31 @@ impl Supervisor {
         drop(outbound);
         writer.abort();
         end
+    }
+
+    /// Resets a connection whose local side stopped reading: it would otherwise stall every connection sharing
+    /// the bridge.
+    fn stalled(
+        &self,
+        channels: &mut HashMap<ConnId, Channel>,
+        conn: ConnId,
+        controls: &mpsc::UnboundedSender<Message>,
+    ) {
+        let Some(channel) = channels.remove(&conn) else {
+            return;
+        };
+        channel.abort.abort();
+        let _ = controls.send(control(&ClientMessage::Reset {
+            conn,
+            code: codes::UPSTREAM_IO_ERROR.into(),
+        }));
+        self.status
+            .send_modify(|status| status.connections = channels.len());
+        self.emit(Event::ConnectionClosed {
+            conn,
+            route: channel.route,
+            error: Some("local connection stalled".into()),
+        });
     }
 
     async fn attach(&self, routes: &[String]) -> Result<(WebSocket, AttachedSession)> {
@@ -704,6 +733,19 @@ impl Supervisor {
             }
         }
         Err(Error::Bridge("bridge closed before attach".into()))
+    }
+}
+
+/// Queues data or an end for a connection, waiting at most `STALLED_CHANNEL_TIMEOUT` while its queue is full.
+/// `false`: the local side stalled.
+async fn deliver(inbound: &mpsc::Sender<Inbound>, item: Inbound) -> bool {
+    match inbound.try_send(item) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => true,
+        Err(mpsc::error::TrySendError::Full(item)) => {
+            tokio::time::timeout(STALLED_CHANNEL_TIMEOUT, inbound.send(item))
+                .await
+                .is_ok()
+        }
     }
 }
 
