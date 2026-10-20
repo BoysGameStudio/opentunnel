@@ -74,6 +74,8 @@ pub struct Metrics {
     acme_failures: Family<Labels2, Counter>,
     acme_duration: Histograms<Labels2>,
     certificate_jobs: Family<Labels, Gauge>,
+    acme_cooldowns: Counter,
+    dns_records: Family<Labels, Counter>,
     certificates_expiring: Gauge,
 }
 
@@ -131,6 +133,8 @@ impl Metrics {
             acme_failures: Family::default(),
             acme_duration: Family::new_with_constructor(acme_histogram),
             certificate_jobs: Family::default(),
+            acme_cooldowns: Counter::default(),
+            dns_records: Family::default(),
             certificates_expiring: Gauge::default(),
         };
         let r = &mut registry;
@@ -291,6 +295,16 @@ impl Metrics {
             metrics.certificate_jobs.clone(),
         );
         r.register(
+            "acme_cooldowns",
+            "CA cool-downs this machine started: new issuance paused after the CA kept failing or rate limited",
+            metrics.acme_cooldowns.clone(),
+        );
+        r.register(
+            "acme_dns_records",
+            "DNS-01 challenge TXT records, by event (created, deleted, delete_failed, swept: deleted by the periodic sweep of leftovers)",
+            metrics.dns_records.clone(),
+        );
+        r.register(
             "certificates_expiring",
             "Certificates of tunnels with a bridge here that expire within 14 days (or have expired)",
             metrics.certificates_expiring.clone(),
@@ -379,7 +393,7 @@ pub fn detach_reason(server_close: Option<u16>, clean: bool) -> &'static str {
 }
 
 /// A visitor connection was served or turned away. Outcomes: `served_local`, `forwarded_out`,
-/// `forwarded_in`, `legacy_relay`, `rejected_unknown_tunnel`, `rejected_unknown_route`, `rejected_no_bridge`,
+/// `forwarded_in`, `rejected_unknown_tunnel`, `rejected_unknown_route`, `rejected_no_bridge`,
 /// `rejected_cert_not_ready`, `rejected_too_many_connections`, `rejected_bad_hello`, `rejected_timeout`, `error`.
 pub fn visitor(outcome: &'static str) {
     get()
@@ -745,6 +759,15 @@ pub fn render(sample: Sample) -> String {
     let mut text = String::new();
     encode(&mut text, &metrics.registry).expect("encoding to a string does not fail");
     text
+}
+
+/// A challenge TXT record was `created`, `deleted`, failed to delete (`delete_failed`) or `swept`.
+pub fn dns_record(event: &'static str) {
+    get().dns_records.get_or_create(&[("event", event)]).inc();
+}
+
+pub fn acme_cooldown() {
+    get().acme_cooldowns.inc();
 }
 
 pub fn set_certificate_jobs(pending: u64, failed: u64) {

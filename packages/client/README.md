@@ -129,6 +129,12 @@ proxy's CA:
 - Deno: `DENO_CERT=/path/to/proxy-ca.pem` (or `--cert`), or the OS store with
   `DENO_TLS_CA_STORE=system,mozilla`.
 
+Node and Bun reject certificates they cannot verify (self-signed ones
+included); add the CA as above instead. Never set
+`NODE_TLS_REJECT_UNAUTHORIZED=0`: it turns off certificate verification for
+every connection the process makes, so anyone on the path can read and change
+the tunnel's control traffic and take its token.
+
 The Rust client and CLI use the OS store automatically and also read
 `OPENTUNNEL_CA_CERT`. Either way this only concerns the connection to
 `opentunnel.xyz`; visitor traffic is still decrypted only in your process.

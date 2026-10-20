@@ -19,9 +19,8 @@ use crate::dns::DnsProvider;
 use crate::http::{self, App, Stats};
 use crate::issuer::{Issuer, LocalCa};
 use crate::jobs::{self, Jobs, ServerCertificates};
-use crate::migration::{Legacy, LegacyFallback, PullThrough};
 use crate::net::{self, AcceptErrors};
-use crate::relay::{self, Fallback};
+use crate::relay;
 use crate::service::Service;
 use crate::store::Store;
 use crate::tls;
@@ -48,7 +47,6 @@ pub struct Server {
     pub jobs: Arc<Jobs>,
     pub certificates: Arc<ServerCertificates>,
     pub resolver: Arc<tls::ServerCertificate>,
-    pub fallback: Option<Arc<dyn Fallback>>,
     /// The other machines, with `INTERNAL_LISTEN`.
     pub cluster: Option<Arc<Cluster>>,
     pub config: Config,
@@ -205,7 +203,6 @@ impl Server {
                         .unwrap_or_else(|| jobs.owner.clone()),
                     config.region.clone(),
                     config.internal_token.clone().unwrap_or_default(),
-                    store.clone(),
                     clock.clone(),
                     stats.clone(),
                     config.mesh(),
@@ -214,38 +211,6 @@ impl Server {
                 Some(cluster)
             }
         };
-        let mut fallback: Option<Arc<dyn Fallback>> = None;
-        if let Some(url) = config
-            .legacy_worker_url
-            .clone()
-            .filter(|url| !url.is_empty())
-        {
-            let legacy = Legacy {
-                worker_url: url.trim_end_matches('/').to_owned(),
-                relay_token: config.relay_token.clone().filter(|token| !token.is_empty()),
-                export_token: config
-                    .legacy_export_token
-                    .clone()
-                    .filter(|token| !token.is_empty()),
-            };
-            info!(worker = %legacy.worker_url, "migration mode: legacy relay fallback and pull-through import");
-            if legacy.export_token.is_some() {
-                service.set_pull_through(Arc::new(PullThrough::new(
-                    legacy.clone(),
-                    http.clone(),
-                    store.clone(),
-                    clock.clone(),
-                )));
-            }
-            if legacy.relay_token.is_some() {
-                fallback = Some(Arc::new(LegacyFallback {
-                    legacy,
-                    stats: stats.clone(),
-                    timeouts: config.timeouts(),
-                }));
-            }
-        }
-
         let admin = config
             .admin_token
             .as_deref()
@@ -268,7 +233,6 @@ impl Server {
             jobs,
             certificates,
             resolver,
-            fallback,
             cluster,
             config,
             local_ca,
@@ -313,6 +277,7 @@ impl Server {
             service.clock.clone(),
         )));
         tasks.push(tokio::spawn(jobs::run_reconcile(service)));
+        tasks.push(tokio::spawn(jobs::run_dns_sweeper(self.jobs.clone())));
         Ok(tasks)
     }
 
@@ -405,7 +370,6 @@ impl Server {
         let _open = crate::metrics::visitor_open();
         let origin = relay::Origin::Public {
             cluster: self.cluster.as_ref(),
-            fallback: self.fallback.as_ref(),
         };
         if let Err(error) = Box::pin(relay::route_tunnel(&self.app.service, accepted, origin)).await
         {
@@ -533,6 +497,8 @@ impl Server {
             drain_ms = server.config.shutdown_drain_ms,
             "shutting down; asking bridges to reconnect"
         );
+        // Issuance attempts end now, each deleting its challenge records, rather than be cut off at exit.
+        self_jobs.stop();
         // Other machines stop forwarding here before the bridges move to them.
         if let Some(cluster) = &server.cluster {
             cluster.shutdown().await;

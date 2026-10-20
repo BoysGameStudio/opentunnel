@@ -118,21 +118,11 @@ pub fn route_name(hostname: &str, id: &str, domain: &str) -> Option<String> {
     (!route.is_empty() && !route.contains('.')).then(|| route.to_owned())
 }
 
-/// What to do with a tunnel connection nothing serves here.
-pub trait Fallback: Send + Sync {
-    /// Takes the connection, or gives it back.
-    fn forward(&self, accepted: Accepted) -> Option<Accepted>;
-}
-
 /// Where a tunnel connection came from.
 #[derive(Clone, Copy)]
 pub enum Origin<'a> {
-    /// A visitor on the public port. Without a bridge here it goes to the machine holding one, then to the
-    /// legacy fallback.
-    Public {
-        cluster: Option<&'a Arc<Cluster>>,
-        fallback: Option<&'a Arc<dyn Fallback>>,
-    },
+    /// A visitor on the public port. Without a bridge here it goes to the machine holding one.
+    Public { cluster: Option<&'a Arc<Cluster>> },
     /// Forwarded by another machine, which waits for one byte: [`FORWARD_ACCEPTED`] before the stream, or
     /// [`FORWARD_REFUSED`]. Never forwarded again.
     Forwarded,
@@ -170,8 +160,8 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
             tunnel_exists,
             outcome,
         } => {
-            let (cluster, fallback) = match origin {
-                Origin::Public { cluster, fallback } => (cluster, fallback),
+            let cluster = match origin {
+                Origin::Public { cluster } => cluster,
                 Origin::Forwarded => {
                     // The forwarding machine retries elsewhere or rejects it, and reports it.
                     let mut stream = accepted.stream;
@@ -192,20 +182,6 @@ pub async fn route_tunnel(service: &Service, accepted: Accepted, origin: Origin<
                         return Ok(());
                     }
                     Some(returned) => accepted = returned,
-                }
-            }
-            if outcome == "no_bridge"
-                && let Some(fallback) = fallback
-            {
-                match fallback.forward(accepted) {
-                    None => {
-                        crate::metrics::visitor("legacy_relay");
-                        return Ok(());
-                    }
-                    Some(returned) => {
-                        return reject(service, &id, tunnel_exists, outcome, started, returned)
-                            .await;
-                    }
                 }
             }
             return reject(service, &id, tunnel_exists, outcome, started, accepted).await;

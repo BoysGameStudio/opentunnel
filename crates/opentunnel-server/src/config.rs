@@ -201,6 +201,11 @@ pub struct Config {
     #[arg(long, env = "MESH_ACCEPT_V1", default_value_t = true, action = clap::ArgAction::Set)]
     pub mesh_accept_v1: bool,
 
+    /// A peer's mesh address must be the one its connection comes from (and, on Fly, what
+    /// `<machine>.vm.<app>.internal` resolves to). Only for unusual networks; forwards go to that address.
+    #[arg(long, env = "MESH_VERIFY_ADDRESS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub mesh_verify_address: bool,
+
     /// A tunnel connection with no traffic in either direction for this long is closed.
     #[arg(long, env = "CONNECTION_IDLE_TIMEOUT_MS", default_value_t = 900_000)]
     pub connection_idle_timeout_ms: u64,
@@ -265,19 +270,6 @@ pub struct Config {
     /// `json` lines (on Fly) or human-readable `text`.
     #[arg(long, env = "LOG_FORMAT", value_enum, default_value = "text")]
     pub log_format: crate::logging::LogFormat,
-
-    /// TEMPORARY (migration): the old Worker, e.g. its workers.dev URL. Enables the legacy relay fallback and
-    /// the pull-through import.
-    #[arg(long, env = "LEGACY_WORKER_URL")]
-    pub legacy_worker_url: Option<String>,
-
-    /// TEMPORARY (migration): the Worker's RELAY_TOKEN, for its /api/relay.
-    #[arg(long, env = "RELAY_TOKEN", hide_env_values = true)]
-    pub relay_token: Option<String>,
-
-    /// TEMPORARY (migration): the Worker's ADMIN_EXPORT_TOKEN, for its /api/admin/export.
-    #[arg(long, env = "LEGACY_EXPORT_TOKEN", hide_env_values = true)]
-    pub legacy_export_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -310,6 +302,11 @@ impl Config {
                 .filter(|app| !app.is_empty())
                 .map(|app| format!("{app}.internal")),
         };
+        // Fly names every machine `<id>.vm.<app>.internal`; only with the default peer name.
+        let machine_dns = match (self.mesh_dns.as_deref(), self.fly_app_name.as_deref()) {
+            (None, Some(app)) if !app.is_empty() => Some(format!("{{}}.vm.{app}.internal")),
+            _ => None,
+        };
         crate::mesh::MeshConfig {
             dns,
             peers: self
@@ -322,6 +319,9 @@ impl Config {
             ping: ms(self.mesh_ping_ms),
             dead: ms(self.mesh_dead_ms),
             accept_v1: self.mesh_accept_v1,
+            machine_dns,
+            verify_address: self.mesh_verify_address,
+            ..crate::mesh::MeshConfig::default()
         }
     }
 

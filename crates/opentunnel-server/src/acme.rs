@@ -38,7 +38,14 @@ pub struct Acme {
     dns: Option<DnsProvider>,
     /// The account URL (the JWS `kid`), once registered.
     account: Mutex<Option<String>>,
+    /// Ends attempts in progress (shutdown): each cleans up its authorizations and records first.
+    stop: tokio_util::sync::CancellationToken,
 }
+
+/// The attempt ended because the server is shutting down, after cleaning up; it is not a failure.
+#[derive(Debug, thiserror::Error)]
+#[error("certificate issuance stopped: the server is shutting down")]
+pub struct Stopped;
 
 /// One attempt's result: the leaf and the rest of the chain as PEM, and the leaf's expiry.
 #[derive(Debug, Clone)]
@@ -191,7 +198,18 @@ impl Acme {
             http,
             dns,
             account: Mutex::new(None),
+            stop: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Ends every attempt in progress and any started later with [`Stopped`], each after deactivating its
+    /// answered authorizations and deleting its challenge records, so a shutdown leaves nothing in the zone.
+    pub fn stop(&self) {
+        self.stop.cancel();
+    }
+
+    pub fn dns(&self) -> Option<&DnsProvider> {
+        self.dns.as_ref()
     }
 
     pub async fn issue(
@@ -206,7 +224,13 @@ impl Acme {
         let Some(dns) = &self.dns else {
             bail!("CLOUDFLARE_ZONE_ID and CLOUDFLARE_API_TOKEN are required");
         };
+        if self.stop.is_cancelled() {
+            return Err(Stopped.into());
+        }
         let key = account_key(self.config.account_key_jwk.as_deref())?;
+        let origin = url::Url::parse(&self.config.directory)
+            .context("ACME_URL is not a URL")?
+            .origin();
         let directory: Directory = self
             .http
             .get(&self.config.directory)
@@ -220,6 +244,7 @@ impl Acme {
             .context("reading the ACME directory")?;
         let mut session = Session {
             http: &self.http,
+            origin,
             key: &key,
             new_nonce: &directory.new_nonce,
             nonce: None,
@@ -273,7 +298,7 @@ impl Acme {
         // state. The CA may still be checking their records, so those stay published until each one is valid,
         // invalid or deactivated.
         let mut unsettled: Vec<&Pending> = Vec::new();
-        let result = async {
+        let attempt = async {
             for (name, value) in &wanted {
                 records.push(
                     dns.create_txt(name, value)
@@ -382,8 +407,12 @@ impl Acme {
                 bail!("ACME returned a certificate for another key");
             }
             Ok(issued)
-        }
-        .await;
+        };
+        // A shutdown ends the attempt here, so the cleanup below still runs.
+        let result = tokio::select! {
+            result = attempt => result,
+            () = self.stop.cancelled() => Err(Stopped.into()),
+        };
         // An authorization left pending is handed to the next order as it is, its challenge possibly stuck in
         // `processing` for good (ZeroSSL), so it is deactivated (RFC 8555 section 7.5.2) and the next attempt
         // gets a new one. Its records are deleted only once the CA can no longer be checking them.
@@ -399,6 +428,8 @@ impl Acme {
                 settled = false;
             }
         }
+        // Otherwise the records stay until the sweep removes them (`jobs::run_dns_sweeper`), long after the CA
+        // could still check them.
         if settled {
             for record in &records {
                 dns.delete_txt(record).await;
@@ -521,6 +552,8 @@ async fn deactivate(session: &mut Session<'_>, url: &str) -> Result<()> {
 
 struct Session<'a> {
     http: &'a reqwest::Client,
+    /// The directory's scheme, host and port: the only place requests go, whatever URLs the CA's answers name.
+    origin: url::Origin,
     key: &'a Key,
     new_nonce: &'a str,
     nonce: Option<String>,
@@ -534,6 +567,7 @@ impl Session<'_> {
         if let Some(nonce) = self.nonce.take() {
             return Ok(nonce);
         }
+        self.check_url(self.new_nonce)?;
         let mut pause = REQUEST_RETRY_PAUSE;
         let mut last = String::new();
         for attempt in 1..=REQUEST_TRIES {
@@ -583,6 +617,7 @@ impl Session<'_> {
     /// servers may do at any time.
     async fn post(&mut self, url: &str, payload: Option<&Value>) -> Result<Response> {
         let mut attempt = 0;
+        self.check_url(url)?;
         loop {
             attempt += 1;
             let nonce = self.fresh_nonce().await?;
@@ -634,6 +669,17 @@ impl Session<'_> {
             .into());
         }
     }
+    /// Refuses a URL the CA named unless it is on the directory's own origin (an HTTPS directory: HTTPS only).
+    fn check_url(&self, url: &str) -> Result<()> {
+        match url::Url::parse(url) {
+            Ok(parsed) if parsed.origin() == self.origin => Ok(()),
+            _ => Err(anyhow!(
+                "the ACME server named a URL outside its directory's origin: {}",
+                url.chars().take(200).collect::<String>()
+            )),
+        }
+    }
+
     fn sign(&self, url: &str, nonce: &str, payload: Option<&Value>) -> Result<String> {
         let mut protected = json!({ "alg": "ES256", "nonce": nonce, "url": url });
         match &self.kid {
@@ -845,6 +891,40 @@ pub fn generate_account_jwk() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requests_go_only_to_the_directorys_origin() {
+        crate::install_crypto_provider();
+        let http = reqwest::Client::new();
+        let key = account_key(Some(&generate_account_jwk().unwrap())).unwrap();
+        let session = Session {
+            http: &http,
+            origin: url::Url::parse("https://acme.zerossl.com/v2/DV90")
+                .unwrap()
+                .origin(),
+            key: &key,
+            new_nonce: "https://acme.zerossl.com/v2/DV90/newNonce",
+            nonce: None,
+            kid: None,
+        };
+        for url in [
+            "https://acme.zerossl.com/v2/DV90/order/1",
+            "https://acme.zerossl.com:443/v2/DV90/authz/2",
+        ] {
+            assert!(session.check_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://acme.zerossl.com/v2/DV90/order/1",
+            "https://169.254.169.254/latest/meta-data",
+            "http://[fdaa::1]:9000/internal/tunnel/x/routes",
+            "https://acme.zerossl.com.evil.example/",
+            "https://acme.zerossl.com:8443/",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            assert!(session.check_url(url).is_err(), "{url}");
+        }
+    }
 
     #[test]
     fn reads_generated_account_keys() {

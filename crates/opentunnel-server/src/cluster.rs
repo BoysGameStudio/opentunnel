@@ -35,7 +35,6 @@ use crate::net::{self, AcceptErrors, Timeouts};
 use crate::peer_auth::{self, Nonces, Secret};
 use crate::relay::{self, Accepted, Origin};
 use crate::service::Service;
-use crate::store::{BridgeLocation, Store};
 
 /// The first line of a forwarded connection:
 /// `OPENTUNNEL-FORWARD/2 <sender> <receiver> <timestamp> <nonce> <tunnel> <route> <visitor> <proof>\n`, the proof
@@ -48,6 +47,9 @@ const FORWARD_LABEL: &str = "opentunnel forward/2";
 /// too.
 pub const CONTROL_AUTH: &str = "x-opentunnel-auth";
 const CONTROL_LABEL: &str = "opentunnel control/2";
+/// Internal connections that have not proven the secret yet, at once; more are closed at accept. Each holds at
+/// most a header line, so this bounds what anyone on the private network can make a machine hold.
+const UNAUTHENTICATED: usize = 256;
 /// The receiving machine's answer, before any data: it has the bridge and the stream follows.
 pub const FORWARD_ACCEPTED: u8 = b'1';
 /// It has no bridge for the route (any more); the sender may look again.
@@ -57,19 +59,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// The receiver may need to load the tunnel from the database before it answers.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
-/// TEMPORARY (deploys from the previous version): its registry rows refreshed this recently are live.
-const LEGACY_LIVE_MS: u64 = 3 * 60_000;
-
-impl From<&BridgeLocation> for Location {
-    fn from(row: &BridgeLocation) -> Self {
-        Self {
-            machine_id: row.machine_id.clone(),
-            region: row.region.clone(),
-            address: row.address.clone(),
-        }
-    }
-}
-
 pub struct Cluster {
     pub machine_id: String,
     pub region: String,
@@ -80,7 +69,6 @@ pub struct Cluster {
     token: String,
     accept_v1: bool,
     nonces: Nonces,
-    store: Store,
     clock: Clock,
     http: reqwest::Client,
     pub stats: Arc<Stats>,
@@ -99,7 +87,6 @@ impl Cluster {
         machine_id: String,
         region: String,
         token: String,
-        store: Store,
         clock: Clock,
         stats: Arc<Stats>,
         mesh: MeshConfig,
@@ -111,6 +98,8 @@ impl Cluster {
         let http = reqwest::Client::builder()
             .connect_timeout(CONTROL_TIMEOUT)
             .timeout(CONTROL_TIMEOUT)
+            .pool_idle_timeout(Duration::from_secs(20))
+            .pool_max_idle_per_host(2)
             .no_proxy()
             .build()?;
         let accept_v1 = mesh.accept_v1;
@@ -129,7 +118,6 @@ impl Cluster {
             token,
             accept_v1,
             nonces: Nonces::default(),
-            store,
             clock,
             http,
             stats,
@@ -149,6 +137,23 @@ impl Cluster {
     /// TEMPORARY: whether a request of the previous version, which carries the secret itself, is accepted.
     fn authorized_v1(&self, token: &str) -> bool {
         self.accept_v1 && self.secret.matches(token)
+    }
+
+    /// Whether a signed request from `sender` comes from where that machine is linked: a request signed by a
+    /// machine this one has no link with, or from another address, is refused.
+    fn check_sender(&self, sender: &str, connection: SocketAddr) -> Result<()> {
+        let Some(address) = self.mesh.peer_address(sender) else {
+            bail!("{sender} is not linked");
+        };
+        let canonical = crate::limits::canonical;
+        if address
+            .parse::<SocketAddr>()
+            .is_ok_and(|address| canonical(address.ip()) == canonical(connection.ip()))
+        {
+            Ok(())
+        } else {
+            bail!("{sender} is linked at {address}, not {connection}")
+        }
     }
 
     /// `<sender> <receiver> <timestamp> <nonce>` and its proof over `label`, these and `fields`.
@@ -211,17 +216,11 @@ impl Cluster {
     ) -> Option<Accepted> {
         let mut tried: Option<String> = None;
         for attempt in 0..2 {
-            let location = match self.mesh.locate(tunnel, route, tried.as_deref()) {
-                Some(location) => location,
-                None => match self.locate_legacy(tunnel, route, tried.as_deref()).await {
-                    Some(location) => location,
-                    None => {
-                        if attempt == 0 {
-                            crate::metrics::mesh_lookup("miss");
-                        }
-                        return Some(accepted);
-                    }
-                },
+            let Some(location) = self.mesh.locate(tunnel, route, tried.as_deref()) else {
+                if attempt == 0 {
+                    crate::metrics::mesh_lookup("miss");
+                }
+                return Some(accepted);
             };
             if attempt == 0 {
                 crate::metrics::mesh_lookup("hit");
@@ -246,38 +245,6 @@ impl Cluster {
             tried = Some(location.machine_id);
         }
         Some(accepted)
-    }
-
-    /// TEMPORARY (deploys from the previous version, which keeps its bridges in the `bridges` table): while a
-    /// machine of that version answers, a route the mesh does not know is looked up there too.
-    async fn locate_legacy(
-        &self,
-        tunnel: &str,
-        route: &str,
-        except: Option<&str>,
-    ) -> Option<Location> {
-        if !self.mesh.legacy_present() {
-            return None;
-        }
-        let since = self.clock.now_ms().saturating_sub(LEGACY_LIVE_MS);
-        let rows = match self
-            .store
-            .bridge_locations(tunnel, Some(route), since)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                debug!(tunnel, %error, "looking up the previous registry failed");
-                return None;
-            }
-        };
-        rows.iter()
-            .find(|row| {
-                row.machine_id != self.machine_id
-                    && Some(row.machine_id.as_str()) != except
-                    && !self.mesh.is_up(&row.machine_id)
-            })
-            .map(Location::from)
     }
 
     /// Connects, sends the header and the ClientHello, and waits for the answer. `None`: refused.
@@ -409,6 +376,25 @@ async fn run_notices(
             Notice::Event(Event::TunnelDeleted { tunnel }) => {
                 let service = service.clone();
                 tokio::spawn(async move {
+                    // Only what the database says: a peer's word alone closes no tenant's bridges.
+                    match service
+                        .store
+                        .deleted_tunnels(std::slice::from_ref(&tunnel))
+                        .await
+                    {
+                        Ok(deleted) if deleted.contains(&tunnel) => {}
+                        Ok(_) => {
+                            warn!(
+                                tunnel,
+                                "ignored a deletion another machine announced: the tunnel is not deleted"
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            warn!(tunnel, error = %format!("{error:#}"), "could not check a deletion another machine announced");
+                            return;
+                        }
+                    }
                     if service.close_deleted(&tunnel).await {
                         info!(
                             tunnel,
@@ -459,6 +445,7 @@ async fn splice(accepted: Accepted, mut internal: TcpStream, timeouts: Timeouts)
 /// Accepts mesh links, forwarded visitors and control requests from other machines.
 pub async fn serve_internal(listener: TcpListener, service: Service, cluster: Arc<Cluster>) {
     let mut errors = AcceptErrors::new("internal accept failed");
+    let unauthenticated = Arc::new(tokio::sync::Semaphore::new(UNAUTHENTICATED));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -468,10 +455,14 @@ pub async fn serve_internal(listener: TcpListener, service: Service, cluster: Ar
             }
         };
         net::tune(&stream);
+        let Ok(permit) = unauthenticated.clone().try_acquire_owned() else {
+            debug!(%peer, "internal connection refused: too many unauthenticated");
+            continue;
+        };
         let service = service.clone();
         let cluster = cluster.clone();
         tokio::spawn(async move {
-            if let Err(error) = internal_connection(stream, peer, service, cluster).await {
+            if let Err(error) = internal_connection(stream, peer, service, cluster, permit).await {
                 debug!(%error, %peer, "internal connection ended");
             }
         });
@@ -483,8 +474,9 @@ async fn internal_connection(
     peer: SocketAddr,
     service: Service,
     cluster: Arc<Cluster>,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
-    let mut buffer = Vec::with_capacity(4096);
+    let mut buffer = Vec::with_capacity(1024);
     let line_end = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
@@ -504,9 +496,12 @@ async fn internal_connection(
         let _ = stream.set_nodelay(true);
         let stream = crate::tls::Replay::new(rest, stream);
         return if v1 {
-            cluster.mesh.accept_v1(stream, &greeting).await
+            cluster
+                .mesh
+                .accept_v1(stream, &greeting, peer, permit)
+                .await
         } else {
-            cluster.mesh.accept(stream, &greeting).await
+            cluster.mesh.accept(stream, &greeting, peer, permit).await
         };
     }
     let v1 = buffer.starts_with(FORWARD_MAGIC_V1);
@@ -515,13 +510,20 @@ async fn internal_connection(
         let handler = hyper::service::service_fn(move |request| {
             let service = service.clone();
             let cluster = cluster.clone();
-            async move { Ok::<_, std::convert::Infallible>(control(request, service, cluster).await) }
+            async move {
+                Ok::<_, std::convert::Infallible>(control(request, peer, service, cluster).await)
+            }
         });
-        let _ = hyper::server::conn::http1::Builder::new()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(Duration::from_secs(30))
-            .serve_connection(TokioIo::new(io), handler)
-            .await;
+        // Route checks are short; the connection keeps its slot while it lasts.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(60),
+            hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(10))
+                .serve_connection(TokioIo::new(io), handler),
+        )
+        .await;
+        drop(permit);
         return Ok(());
     }
     let line = std::str::from_utf8(&buffer[FORWARD_MAGIC.len()..line_end])?;
@@ -544,6 +546,7 @@ async fn internal_connection(
                     &[tunnel, route, visitor],
                 )
                 .with_context(|| format!("a forward from {peer}"))?;
+            cluster.check_sender(sender, peer)?;
             (*tunnel, *visitor)
         }
         [token, tunnel, _route, visitor] if v1 => {
@@ -554,6 +557,7 @@ async fn internal_connection(
         }
         _ => bail!("malformed forward header"),
     };
+    drop(permit);
     let tunnel = tunnel.to_owned();
     let visitor: SocketAddr = visitor.parse().context("forwarded visitor address")?;
     let rest = buffer.split_off(line_end + 1);
@@ -568,6 +572,7 @@ async fn internal_connection(
 
 async fn control(
     request: Request<Incoming>,
+    peer: SocketAddr,
     service: Service,
     cluster: Arc<Cluster>,
 ) -> Response<Body> {
@@ -580,11 +585,14 @@ async fn control(
     let authorized = match signed.as_deref() {
         Some([sender, receiver, timestamp, nonce, proof]) => {
             let method = request.method().as_str();
-            match cluster.verify(
-                CONTROL_LABEL,
-                (sender, receiver, timestamp, nonce, proof),
-                &[method, &path],
-            ) {
+            match cluster
+                .verify(
+                    CONTROL_LABEL,
+                    (sender, receiver, timestamp, nonce, proof),
+                    &[method, &path],
+                )
+                .and_then(|()| cluster.check_sender(sender, peer))
+            {
                 Ok(()) => true,
                 Err(error) => {
                     debug!(error = %format!("{error:#}"), "a control request failed authentication");

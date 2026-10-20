@@ -24,6 +24,13 @@ impl Issuer {
             Self::Local(ca) => ca.sign(identifiers, csr),
         }
     }
+
+    /// Ends attempts in progress at shutdown, each after cleaning up (see [`Acme::stop`]).
+    pub fn stop(&self) {
+        if let Self::Acme(acme) = self {
+            acme.stop();
+        }
+    }
 }
 
 /// An insecure certificate authority whose key lives in the database. Never use it in production: anyone with

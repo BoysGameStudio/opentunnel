@@ -73,8 +73,6 @@ impl Shutdown {
 
 #[derive(Default)]
 pub struct Stats {
-    /// Public connections handed to the legacy Worker because nothing here served them.
-    pub legacy_forwarded: AtomicU64,
     pub tunnel_connections: AtomicU64,
     /// Visitors carried to the machine holding their bridge.
     pub forwarded_out: AtomicU64,

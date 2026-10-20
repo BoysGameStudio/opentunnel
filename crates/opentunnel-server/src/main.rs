@@ -80,7 +80,8 @@ async fn main() -> Result<()> {
             let export: ExportFile =
                 serde_json::from_str(&text).context("reading the export file")?;
             let store = Store::open(&database_url(&cli.config)?).await?;
-            let mut summary = migration::import(&store, &clock, export, force).await?;
+            let domain = cli.config.domain.to_ascii_lowercase();
+            let mut summary = migration::import(&store, &clock, &domain, export, force).await?;
             summary.ids.clear();
             println!("{}", serde_json::to_string_pretty(&summary)?);
             eprintln!(

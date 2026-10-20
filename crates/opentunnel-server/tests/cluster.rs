@@ -1,7 +1,7 @@
 //! Several servers on one database, as machines in several regions, linked by the mesh: visitors reach a bridge
 //! attached to another machine as soon as it attached, detaches, deletes and route conflicts cross machines, a
 //! machine that crashes, freezes, restarts or is cut off is handled, changes reach other machines' caches at
-//! once, a deploy from the previous version keeps forwarding, and background jobs run once.
+//! once, requests between machines prove the secret, and background jobs run once.
 
 mod common;
 
@@ -15,9 +15,9 @@ use opentunnel_server::clock::iso;
 use opentunnel_server::crypto::hash_token;
 use opentunnel_server::issuer::Issuer;
 use opentunnel_server::service::Route;
-use opentunnel_server::store::{BridgeLocation, Job, JobKind};
+use opentunnel_server::store::{Job, JobKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 /// Fast pings, so a silent peer is down after a second.
 const FAST: &[&str] = &["--mesh-ping-ms=200", "--mesh-dead-ms=1000"];
@@ -314,10 +314,14 @@ async fn a_restarted_machine_replaces_its_old_entries() {
     })
     .await;
     let old_epoch = a.mesh().epoch;
+    let address = a.internal();
     a.freeze();
     drop(tunnel);
 
-    let restarted = machine_with(dir.path(), "machine-a", "iad", &[])
+    // A restarted machine keeps its address (on Fly, its 6PN address): a link from another address claiming
+    // its ID would be refused while the old link lasts.
+    let listen = format!("--internal-listen={address}");
+    let restarted = machine_with(dir.path(), "machine-a", "iad", &[&listen])
         .await
         .unwrap();
     assert_ne!(restarted.mesh().epoch, old_epoch);
@@ -482,15 +486,50 @@ async fn runs_each_job_once_across_machines() {
         .map(|index| format!("job{index:02}.opentunnel.test"))
         .collect();
     let now = a.service().now();
+    // Tunnels waiting for these certificates (the runner orders only a tunnel's own names, and only while it
+    // still wants them).
+    let records: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            let id = name.split('.').next().unwrap();
+            serde_json::json!({ "record": {
+                "version": 1, "id": id, "hostname": name, "tokenHash": hash_token("token"),
+                "state": "offline", "createdAt": "2026-10-09T00:00:00.000Z",
+                "certificateID": format!("cert_{name}"),
+                "certificate": { "id": format!("cert_{name}"), "state": { "type": "issuing" } },
+                "certificateIdentifiers": [name],
+                "certificateCsr": csr(name),
+            }})
+        })
+        .collect();
+    let imported: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/api/admin/import", a.api))
+        .bearer_auth("admin-secret")
+        .json(&serde_json::json!({ "version": 1, "records": records }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(imported["inserted"], 30, "{imported}");
     for name in &names {
+        let csr = store
+            .tunnel(name.split('.').next().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .record
+            .certificate_csr
+            .unwrap();
         store
             .add_job(
                 Job {
                     certificate_id: format!("cert_{name}"),
-                    tunnel_id: None,
+                    tunnel_id: Some(name.split('.').next().unwrap().to_owned()),
                     kind: JobKind::Issue,
                     identifiers: vec![name.clone()],
-                    csr: csr(name),
+                    csr,
                     attempts: 0,
                     created_at: now,
                 },
@@ -611,90 +650,6 @@ async fn changes_reach_other_machines_caches_at_once() {
     b.stop().await;
 }
 
-/// A machine of the previous version, as far as a new one can tell: it answers the mesh greeting with an HTTP
-/// error (its internal listener hands anything but a forward to its HTTP control API) and passes forwarded
-/// visitors on to `target`, a server that holds the bridge outside the mesh.
-async fn previous_version(target: String) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let target = target.clone();
-            tokio::spawn(async move {
-                let mut first = [0u8; 18];
-                if stream.read_exact(&mut first).await.is_err() {
-                    return;
-                }
-                if first.starts_with(b"OPENTUNNEL-FORWARD") {
-                    let Ok(mut upstream) = TcpStream::connect(&target).await else {
-                        return;
-                    };
-                    let _ = upstream.write_all(&first).await;
-                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
-                } else {
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                        .await;
-                }
-            });
-        }
-    });
-    address
-}
-
-/// During a deploy from the previous version, which keeps its bridges in the `bridges` table and not in the
-/// mesh, a new machine still forwards visitors to the old machines' bridges.
-#[tokio::test(flavor = "multi_thread")]
-async fn forwards_to_machines_of_the_previous_version() {
-    let dir = tempfile::tempdir().unwrap();
-    let Some(old) = machine(dir.path(), "machine-old", "iad").await else {
-        return;
-    };
-    // The old machine is outside the mesh: it never links.
-    old.mesh().halt(false);
-    let on_old = client(&old, &dir.path().join("client"));
-    let identity = on_old.create("default", |_| {}).await.unwrap();
-    let api = app("on the old machine").await;
-    let tunnel = on_old.connect("default", routes(&[("api", &api)])).unwrap();
-    connected(&tunnel).await;
-    let front = previous_version(old.internal()).await;
-    // Its registry row, as the previous version writes it.
-    old.service()
-        .store
-        .put_bridge(
-            &BridgeLocation {
-                tunnel_id: identity.id.clone(),
-                route: String::new(),
-                machine_id: "machine-old".into(),
-                bridge_id: 1,
-                region: "iad".into(),
-                address: front.clone(),
-                updated_at: old.service().now(),
-            },
-            &["api".into()],
-        )
-        .await
-        .unwrap();
-
-    let new = machine(dir.path(), "machine-new", "syd").await.unwrap();
-    let sni = format!("api.{}", identity.hostname);
-    // Until the new machine has met the old one, it does not look there.
-    assert!(new.visit(&sni, "/").await.is_err());
-    new.mesh().add_peer(&front);
-    within(
-        "the old machine to be recognised",
-        Duration::from_secs(3),
-        || async { new.mesh().legacy_present() },
-    )
-    .await;
-    assert_eq!(stats(&new).await["cluster"]["peers"]["legacy"], 1);
-    assert_eq!(stats(&new).await["cluster"]["complete"], false);
-    let response = new.visit(&sni, "/").await.unwrap();
-    assert!(response.ends_with("on the old machine"), "{response}");
-    drop(tunnel);
-    new.stop().await;
-}
-
 /// Requests between machines prove the shared secret without carrying it: a signed control request is answered
 /// once, and not when replayed, stale, for another machine or signed with another secret. TEMPORARY: the previous
 /// version's bearer secret and forward header are accepted only while `MESH_ACCEPT_V1` is on.
@@ -705,20 +660,26 @@ async fn internal_requests_prove_the_secret_without_sending_it() {
     let Some(a) = machine(dir.path(), "machine-a", "iad").await else {
         return;
     };
+    // Signed requests count only from a linked machine, at its address (here loopback, like the test client).
+    let b = machine(dir.path(), "machine-b", "syd").await.unwrap();
+    link(&[&a, &b]).await;
     let path = "/internal/tunnel/abcdefghijkl/routes";
     let url = format!("http://{}{path}", a.internal());
-    let signed = |secret: &str, receiver: &str, timestamp: u64, nonce: &str| {
+    let signed_by = |sender: &str, secret: &str, receiver: &str, timestamp: u64, nonce: &str| {
         let timestamp = timestamp.to_string();
         let proof = Secret::new(secret).sign(&[
             "opentunnel control/2",
-            "machine-x",
+            sender,
             receiver,
             &timestamp,
             nonce,
             "GET",
             path,
         ]);
-        format!("machine-x {receiver} {timestamp} {nonce} {proof}")
+        format!("{sender} {receiver} {timestamp} {nonce} {proof}")
+    };
+    let signed = |secret: &str, receiver: &str, timestamp: u64, nonce: &str| {
+        signed_by("machine-b", secret, receiver, timestamp, nonce)
     };
     let get = |auth: Option<(&'static str, String)>| {
         let url = url.clone();
@@ -788,6 +749,7 @@ async fn internal_requests_prove_the_secret_without_sending_it() {
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut answer)).await;
     assert!(answer.is_empty());
     a.stop().await;
+    b.stop().await;
 
     let strict = machine_with(
         dir.path(),
@@ -807,4 +769,34 @@ async fn internal_requests_prove_the_secret_without_sending_it() {
         .status();
     assert_eq!(status, 401);
     strict.stop().await;
+}
+
+/// A deletion another machine announces closes bridges only when the database says the tunnel is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn ignores_deletions_the_database_does_not_confirm() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(a) = machine(dir.path(), "machine-a", "iad").await else {
+        return;
+    };
+    let b = machine(dir.path(), "machine-b", "syd").await.unwrap();
+    link(&[&a, &b]).await;
+    let on_b = client(&b, &dir.path().join("client"));
+    let identity = on_b.create("default", |_| {}).await.unwrap();
+    let api = app("still here").await;
+    let tunnel = on_b.connect("default", routes(&[("api", &api)])).unwrap();
+    connected(&tunnel).await;
+    a.mesh()
+        .publish(opentunnel_server::mesh::Event::TunnelDeleted {
+            tunnel: identity.id.clone(),
+        });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(tunnel.status().state, State::Connected);
+    let response = a
+        .visit(&format!("api.{}", identity.hostname), "/")
+        .await
+        .unwrap();
+    assert!(response.ends_with("still here"), "{response}");
+    drop(tunnel);
+    a.stop().await;
+    b.stop().await;
 }

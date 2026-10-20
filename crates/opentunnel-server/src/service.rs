@@ -82,8 +82,6 @@ pub struct Inner {
     pub alarms: Arc<Notify>,
     tunnels: Mutex<HashMap<String, Arc<Entry>>>,
     next_bridge: AtomicU64,
-    /// TEMPORARY (migration): imports tunnels this server has not seen from the Worker.
-    pull_through: std::sync::OnceLock<crate::migration::SharedPullThrough>,
     /// The other machines, when this is one of many.
     cluster: std::sync::OnceLock<Arc<Cluster>>,
     /// Limits on creating tunnels and issuing certificates; none when unset (tests).
@@ -441,7 +439,6 @@ impl Service {
             alarms: Arc::new(Notify::new()),
             tunnels: Mutex::new(HashMap::new()),
             next_bridge: AtomicU64::new(1),
-            pull_through: std::sync::OnceLock::new(),
             cluster: std::sync::OnceLock::new(),
             limits: std::sync::OnceLock::new(),
             refresh_failed_at: AtomicU64::new(0),
@@ -498,10 +495,6 @@ impl Service {
         self.limits.get()
     }
 
-    pub fn set_pull_through(&self, pull: crate::migration::SharedPullThrough) {
-        let _ = self.pull_through.set(pull);
-    }
-
     pub fn now(&self) -> u64 {
         self.clock.now_ms()
     }
@@ -526,13 +519,7 @@ impl Service {
     ) -> Result<tokio::sync::MutexGuard<'a, EntryState>> {
         let mut state = entry.state.lock().await;
         if !state.loaded {
-            let mut loaded = self.store.tunnel_with_alarm(&entry.id).await?;
-            if loaded.is_none()
-                && let Some(pull) = self.pull_through.get()
-                && pull.fetch(&entry.id).await
-            {
-                loaded = self.store.tunnel_with_alarm(&entry.id).await?;
-            }
+            let loaded = self.store.tunnel_with_alarm(&entry.id).await?;
             let now = self.now();
             (state.record, state.revision, state.alarm) = match loaded {
                 Some(loaded) => (
@@ -660,12 +647,6 @@ impl Service {
                         alarm: Some(snapshot.alarm),
                     },
                 ))
-            }
-            // Missing: the pull-through import (migration) may still find it.
-            Ok(None) if self.pull_through.get().is_some() => {
-                state.loaded = false;
-                drop(state);
-                Ok((self.lock(entry).await?, unread))
             }
             Ok(None) => {
                 state.record = None;
@@ -2004,10 +1985,9 @@ mod tests {
         /// One of many machines sharing the database.
         async fn clustered() -> Option<Self> {
             let harness = Self::new().await?;
-            harness.service.set_cluster(Arc::new(test_cluster(
-                &harness.service.store,
-                harness.service.clock.clone(),
-            )));
+            harness
+                .service
+                .set_cluster(Arc::new(test_cluster(harness.service.clock.clone())));
             Some(harness)
         }
 
@@ -2103,12 +2083,11 @@ mod tests {
         }
     }
 
-    fn test_cluster(store: &Store, clock: Clock) -> Cluster {
+    fn test_cluster(clock: Clock) -> Cluster {
         Cluster::new(
             "machine-a".into(),
             "nrt".into(),
             "secret".into(),
-            store.clone(),
             clock,
             Arc::new(crate::http::Stats::default()),
             crate::mesh::MeshConfig::default(),
@@ -2861,7 +2840,7 @@ mod tests {
             clock.clone(),
             analytics,
         );
-        service.set_cluster(Arc::new(test_cluster(&store, clock)));
+        service.set_cluster(Arc::new(test_cluster(clock)));
         let harness = Harness {
             service,
             now: Arc::new(AtomicU64::new(T0)),

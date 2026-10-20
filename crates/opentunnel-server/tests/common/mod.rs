@@ -148,6 +148,7 @@ impl TestServer {
             cluster.shutdown().await;
         }
         self.server.app.service.drain().await;
+        self.server.jobs.stop();
         self.server.jobs.release().await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         if let Some(cluster) = &self.server.cluster {

@@ -58,7 +58,15 @@ const ACCEPT_LABEL: &str = "opentunnel mesh/2 accept";
 const DIAL_LABEL: &str = "opentunnel mesh/2 dial";
 /// The frame format's version, in `hello`. Unknown frame types and fields are ignored, so additions need no bump.
 pub const VERSION: u32 = 1;
-const MAX_FRAME: usize = 256 << 20;
+/// The largest frame from a linked peer. Snapshots larger than `SNAPSHOT_CHUNK` go out in several frames.
+const MAX_FRAME: usize = 16 << 20;
+/// The largest `hello`, the first frame after the handshake.
+const MAX_HELLO: usize = 4 << 10;
+/// Snapshot entries per frame, by encoded size (`MeshConfig::snapshot_chunk`).
+const SNAPSHOT_CHUNK: usize = 4 << 20;
+/// How far ahead of this machine's clock a peer's `attached_at` may be; later ones are taken as now, so a peer
+/// cannot claim routes forever with a time far in the future.
+const MAX_CLOCK_AHEAD_MS: u64 = 5_000;
 /// Frames queued for a link; a peer that falls this far behind is disconnected and gets a fresh snapshot.
 const LINK_QUEUE: usize = 200_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -69,9 +77,9 @@ const FIRST_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// How long the higher address of a pair waits before dialing too, so usually only one link is made.
 const HIGHER_DIAL_DELAY: Duration = Duration::from_secs(2);
-/// A machine of the previous version is greeted again this often, and counted as present this long after.
+/// A machine that answers the greeting with HTTP (a version that does not speak this handshake) is greeted again
+/// this often.
 const LEGACY_RETRY: Duration = Duration::from_secs(15);
-const LEGACY_TTL: Duration = Duration::from_secs(60);
 /// An address that left the DNS answer is dialed for this long more.
 const FORGET_AFTER: Duration = Duration::from_secs(30);
 /// Writes are gathered up to this size before a flush.
@@ -88,6 +96,13 @@ pub struct MeshConfig {
     pub dead: Duration,
     /// TEMPORARY: accept links from machines that send the secret itself (`OPENTUNNEL-MESH/1`).
     pub accept_v1: bool,
+    /// The name of a machine's own address (`{}` is its ID), e.g. `{}.vm.<app>.internal` on Fly: a peer's
+    /// `hello` address must be among its answers. A name that does not resolve is not held against the peer.
+    pub machine_dns: Option<String>,
+    /// A peer's `hello` address must be the address its connection comes from (or was dialed at).
+    pub verify_address: bool,
+    /// Snapshot entries per frame, by encoded size.
+    pub snapshot_chunk: usize,
 }
 
 impl Default for MeshConfig {
@@ -99,6 +114,9 @@ impl Default for MeshConfig {
             ping: Duration::from_secs(1),
             dead: Duration::from_secs(5),
             accept_v1: true,
+            machine_dns: None,
+            verify_address: true,
+            snapshot_chunk: SNAPSHOT_CHUNK,
         }
     }
 }
@@ -157,6 +175,14 @@ enum Frame {
         seq: u64,
         sent_at: u64,
         entries: Vec<Entry>,
+        /// More entries follow in `snapshot_part` frames.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        more: bool,
+    },
+    SnapshotPart {
+        entries: Vec<Entry>,
+        #[serde(default)]
+        more: bool,
     },
     Attached {
         seq: u64,
@@ -240,6 +266,8 @@ struct Peer {
     entries: HashMap<u64, Entry>,
     /// TEMPORARY: linked with `OPENTUNNEL-MESH/1`, so it takes forwards and control requests in that format.
     v1: bool,
+    /// A snapshot in several frames is arriving.
+    snapshot_open: bool,
 }
 
 #[derive(Default)]
@@ -311,7 +339,6 @@ struct Address {
     current: bool,
     is_static: bool,
     seen: Instant,
-    legacy_at: Option<Instant>,
 }
 
 pub struct Mesh {
@@ -338,6 +365,8 @@ pub struct Mesh {
     held: Mutex<Vec<Box<dyn Any + Send>>>,
     /// Test hook: machines this one refuses to link with.
     partitioned: Mutex<HashSet<String>>,
+    /// Test hook: the address `hello` gives instead of the real one.
+    advertised: Mutex<Option<String>>,
 }
 
 fn encode(frame: &Frame) -> Bytes {
@@ -352,12 +381,13 @@ async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     buffer: &mut Vec<u8>,
     wait: Duration,
+    max: usize,
 ) -> Result<Frame> {
     let length = tokio::time::timeout(wait, reader.read_u32())
         .await
         .map_err(|_| anyhow!("no frame for {wait:?}"))?
         .context("reading a frame")? as usize;
-    if length > MAX_FRAME {
+    if length > max {
         bail!("a frame of {length} bytes");
     }
     buffer.resize(length, 0);
@@ -366,6 +396,15 @@ async fn read_frame<R: AsyncRead + Unpin>(
         .map_err(|_| anyhow!("a frame body took over {FRAME_BODY_TIMEOUT:?}"))?
         .context("reading a frame")?;
     serde_json::from_slice(buffer).context("decoding a frame")
+}
+
+/// A peer's time, or `now` when it is further ahead than clocks drift.
+fn sane_time(at: u64, now: u64) -> u64 {
+    if at > now + MAX_CLOCK_AHEAD_MS {
+        now
+    } else {
+        at
+    }
 }
 
 /// A machine ID as it may appear in a handshake line.
@@ -396,6 +435,16 @@ async fn read_line<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<St
     Ok(std::str::from_utf8(line)
         .context("a greeting that is not text")?
         .to_owned())
+}
+
+/// What the handshake established about the other side.
+struct Proven {
+    /// The machine that proved itself, when the handshake names one.
+    machine: Option<String>,
+    /// Where the connection comes from, or was dialed.
+    remote: std::net::IpAddr,
+    /// TEMPORARY: the previous version's handshake.
+    v1: bool,
 }
 
 fn random_u64() -> u64 {
@@ -436,12 +485,19 @@ impl Mesh {
             silent: AtomicBool::new(false),
             held: Mutex::new(Vec::new()),
             partitioned: Mutex::new(HashSet::new()),
+            advertised: Mutex::new(None),
         });
         (mesh, receiver)
     }
 
     pub fn set_address(&self, address: String) {
         let _ = self.address.set(address);
+    }
+
+    /// Test hook: advertises `address` instead of the one set, for a peer that lies about where it is.
+    #[doc(hidden)]
+    pub fn set_address_for_tests(&self, address: &str) {
+        *self.advertised.lock().expect("advertised lock") = Some(address.to_owned());
     }
 
     pub fn address(&self) -> &str {
@@ -461,7 +517,12 @@ impl Mesh {
             version: VERSION,
             machine_id: self.machine_id.clone(),
             region: self.region.clone(),
-            address: self.address().to_owned(),
+            address: self
+                .advertised
+                .lock()
+                .expect("advertised lock")
+                .clone()
+                .unwrap_or_else(|| self.address().to_owned()),
             epoch: self.epoch,
             started_at: self.started_at,
             draining: self.draining.load(Ordering::SeqCst),
@@ -543,13 +604,36 @@ impl Mesh {
         let link = self.next_link.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(LINK_QUEUE);
         let mut local = self.local.lock().expect("mesh local lock");
-        let snapshot = encode(&Frame::Snapshot {
-            epoch: self.epoch,
-            seq: local.seq,
-            sent_at: self.now(),
-            entries: local.entries.values().cloned().collect(),
-        });
-        let _ = tx.try_send(snapshot);
+        // In frames of at most `SNAPSHOT_CHUNK` bytes of entries, all queued before anything announced later.
+        let mut chunks: Vec<Vec<Entry>> = vec![Vec::new()];
+        let mut size = 0;
+        for entry in local.entries.values() {
+            let length = serde_json::to_vec(entry).map_or(0, |json| json.len());
+            if size + length > self.config.snapshot_chunk
+                && !chunks.last().expect("a chunk").is_empty()
+            {
+                chunks.push(Vec::new());
+                size = 0;
+            }
+            size += length;
+            chunks.last_mut().expect("a chunk").push(entry.clone());
+        }
+        let count = chunks.len();
+        for (index, entries) in chunks.into_iter().enumerate() {
+            let more = index + 1 < count;
+            let frame = if index == 0 {
+                Frame::Snapshot {
+                    epoch: self.epoch,
+                    seq: local.seq,
+                    sent_at: self.now(),
+                    entries,
+                    more,
+                }
+            } else {
+                Frame::SnapshotPart { entries, more }
+            };
+            let _ = tx.try_send(encode(&frame));
+        }
         local.links.insert(link, Subscriber { tx, cancel });
         (link, rx)
     }
@@ -625,6 +709,16 @@ impl Mesh {
             .is_some_and(|peer| peer.v1)
     }
 
+    /// The internal address of a linked machine, as its `hello` gave it (and the link checked).
+    pub fn peer_address(&self, machine_id: &str) -> Option<String> {
+        self.remote
+            .lock()
+            .expect("mesh remote lock")
+            .peers
+            .get(machine_id)
+            .map(|peer| peer.hello.address.clone())
+    }
+
     /// Whether a machine of this ID is linked now.
     pub fn is_up(&self, machine_id: &str) -> bool {
         self.remote
@@ -655,20 +749,6 @@ impl Mesh {
             .map(|(address, _)| *address)
             .collect();
         current.into_iter().all(|address| self.linked(address))
-    }
-
-    /// Whether a machine of the previous version answered recently. TEMPORARY: for deploys from it.
-    pub fn legacy_present(&self) -> bool {
-        self.addresses
-            .lock()
-            .expect("mesh addresses lock")
-            .values()
-            .any(|address| {
-                address.current
-                    && address
-                        .legacy_at
-                        .is_some_and(|at| at.elapsed() < LEGACY_TTL)
-            })
     }
 
     /// The machine IDs linked now.
@@ -792,7 +872,15 @@ impl Mesh {
 
     /// Takes a link another machine dialed, after the start of its greeting line (`<machine> <nonce>`, after
     /// [`MESH_MAGIC`]). `stream` continues after that line.
-    pub async fn accept<S>(self: &Arc<Self>, stream: S, greeting: &str) -> Result<()>
+    /// `remote` is where the connection comes from. `permit` (a slot for connections not yet authenticated) is
+    /// released once the peer proved itself.
+    pub async fn accept<S>(
+        self: &Arc<Self>,
+        stream: S,
+        greeting: &str,
+        remote: SocketAddr,
+        permit: impl Send,
+    ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -827,18 +915,25 @@ impl Mesh {
         if !self.secret.verify(&expected, &answer) {
             bail!("a mesh peer failed the challenge");
         }
-        self.link(
-            tokio::io::join(reader, write),
-            false,
-            Some(dialer.to_owned()),
-            false,
-        )
-        .await
+        drop(permit);
+        let proven = Proven {
+            machine: Some(dialer.to_owned()),
+            remote: remote.ip(),
+            v1: false,
+        };
+        self.link(tokio::io::join(reader, write), false, proven)
+            .await
     }
 
     /// TEMPORARY: takes a link from a machine of the previous version, which greeted with the secret itself.
     /// It is answered with the line it sent, as that version expects, only when the secret is right.
-    pub async fn accept_v1<S>(self: &Arc<Self>, stream: S, token: &str) -> Result<()>
+    pub async fn accept_v1<S>(
+        self: &Arc<Self>,
+        stream: S,
+        token: &str,
+        remote: SocketAddr,
+        permit: impl Send,
+    ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -848,6 +943,7 @@ impl Mesh {
         if !self.secret.matches(token) {
             bail!("mesh link with a bad token");
         }
+        drop(permit);
         let (read, mut write) = tokio::io::split(stream);
         let mut line = MESH_MAGIC_V1.to_vec();
         line.extend_from_slice(token.as_bytes());
@@ -855,8 +951,12 @@ impl Mesh {
         tokio::time::timeout(HANDSHAKE_TIMEOUT, write.write_all(&line))
             .await
             .map_err(|_| anyhow!("the handshake timed out"))??;
-        self.link(tokio::io::join(read, write), false, None, true)
-            .await
+        let proven = Proven {
+            machine: None,
+            remote: remote.ip(),
+            v1: true,
+        };
+        self.link(tokio::io::join(read, write), false, proven).await
     }
 
     async fn dial(self: &Arc<Self>, address: SocketAddr) -> Result<(), DialError> {
@@ -906,20 +1006,53 @@ impl Mesh {
         }
         let answer = format!("{}\n", self.secret.sign(&parts(DIAL_LABEL)));
         write.write_all(answer.as_bytes()).await?;
-        let acceptor = acceptor.to_owned();
+        let proven = Proven {
+            machine: Some(acceptor.to_owned()),
+            remote: address.ip(),
+            v1: false,
+        };
         let stream = tokio::io::join(reader, write);
-        Ok(self.link(stream, true, Some(acceptor), false).await?)
+        Ok(self.link(stream, true, proven).await?)
     }
 
-    /// Runs a link after the handshake until it ends. `machine` is the machine that proved itself, if the
-    /// handshake named one; `v1` a link of the previous version.
-    async fn link<S>(
-        self: &Arc<Self>,
-        stream: S,
-        dialed: bool,
-        machine: Option<String>,
-        v1: bool,
-    ) -> Result<()>
+    /// Checks that a peer's `hello` address, where forwards to its bridges go, is its own: the address its
+    /// connection comes from or was dialed at, and (on Fly) its machine's own name resolves to it.
+    async fn check_address(&self, hello: &Hello, remote: std::net::IpAddr) -> Result<()> {
+        let address: SocketAddr = hello
+            .address
+            .parse()
+            .with_context(|| format!("the peer's address {:?}", hello.address))?;
+        let canonical = crate::limits::canonical;
+        if self.config.verify_address && canonical(address.ip()) != canonical(remote) {
+            bail!("the peer says it is at {address} but connects from {remote}");
+        }
+        if let Some(template) = &self.config.machine_dns {
+            let name = template.replace("{}", &hello.machine_id);
+            match tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                tokio::net::lookup_host((name.as_str(), address.port())),
+            )
+            .await
+            {
+                Ok(Ok(found)) => {
+                    let found: Vec<SocketAddr> = found.collect();
+                    if !found.is_empty()
+                        && !found
+                            .iter()
+                            .any(|candidate| canonical(candidate.ip()) == canonical(address.ip()))
+                    {
+                        bail!("{name} does not resolve to the peer's address {address}");
+                    }
+                }
+                Ok(Err(error)) => debug!(name, %error, "could not resolve a peer's machine name"),
+                Err(_) => debug!(name, "resolving a peer's machine name timed out"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs a link after the handshake until it ends.
+    async fn link<S>(self: &Arc<Self>, stream: S, dialed: bool, proven: Proven) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -933,7 +1066,7 @@ impl Mesh {
             .run_link(
                 &mut reader,
                 &mut writer,
-                (dialed, machine, v1),
+                (dialed, proven),
                 link,
                 queue,
                 &cancel,
@@ -954,7 +1087,7 @@ impl Mesh {
         self: &Arc<Self>,
         reader: &mut R,
         writer: &mut W,
-        (dialed, machine, v1): (bool, Option<String>, bool),
+        (dialed, proven): (bool, Proven),
         link: u64,
         mut queue: mpsc::Receiver<Bytes>,
         cancel: &CancellationToken,
@@ -969,7 +1102,7 @@ impl Mesh {
                 .write_all(&encode(&Frame::Hello(self.hello())))
                 .await?;
             writer.flush().await?;
-            match read_frame(reader, &mut buffer, HANDSHAKE_TIMEOUT).await? {
+            match read_frame(reader, &mut buffer, HANDSHAKE_TIMEOUT, MAX_HELLO).await? {
                 Frame::Hello(hello) => Ok(hello),
                 _ => bail!("the peer did not say hello"),
             }
@@ -979,9 +1112,15 @@ impl Mesh {
         if peer.machine_id == self.machine_id {
             bail!("linked to itself");
         }
-        if machine.is_some_and(|machine| machine != peer.machine_id) {
+        if proven
+            .machine
+            .as_ref()
+            .is_some_and(|machine| *machine != peer.machine_id)
+        {
             bail!("the peer said hello as another machine than it proved to be");
         }
+        self.check_address(&peer, proven.remote).await?;
+        let v1 = proven.v1;
         let dialer = if dialed {
             self.address().to_owned()
         } else {
@@ -1010,7 +1149,7 @@ impl Mesh {
         buffer: &mut Vec<u8>,
     ) -> Result<()> {
         loop {
-            let frame = read_frame(reader, buffer, self.config.dead).await?;
+            let frame = read_frame(reader, buffer, self.config.dead, MAX_FRAME).await?;
             self.apply(machine, link, frame)?;
         }
     }
@@ -1070,6 +1209,11 @@ impl Mesh {
         let mut remote = self.remote.lock().expect("mesh remote lock");
         let mut entries = HashMap::new();
         if let Some(existing) = remote.peers.get(&machine) {
+            // Another address claiming a linked machine's ID does not take its place.
+            if existing.hello.address != hello.address {
+                warn!(peer = %machine, address = %hello.address, linked = %existing.hello.address, "refused a second link for a machine at another address");
+                return false;
+            }
             let life = (hello.started_at, hello.epoch);
             let known = (existing.hello.started_at, existing.hello.epoch);
             let wins = if life != known {
@@ -1103,6 +1247,7 @@ impl Mesh {
                 seq: 0,
                 entries,
                 v1,
+                snapshot_open: false,
             },
         );
         drop(remote);
@@ -1151,6 +1296,7 @@ impl Mesh {
                 seq,
                 sent_at,
                 entries,
+                more,
             } => {
                 if epoch != peer.hello.epoch {
                     bail!("a snapshot of another epoch");
@@ -1160,9 +1306,11 @@ impl Mesh {
                 }
                 peer.entries.clear();
                 peer.seq = seq;
+                peer.snapshot_open = more;
                 let count = entries.len();
                 if !peer.hello.draining {
-                    for entry in entries {
+                    for mut entry in entries {
+                        entry.attached_at = sane_time(entry.attached_at, now);
                         Remote::index_add(index, machine, &entry);
                         peer.entries.insert(entry.bridge, entry);
                     }
@@ -1170,11 +1318,28 @@ impl Mesh {
                 debug!(peer = %machine, bridges = count, "mesh snapshot applied");
                 crate::metrics::mesh_snapshot(count, now.saturating_sub(sent_at));
             }
+            Frame::SnapshotPart { entries, more } => {
+                if !peer.snapshot_open {
+                    bail!("a snapshot part without a snapshot");
+                }
+                peer.snapshot_open = more;
+                if !peer.hello.draining {
+                    for mut entry in entries {
+                        entry.attached_at = sane_time(entry.attached_at, now);
+                        Remote::index_add(index, machine, &entry);
+                        peer.entries.insert(entry.bridge, entry);
+                    }
+                }
+            }
             Frame::Attached {
                 seq,
                 sent_at,
-                entry,
+                mut entry,
             } => {
+                entry.attached_at = sane_time(entry.attached_at, now);
+                if peer.snapshot_open {
+                    bail!("a change inside a snapshot");
+                }
                 if seq != peer.seq + 1 {
                     bail!("sequence {seq} after {}", peer.seq);
                 }
@@ -1293,7 +1458,6 @@ impl Mesh {
                         current: true,
                         is_static,
                         seen: Instant::now(),
-                        legacy_at: None,
                     }
                 });
                 known.current = true;
@@ -1315,11 +1479,6 @@ impl Mesh {
             .get_mut(&address)
         {
             known.state = state;
-            if state == AddressState::Legacy {
-                known.legacy_at = Some(Instant::now());
-            } else if state == AddressState::Up {
-                known.legacy_at = None;
-            }
         }
     }
 
@@ -1457,5 +1616,34 @@ impl Mesh {
         {
             peer.cancel.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn frames_over_the_limit_are_refused_before_their_body_is_read() {
+        let mut buffer = Vec::new();
+        let mut huge: &[u8] = &[0x10, 0, 0, 0];
+        let error = read_frame(&mut huge, &mut buffer, Duration::from_secs(1), MAX_FRAME)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("a frame of"), "{error}");
+        assert!(buffer.capacity() < 1024);
+        // The first frame after the handshake, a hello, is held to a few KiB.
+        let mut hello: &[u8] = &[0, 0, 0x20, 0];
+        assert!(
+            read_frame(&mut hello, &mut buffer, Duration::from_secs(1), MAX_HELLO)
+                .await
+                .is_err()
+        );
+        assert_eq!(sane_time(5, 10), 5);
+        assert_eq!(
+            sane_time(10 + MAX_CLOCK_AHEAD_MS, 10),
+            10 + MAX_CLOCK_AHEAD_MS
+        );
+        assert_eq!(sane_time(u64::MAX, 10), 10);
     }
 }

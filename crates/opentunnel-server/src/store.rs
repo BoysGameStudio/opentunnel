@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::{
     MySqlConnectOptions, MySqlConnection, MySqlDatabaseError, MySqlPool, MySqlPoolOptions,
-    MySqlRow, MySqlSslMode,
+    MySqlSslMode,
 };
 use sqlx::{ConnectOptions, Connection, Executor, Row};
 use tracing::{info, warn};
@@ -236,50 +236,6 @@ pub struct ServerCertificate {
     pub certificate: Option<String>,
     pub chain: Option<String>,
     pub expiry: Option<String>,
-}
-
-/// A route a bridge serves on a machine of the previous version (a `bridges` row). TEMPORARY, see the schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BridgeLocation {
-    pub tunnel_id: String,
-    pub route: String,
-    pub machine_id: String,
-    pub bridge_id: u64,
-    pub region: String,
-    pub address: String,
-    pub updated_at: u64,
-}
-
-type BridgeRow = (String, String, String, i64, String, String, i64);
-
-/// A registry row from the columns starting at `at`: tunnel ID, route, machine, bridge ID, region, address, and
-/// time refreshed, all NULL when a join found none.
-fn bridge_at(row: &MySqlRow, at: usize) -> Result<Option<BridgeLocation>> {
-    let Some(tunnel_id) = row.try_get::<Option<String>, _>(at)? else {
-        return Ok(None);
-    };
-    Ok(Some(BridgeLocation {
-        tunnel_id,
-        route: row.try_get(at + 1)?,
-        machine_id: row.try_get(at + 2)?,
-        bridge_id: row.try_get::<i64, _>(at + 3)? as u64,
-        region: row.try_get(at + 4)?,
-        address: row.try_get(at + 5)?,
-        updated_at: row.try_get::<i64, _>(at + 6)? as u64,
-    }))
-}
-
-fn bridge_from_row(row: BridgeRow) -> BridgeLocation {
-    let (tunnel_id, route, machine_id, bridge_id, region, address, updated_at) = row;
-    BridgeLocation {
-        tunnel_id,
-        route,
-        machine_id,
-        bridge_id: bridge_id as u64,
-        region,
-        address,
-        updated_at: updated_at as u64,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1164,6 +1120,26 @@ impl Store {
         .await
     }
 
+    /// The names of every job some process is running now (an unexpired lease), whose challenge records are
+    /// in use.
+    pub async fn leased_job_identifiers(&self, now: u64) -> Result<Vec<String>> {
+        timed("leased_job_identifiers", async {
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT identifiers FROM jobs WHERE status = 'pending' AND lease_until >= ?",
+            )
+            .bind(now as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
+            Ok(rows
+                .iter()
+                .filter_map(|row| serde_json::from_str::<Vec<String>>(row).ok())
+                .flatten()
+                .collect())
+        })
+        .await
+    }
+
     /// Certificate jobs pending, cluster-wide, for the issuance backlog limit.
     pub async fn pending_jobs(&self) -> Result<u64> {
         timed("pending_jobs", async {
@@ -1620,6 +1596,22 @@ impl Store {
         .await
     }
 
+    /// Sets `key` to `value`, whatever it was.
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        timed("set_meta", async {
+            sqlx::query(
+                "INSERT INTO meta (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Sets `key` to `value` only if it is still `expected` (`None`: absent). Returns whether it did.
     pub async fn swap_meta(&self, key: &str, expected: Option<&str>, value: &str) -> Result<bool> {
         timed("swap_meta", async {
@@ -1645,84 +1637,6 @@ impl Store {
                 Err(error) if mysql_code(&error) == Some(ER_DUP_ENTRY) => Ok(false),
                 Err(error) => Err(db(error)),
             }
-        })
-        .await
-    }
-
-    // --- The previous version's bridge registry (TEMPORARY, see the schema) --------------------------------
-
-    /// Records that `machine_id` serves `routes` of a tunnel, as the previous version did. Only for tests of the
-    /// mixed-version fallback.
-    #[doc(hidden)]
-    pub async fn put_bridge(&self, location: &BridgeLocation, routes: &[String]) -> Result<()> {
-        if routes.is_empty() {
-            return Ok(());
-        }
-        timed("put_bridge", async {
-            let mut query = sqlx::QueryBuilder::new(
-                "INSERT INTO bridges (tunnel_id, route, machine_id, bridge_id, region, address, updated_at) ",
-            );
-            query.push_values(routes, |mut row, route| {
-                row.push_bind(&location.tunnel_id)
-                    .push_bind(route)
-                    .push_bind(&location.machine_id)
-                    .push_bind(location.bridge_id as i64)
-                    .push_bind(&location.region)
-                    .push_bind(&location.address)
-                    .push_bind(location.updated_at as i64);
-            });
-            query.push(
-                " ON DUPLICATE KEY UPDATE bridge_id = VALUES(bridge_id), region = VALUES(region),
-                   address = VALUES(address), updated_at = VALUES(updated_at)",
-            );
-            query.build().execute(&self.pool).await.map_err(db)?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Rows of the previous version's registry for a tunnel (one route, or all) refreshed since `since`, newest
-    /// first. TEMPORARY: only read during a deploy from that version.
-    pub async fn bridge_locations(
-        &self,
-        tunnel_id: &str,
-        route: Option<&str>,
-        since: u64,
-    ) -> Result<Vec<BridgeLocation>> {
-        timed("bridge_locations", async {
-            const COLUMNS: &str =
-                "SELECT tunnel_id, route, machine_id, bridge_id, region, address, updated_at FROM bridges";
-            let literals = (literal(tunnel_id), route.map(literal));
-            if let (Some(tunnel), None | Some(Some(_))) = &literals {
-                let route = match &literals.1 {
-                    Some(Some(route)) => format!(" AND route = {route}"),
-                    _ => String::new(),
-                };
-                let rows = self
-                    .pool
-                    .fetch_all(sqlx::AssertSqlSafe(format!(
-                        "{COLUMNS} WHERE tunnel_id = {tunnel}{route} AND updated_at >= {since}
-                         ORDER BY updated_at DESC"
-                    )))
-                    .await
-                    .map_err(db)?;
-                return rows
-                    .iter()
-                    .filter_map(|row| bridge_at(row, 0).transpose())
-                    .collect();
-            }
-            let rows: Vec<BridgeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-                "{COLUMNS} WHERE tunnel_id = ? AND (? IS NULL OR route = ?) AND updated_at >= ?
-                 ORDER BY updated_at DESC"
-            )))
-            .bind(tunnel_id)
-            .bind(route)
-            .bind(route)
-            .bind(since as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db)?;
-            Ok(rows.into_iter().map(bridge_from_row).collect())
         })
         .await
     }
@@ -1973,54 +1887,6 @@ mod tests {
         );
         let loaded = store.tunnel("pulledthrugh").await.unwrap().unwrap();
         assert_eq!(loaded.revision, 1);
-    }
-
-    #[tokio::test]
-    async fn the_previous_registry_is_read_for_mixed_version_deploys() {
-        let Some(store) = test_store().await else {
-            return;
-        };
-        let location = |machine: &str, bridge_id, updated_at| BridgeLocation {
-            tunnel_id: "abcdefghijkl".into(),
-            route: String::new(),
-            machine_id: machine.into(),
-            bridge_id,
-            region: "iad".into(),
-            address: "[fdaa::1]:9000".into(),
-            updated_at,
-        };
-        let routes = vec!["api".to_owned(), "@".to_owned()];
-        store
-            .put_bridge(&location("a", 1, 100), &routes)
-            .await
-            .unwrap();
-        store
-            .put_bridge(&location("b", 7, 150), &routes[..1])
-            .await
-            .unwrap();
-        let api = store
-            .bridge_locations("abcdefghijkl", Some("api"), 0)
-            .await
-            .unwrap();
-        assert_eq!(api.len(), 2);
-        assert_eq!(api[0].machine_id, "b");
-        assert_eq!(
-            store
-                .bridge_locations("abcdefghijkl", None, 120)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        // IDs that cannot be inlined as literals are bound instead.
-        assert_eq!(
-            store
-                .bridge_locations("abcdefghijkl", Some("x'"), 0)
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! `/api/admin/*` on this server, behind the `ADMIN_TOKEN` bearer secret (404 without it):
 //!
-//! - `POST /api/admin/import[?force=1]`: imports an export file (the cutover's path; see docs/cutover.md)
+//! - `POST /api/admin/import[?force=1]`: imports an export file (a restore), refusing any record the server could
+//!   not have written itself (`migration::check`)
 //! - `POST /api/admin/export`: every record, in the same format
 //! - `POST /api/admin/stats`: counts for checking a cutover, this machine's counters, and every machine's bridges
 
@@ -46,7 +47,15 @@ impl Admin for TokenAdmin {
                         }
                     };
                     let force = query.split('&').any(|pair| pair == "force=1");
-                    match migration::import(&service.store, &service.clock, file, force).await {
+                    match migration::import(
+                        &service.store,
+                        &service.clock,
+                        &service.domain.to_ascii_lowercase(),
+                        file,
+                        force,
+                    )
+                    .await
+                    {
                         Ok(summary) => {
                             for id in &summary.ids {
                                 service.invalidate(id).await;
@@ -71,8 +80,6 @@ impl Admin for TokenAdmin {
                         // This machine's counters (top level, as before, and under `machine`).
                         let stats = &app.stats;
                         counts["bridges_attached"] = service.bridge_count().into();
-                        counts["legacy_forwarded"] =
-                            stats.legacy_forwarded.load(Ordering::Relaxed).into();
                         counts["tunnel_connections"] =
                             stats.tunnel_connections.load(Ordering::Relaxed).into();
                         if let Some(cluster) = service.cluster() {
@@ -85,7 +92,6 @@ impl Admin for TokenAdmin {
                                 "forwarded_out": stats.forwarded_out.load(Ordering::Relaxed),
                                 "forwarded_in": stats.forwarded_in.load(Ordering::Relaxed),
                                 "forward_failures": stats.forward_failures.load(Ordering::Relaxed),
-                                "legacy_forwarded": stats.legacy_forwarded.load(Ordering::Relaxed),
                                 // Grows with open connections and bridges only; anything else is a leak.
                                 "tasks": tokio::runtime::Handle::current().metrics().num_alive_tasks(),
                                 // Open file descriptors: sockets, the database pool, and a few files.

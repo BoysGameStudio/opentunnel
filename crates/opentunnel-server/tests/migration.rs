@@ -1,306 +1,181 @@
-//! The temporary migration paths against a fake Worker: public connections for tunnels whose client is still
-//! on the Worker go to its `/api/relay`, and unknown tunnels are imported from its export endpoint on first use.
+//! Imports (`POST /api/admin/import`, a restore) take only records the server could have written itself, and
+//! the job runner orders certificates only for a tunnel's own names, whatever queued the job: a record or job
+//! naming the domain, its wildcard or another tunnel never reaches the CA.
 
 mod common;
 
-use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use bytes::Bytes;
 use common::TestServer;
-use futures_util::{SinkExt, StreamExt};
-use http_body_util::Full;
-use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
-use tokio_tungstenite::tungstenite::protocol::Role;
+use opentunnel_server::crypto::hash_token;
+use opentunnel_server::store::{Job, JobKind};
+use serde_json::{Value, json};
 
-const TOKEN: &str = "rly_pulled";
-
-fn client_hello(sni: &str) -> Vec<u8> {
-    let u16be = |n: usize| [(n >> 8) as u8, n as u8];
-    let name = sni.as_bytes();
-    let mut names = vec![0u8];
-    names.extend(u16be(name.len()));
-    names.extend(name);
-    let mut list = u16be(names.len()).to_vec();
-    list.extend(names);
-    let mut extensions = vec![0, 0];
-    extensions.extend(u16be(list.len()));
-    extensions.extend(list);
-    let mut hello = vec![3, 3];
-    hello.extend([0u8; 32]);
-    hello.extend([0, 0, 2, 0x13, 1, 1, 0]);
-    hello.extend(u16be(extensions.len()));
-    hello.extend(extensions);
-    let mut handshake = vec![1, 0];
-    handshake.extend(u16be(hello.len()));
-    handshake.extend(hello);
-    let mut record = vec![0x16, 3, 1];
-    record.extend(u16be(handshake.len()));
-    record.extend(handshake);
-    record
+fn csr(names: &[&str]) -> String {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, names[0]);
+    params.serialize_request(&key).unwrap().pem().unwrap()
 }
 
-#[derive(Default)]
-struct Worker {
-    relayed: Mutex<Vec<String>>,
-    exports: Mutex<Vec<String>>,
-}
-
-fn pulled_record() -> serde_json::Value {
-    serde_json::json!({
+fn record(id: &str, extra: Value) -> Value {
+    let mut record = json!({
         "version": 1,
-        "id": "pulledtunnel",
-        "hostname": "pulledtunnel.opentunnel.test",
-        "tokenHash": opentunnel_server::crypto::hash_token(TOKEN),
+        "id": id,
+        "hostname": format!("{id}.opentunnel.test"),
+        "tokenHash": hash_token("token"),
         "state": "offline",
-        "createdAt": "2026-10-09T00:00:00.000Z"
-    })
-}
-
-async fn fake_worker() -> (String, Arc<Worker>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let worker = Arc::new(Worker::default());
-    let state = worker.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let state = state.clone();
-            tokio::spawn(async move {
-                let service = hyper::service::service_fn(
-                    move |mut request: Request<hyper::body::Incoming>| {
-                        let state = state.clone();
-                        async move {
-                            let path = request.uri().path().to_owned();
-                            if path == "/api/relay" {
-                                assert!(
-                                    request
-                                        .uri()
-                                        .query()
-                                        .unwrap()
-                                        .contains("token=relay-secret")
-                                );
-                                let key =
-                                    request.headers()["sec-websocket-key"].as_bytes().to_owned();
-                                let upgrade = hyper::upgrade::on(&mut request);
-                                let state = state.clone();
-                                tokio::spawn(async move {
-                                    let upgraded = upgrade.await.unwrap();
-                                    let mut socket = WebSocketStream::from_raw_socket(
-                                        TokioIo::new(upgraded),
-                                        Role::Server,
-                                        None,
-                                    )
-                                    .await;
-                                    // The Worker parses the ClientHello, routes it, and answers.
-                                    let Some(Ok(Message::Binary(hello))) = socket.next().await
-                                    else {
-                                        return;
-                                    };
-                                    state
-                                        .relayed
-                                        .lock()
-                                        .unwrap()
-                                        .push(String::from_utf8_lossy(&hello).into_owned());
-                                    socket
-                                        .send(Message::Binary(Bytes::from(format!(
-                                            "relayed {} bytes",
-                                            hello.len()
-                                        ))))
-                                        .await
-                                        .unwrap();
-                                    socket
-                                        .send(Message::text(r#"{"type":"end"}"#))
-                                        .await
-                                        .unwrap();
-                                    let _ = socket.close(None).await;
-                                });
-                                let mut response = Response::new(Full::new(Bytes::new()));
-                                *response.status_mut() = hyper::StatusCode::SWITCHING_PROTOCOLS;
-                                let headers = response.headers_mut();
-                                headers.insert("upgrade", "websocket".parse().unwrap());
-                                headers.insert("connection", "Upgrade".parse().unwrap());
-                                headers.insert(
-                                    "sec-websocket-accept",
-                                    derive_accept_key(&key).parse().unwrap(),
-                                );
-                                return Ok::<_, Infallible>(response);
-                            }
-                            assert_eq!(path, "/api/admin/export");
-                            assert_eq!(request.headers()["authorization"], "Bearer export-secret");
-                            let body = http_body_util::BodyExt::collect(request.into_body())
-                                .await
-                                .unwrap()
-                                .to_bytes();
-                            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                            let name = body["names"][0].as_str().unwrap().to_owned();
-                            state.exports.lock().unwrap().push(name.clone());
-                            let record = (name == "pulledtunnel").then(pulled_record);
-                            let reply = serde_json::json!({
-                                "records": [{ "objectId": "hex", "name": name, "record": record, "alarm": null }]
-                            });
-                            let mut response =
-                                Response::new(Full::new(Bytes::from(reply.to_string())));
-                            response
-                                .headers_mut()
-                                .insert("content-type", "application/json".parse().unwrap());
-                            Ok(response)
-                        }
-                    },
-                );
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), service)
-                    .with_upgrades()
-                    .await;
-            });
-        }
+        "createdAt": "2026-10-09T00:00:00.000Z",
     });
-    (url, worker)
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn hands_connections_without_a_local_bridge_to_the_worker() {
-    relays_to_the_worker(&[], "stillonwrkr").await;
-}
-
-/// With other machines, the Worker gets what no machine has a bridge for.
-#[tokio::test(flavor = "multi_thread")]
-async fn hands_connections_no_machine_serves_to_the_worker() {
-    relays_to_the_worker(
-        &[
-            "--internal-listen=127.0.0.1:0",
-            "--internal-token=cluster-secret",
-            "--mesh-dns=off",
-        ],
-        "migratedhere",
-    )
-    .await;
-}
-
-async fn relays_to_the_worker(extra: &[&str], id: &str) {
-    let (url, worker) = fake_worker().await;
-    let dir = tempfile::tempdir().unwrap();
-    let legacy = format!("--legacy-worker-url={url}");
-    let mut args = vec![
-        legacy.as_str(),
-        "--relay-token=relay-secret",
-        "--legacy-export-token=export-secret",
-    ];
-    args.extend_from_slice(extra);
-    let Some(server) = TestServer::start(dir.path(), &args).await else {
-        return;
-    };
-
-    if server.server.cluster.is_some() {
-        // Imported here, but its client is still on the Worker.
-        let record = serde_json::from_value(serde_json::json!({
-            "version": 1,
-            "id": id,
-            "hostname": format!("{id}.opentunnel.test"),
-            "tokenHash": opentunnel_server::crypto::hash_token(TOKEN),
-            "state": "online",
-            "createdAt": "2026-10-09T00:00:00.000Z",
-            "certificateID": "cert_1",
-            "certificate": { "id": "cert_1", "state": {
-                "type": "ready", "certificate": "C", "chain": "C", "expiry": "2099-01-01T00:00:00.000Z"
-            } }
-        }))
-        .unwrap();
-        server.service().store.put_tunnel(&record, 1).await.unwrap();
+    for (key, value) in extra.as_object().unwrap() {
+        record[key] = value.clone();
     }
-    let hello = client_hello(&format!("api.{id}.opentunnel.test"));
-    let mut visitor = TcpStream::connect(server.tls).await.unwrap();
-    visitor.write_all(&hello).await.unwrap();
-    let mut reply = String::new();
-    visitor.read_to_string(&mut reply).await.unwrap();
-    assert_eq!(reply, format!("relayed {} bytes", hello.len()));
-    assert_eq!(
-        worker.relayed.lock().unwrap().as_slice(),
-        [String::from_utf8_lossy(&hello).into_owned()]
-    );
-    assert_eq!(
-        server
-            .server
-            .app
-            .stats
-            .legacy_forwarded
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1
-    );
-    if server.server.cluster.is_some() {
-        let stats = &server.server.app.stats;
-        assert_eq!(
-            stats
-                .forward_failures
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-    }
-    server.stop().await;
+    json!({ "record": record })
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn imports_unknown_tunnels_from_the_worker_on_first_use() {
-    let (url, worker) = fake_worker().await;
-    let dir = tempfile::tempdir().unwrap();
-    let legacy = format!("--legacy-worker-url={url}");
-    let Some(server) = TestServer::start(
-        dir.path(),
-        &[
-            &legacy,
-            "--relay-token=relay-secret",
-            "--legacy-export-token=export-secret",
-        ],
-    )
-    .await
-    else {
-        return;
-    };
-    let http = reqwest::Client::new();
-    let response = http
-        .get(format!("{}/api/tunnel/pulledtunnel", server.api))
-        .bearer_auth(TOKEN)
+async fn import(server: &TestServer, records: Vec<Value>) -> Value {
+    reqwest::Client::new()
+        .post(format!("{}/api/admin/import", server.api))
+        .bearer_auth("admin-secret")
+        .json(&json!({ "version": 1, "records": records }))
         .send()
         .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["hostname"], "pulledtunnel.opentunnel.test");
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn imports_only_records_for_a_tunnels_own_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(server) = TestServer::start(dir.path(), &[]).await else {
+        return;
+    };
+    let apex = ["opentunnel.test", "*.opentunnel.test"];
+    let issuing = |names: &[&str], csr: String| {
+        json!({
+            "certificateID": "cert_imported",
+            "certificate": { "id": "cert_imported", "state": { "type": "issuing" } },
+            "certificateCsr": csr,
+            "certificateIdentifiers": names,
+        })
+    };
+    let summary = import(
+        &server,
+        vec![
+            record("goodtunnel01", json!({})),
+            record(
+                "goodtunnel02",
+                issuing(
+                    &[
+                        "goodtunnel02.opentunnel.test",
+                        "*.goodtunnel02.opentunnel.test",
+                    ],
+                    csr(&[
+                        "goodtunnel02.opentunnel.test",
+                        "*.goodtunnel02.opentunnel.test",
+                    ]),
+                ),
+            ),
+            // The whole domain, with the attacker's CSR.
+            record("evil00000001", issuing(&apex, csr(&apex))),
+            // The tunnel's names, but a CSR for the domain.
+            record(
+                "evil00000002",
+                issuing(&["evil00000002.opentunnel.test"], csr(&apex)),
+            ),
+            // Another tunnel's names.
+            record(
+                "evil00000003",
+                issuing(
+                    &["goodtunnel01.opentunnel.test"],
+                    csr(&["goodtunnel01.opentunnel.test"]),
+                ),
+            ),
+            record("evil00000004", json!({ "hostname": "opentunnel.test" })),
+            record("Evil.Tunnel", json!({})),
+            record("evil00000005", json!({ "tokenHash": "" })),
+        ],
+    )
+    .await;
+    assert_eq!(summary["inserted"], 2, "{summary}");
+    let rejected = summary["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 6, "{summary}");
+    for id in [
+        "evil00000001",
+        "evil00000002",
+        "evil00000003",
+        "evil00000004",
+    ] {
+        assert!(server.service().store.tunnel(id).await.unwrap().is_none());
+    }
     assert!(
         server
             .service()
             .store
-            .tunnel("pulledtunnel")
+            .tunnel("goodtunnel02")
             .await
             .unwrap()
             .is_some()
     );
+    server.stop().await;
+}
 
-    // Misses are remembered, and IDs that cannot be tunnels are never looked up.
-    for _ in 0..3 {
-        let response = http
-            .get(format!("{}/api/tunnel/missingtunnl", server.api))
-            .bearer_auth(TOKEN)
-            .send()
+#[tokio::test(flavor = "multi_thread")]
+async fn the_job_runner_refuses_names_that_are_not_the_tunnels() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(server) = TestServer::start(dir.path(), &[]).await else {
+        return;
+    };
+    assert_eq!(
+        import(&server, vec![record("victim000001", json!({}))]).await["inserted"],
+        1
+    );
+    let store = &server.service().store;
+    let now = server.service().now();
+    let apex = ["opentunnel.test", "*.opentunnel.test"];
+    // Jobs as a tampered record or a bug could queue them.
+    for (id, names, request) in [
+        ("cert_apex", apex.to_vec(), csr(&apex)),
+        (
+            "cert_mismatch",
+            vec!["victim000001.opentunnel.test"],
+            csr(&apex),
+        ),
+    ] {
+        store
+            .add_job(
+                Job {
+                    certificate_id: id.into(),
+                    tunnel_id: Some("victim000001".into()),
+                    kind: JobKind::Issue,
+                    identifiers: names.iter().map(|name| (*name).to_owned()).collect(),
+                    csr: request,
+                    attempts: 0,
+                    created_at: now,
+                },
+                now,
+            )
             .await
             .unwrap();
-        assert_eq!(response.status(), 404);
     }
-    let response = http
-        .get(format!("{}/api/tunnel/x", server.api))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 404);
-    let exports = worker.exports.lock().unwrap().clone();
-    assert_eq!(exports, ["pulledtunnel", "missingtunnl"]);
-    server.stop().await;
+    server.service().jobs.notify_one();
+    for _ in 0..200 {
+        let counts = store.counts().await.unwrap();
+        if counts["jobs_failed"] == 2 && counts["jobs_pending"] == 0 {
+            server.stop().await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{}", store.counts().await.unwrap());
 }

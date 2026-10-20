@@ -45,6 +45,8 @@ struct Faults {
     slow_validation: u32,
     /// The next new order hands out the newest failed authorization for its identifier again.
     reuse_failed_once: bool,
+    /// The next record deletions are rate limited (HTTP 429).
+    delete_429: u32,
 }
 
 /// An authorization, which the CA hands to every new order for its identifier while it is pending or valid.
@@ -76,6 +78,8 @@ struct State {
     authzs: Vec<Authz>,
     /// Cloudflare records: id to (name, content).
     records: HashMap<String, (String, String)>,
+    /// When each record was created (RFC 3339), when not just now.
+    created_on: HashMap<String, String>,
     stale_nonces: u32,
     identical_records: u32,
     ca: Option<(String, String)>,
@@ -278,21 +282,41 @@ async fn handle(
                 }
             }
             (Method::GET, None) => {
-                let name = url::form_urlencoded::parse(query.as_bytes())
-                    .find(|(key, _)| key == "name")
-                    .map(|(_, value)| value.into_owned())
-                    .unwrap_or_default();
-                let found: Vec<Value> = state
+                let query: HashMap<String, String> =
+                    url::form_urlencoded::parse(query.as_bytes())
+                        .into_owned()
+                        .collect();
+                let mut found: Vec<Value> = state
                     .records
                     .iter()
-                    .filter(|(_, (record, _))| *record == name)
-                    .map(|(id, (_, content))| json!({ "id": id, "type": "TXT", "name": name, "content": format!("\"{content}\"") }))
+                    .filter(|(_, (record, _))| match (query.get("name"), query.get("name.startswith")) {
+                        (Some(name), _) => record == name,
+                        (None, Some(prefix)) => record.starts_with(prefix.as_str()),
+                        (None, None) => true,
+                    })
+                    .map(|(id, (name, content))| json!({
+                        "id": id, "type": "TXT", "name": name, "content": format!("\"{content}\""),
+                        "created_on": state.created_on.get(id).cloned().unwrap_or_else(|| "2099-01-01T00:00:00.000000Z".into()),
+                    }))
                     .collect();
+                found.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+                let per_page: usize = query.get("per_page").and_then(|value| value.parse().ok()).unwrap_or(100);
+                let page: usize = query.get("page").and_then(|value| value.parse().ok()).unwrap_or(1);
+                let total_pages = found.len().div_ceil(per_page).max(1);
+                let found: Vec<Value> = found.into_iter().skip((page - 1) * per_page).take(per_page).collect();
                 reply(
                     200,
-                    json!({ "success": true, "errors": [], "result": found }).to_string(),
+                    json!({ "success": true, "errors": [], "result": found, "result_info": { "page": page, "total_pages": total_pages } }).to_string(),
                 )
             }
+            (Method::DELETE, Some(_)) if state.faults.delete_429 > 0 => {
+                state.faults.delete_429 -= 1;
+                reply(429, json!({ "success": false, "errors": [{ "code": 971, "message": "rate limited" }] }).to_string())
+            }
+            (Method::DELETE, Some(id)) if !state.records.contains_key(*id) => reply(
+                404,
+                json!({ "success": false, "errors": [{ "code": 81044, "message": "Record does not exist." }] }).to_string(),
+            ),
             (Method::DELETE, Some(id)) => {
                 if let Some(record) = state.records.remove(*id) {
                     let validating = state
@@ -998,4 +1022,207 @@ async fn abandons_issuance_for_a_tunnel_deleted_meanwhile() {
     let (pending, failed) = service.store.job_counts(0).await.unwrap();
     assert_eq!((pending, failed), (0, 0));
     server.stop().await;
+}
+
+/// Deletes that Cloudflare rate limits are retried, so an attempt leaves no record behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn retries_rate_limited_record_deletes() {
+    let (fake, state) = fake(Faults::default()).await;
+    let acme = client(fake);
+    register(&acme, &state).await;
+    state.lock().unwrap().faults.delete_429 = 2;
+    let (identifiers, csr) = order("ratelimited0");
+    attempt(&acme, &identifiers, &csr).await.unwrap();
+    let state = state.lock().unwrap();
+    assert_eq!(state.faults.delete_429, 0);
+    assert!(state.records.is_empty(), "{:?}", state.records);
+}
+
+/// A shutdown in the middle of validation ends the attempt only after its authorizations are deactivated and
+/// its records deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_attempt_cleans_up_first() {
+    let (fake, state) = fake(Faults {
+        // Validation that never finishes, so the attempt is still polling when stopped.
+        stuck_challenges: 2,
+        ..Faults::default()
+    })
+    .await;
+    let acme = Arc::new(client(fake));
+    let (identifiers, csr) = order("stoppedmid00");
+    let running = {
+        let acme = acme.clone();
+        tokio::spawn(async move { attempt(&acme, &identifiers, &csr).await })
+    };
+    for _ in 0..200 {
+        if !state.lock().unwrap().records.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!state.lock().unwrap().records.is_empty());
+    acme.stop();
+    let error = running.await.unwrap().unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<opentunnel_server::acme::Stopped>()
+            .is_some(),
+        "{error:#}"
+    );
+    let state = state.lock().unwrap();
+    assert_eq!(state.deactivated, 2);
+    assert!(state.records.is_empty(), "{:?}", state.records);
+    assert_eq!(state.premature_deletes, 0);
+}
+
+/// The sweep deletes challenge records older than its cut-off that no running issuance uses, page by page,
+/// and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn sweeps_leftover_challenge_records() {
+    let (fake, state) = fake(Faults::default()).await;
+    opentunnel_server::install_crypto_provider();
+    let http = reqwest::Client::new();
+    let dns = DnsProvider::Cloudflare {
+        http,
+        api: format!("http://{fake}/cf"),
+        zone_id: "zone".into(),
+        token: "token".into(),
+    };
+    let value = |index: usize| format!("{index:0>43}");
+    {
+        let mut state = state.lock().unwrap();
+        let mut add = |id: String, name: String, content: String, created: &str| {
+            state.created_on.insert(id.clone(), created.into());
+            state.records.insert(id, (name, content));
+        };
+        // 700 leftovers from two hours ago: more than one page.
+        for index in 0..700 {
+            add(
+                format!("old-{index:05}"),
+                format!("_acme-challenge.left{index:07}.{DOMAIN}"),
+                value(index),
+                "2026-10-20T10:00:00.12345Z",
+            );
+        }
+        // Not ours: another zone name, a value that is not a challenge, another domain.
+        add(
+            "keep-1".into(),
+            "_acme-challenge.other.example".into(),
+            value(1),
+            "2026-10-20T10:00:00Z",
+        );
+        add(
+            "keep-2".into(),
+            format!("_acme-challenge.free.{DOMAIN}"),
+            "v=spf1 -all".into(),
+            "2026-10-20T10:00:00Z",
+        );
+        add(
+            "keep-3".into(),
+            format!("_dmarc.{DOMAIN}"),
+            value(3),
+            "2026-10-20T10:00:00Z",
+        );
+        // Recent, and one an issuance is using.
+        add(
+            "keep-4".into(),
+            format!("_acme-challenge.recent00000.{DOMAIN}"),
+            value(4),
+            "2026-10-20T11:59:00Z",
+        );
+        add(
+            "keep-5".into(),
+            format!("_acme-challenge.inflight000.{DOMAIN}"),
+            value(5),
+            "2026-10-20T10:00:00Z",
+        );
+    }
+    let before = opentunnel_server::clock::parse_iso("2026-10-20T11:00:00Z").unwrap();
+    let in_flight: HashSet<String> = [format!("_acme-challenge.inflight000.{DOMAIN}")].into();
+    // At most the limit per sweep.
+    assert_eq!(
+        dns.sweep(DOMAIN, before, &in_flight, 5, Duration::ZERO)
+            .await
+            .unwrap(),
+        5
+    );
+    let swept = dns
+        .sweep(DOMAIN, before, &in_flight, 10_000, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(swept, 695);
+    let state = state.lock().unwrap();
+    let mut left: Vec<&String> = state.records.keys().collect();
+    left.sort();
+    assert_eq!(left, ["keep-1", "keep-2", "keep-3", "keep-4", "keep-5"]);
+}
+
+/// One machine sweeps at a time (a lease in the database), and records of a job some machine is running stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_machine_sweeps_and_spares_running_issuance() {
+    let dir = tempfile::tempdir().unwrap();
+    if common::database_url(dir.path()).await.is_none() {
+        return;
+    }
+    let (fake, state) = fake(Faults::default()).await;
+    let arguments = arguments(dir.path(), fake);
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let a = TestServer::start(dir.path(), &arguments).await.unwrap();
+    let b = TestServer::start(dir.path(), &arguments).await.unwrap();
+    {
+        let mut state = state.lock().unwrap();
+        for (id, host) in [("old-1", "leftover000"), ("old-2", "running0000")] {
+            state
+                .created_on
+                .insert(id.into(), "2020-01-01T00:00:00Z".into());
+            state.records.insert(
+                id.into(),
+                (format!("_acme-challenge.{host}.{DOMAIN}"), "a".repeat(43)),
+            );
+        }
+    }
+    // A job another process holds the lease on.
+    let store = &a.service().store;
+    let now = a.service().now();
+    let hostname = format!("running0000.{DOMAIN}");
+    store
+        .add_job(
+            Job {
+                certificate_id: "cert_running".into(),
+                tunnel_id: Some("running0000".into()),
+                kind: JobKind::Issue,
+                identifiers: vec![hostname.clone(), format!("*.{hostname}")],
+                csr: csr(&hostname),
+                attempts: 0,
+                created_at: now,
+            },
+            now + 3_600_000,
+        )
+        .await
+        .unwrap();
+    store
+        .claim_job("cert_running", "elsewhere", now + 3_600_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let dns = |server: &TestServer| match server.server.jobs.issuer.as_ref() {
+        opentunnel_server::issuer::Issuer::Acme(acme) => acme.dns().unwrap().clone(),
+        _ => unreachable!(),
+    };
+    let swept = opentunnel_server::jobs::sweep_dns(&a.server.jobs, &dns(&a))
+        .await
+        .unwrap();
+    assert_eq!(swept, Some(1));
+    assert_eq!(
+        opentunnel_server::jobs::sweep_dns(&b.server.jobs, &dns(&b))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        state.lock().unwrap().records.keys().collect::<Vec<_>>(),
+        ["old-2"]
+    );
+    a.stop().await;
+    b.stop().await;
 }

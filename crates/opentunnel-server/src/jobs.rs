@@ -31,6 +31,85 @@ pub const ORPHAN_GRACE_MS: u64 = 15 * MINUTE_MS;
 /// notified); polling only covers machines that went away, and leases and compare-and-set keep it safe.
 const POLL_MS: u64 = 30_000;
 
+/// The CA cool-down: this many failures in a row that point at the CA (or one rate limit) stop new issuance
+/// for a while, starting at a minute and doubling up to an hour while attempts keep failing.
+const COOLDOWN_FAILURES: u32 = 5;
+const COOLDOWN_MIN_MS: u64 = MINUTE_MS;
+const COOLDOWN_MAX_MS: u64 = HOUR_MS;
+/// In `meta`, `<until> <cool-down>` (Unix ms, ms), so every machine pauses together.
+const COOLDOWN_KEY: &str = "ca_cooldown";
+/// How often a machine reads the shared cool-down again.
+const COOLDOWN_REFRESH_MS: u64 = 15_000;
+
+/// Failure classes (`metrics::error_class`) that say the CA is struggling or limiting us, rather than one
+/// tunnel's request being wrong or the DNS provider failing.
+fn ca_trouble(class: &str) -> bool {
+    matches!(
+        class,
+        "network" | "timeout" | "http_5xx" | "http_429" | "bad_body" | "nonce" | "bad_nonce"
+    )
+}
+
+/// The CA cool-down as one machine knows it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Cooldown {
+    /// CA failures in a row since the last success or cool-down.
+    pub failures: u32,
+    /// The last cool-down's length; 0 after a success.
+    pub cooldown_ms: u64,
+    /// No new issuance before this (Unix ms).
+    pub until: u64,
+}
+
+impl Cooldown {
+    /// Records a failed attempt of `class`. Returns whether a cool-down starts.
+    pub fn failed(&mut self, class: &str, retry_after_ms: Option<u64>, now: u64) -> bool {
+        if !ca_trouble(class) {
+            return false;
+        }
+        self.failures += 1;
+        if class != "http_429" && self.failures < COOLDOWN_FAILURES {
+            return false;
+        }
+        self.cooldown_ms = if self.cooldown_ms == 0 {
+            COOLDOWN_MIN_MS
+        } else {
+            (self.cooldown_ms * 2).min(COOLDOWN_MAX_MS)
+        };
+        self.until = self.until.max(
+            now + self
+                .cooldown_ms
+                .max(retry_after_ms.unwrap_or(0).min(COOLDOWN_MAX_MS)),
+        );
+        self.failures = 0;
+        true
+    }
+
+    /// Records a success: the CA works again. Returns whether a cool-down was in effect.
+    pub fn succeeded(&mut self) -> bool {
+        let was = self.cooldown_ms > 0;
+        *self = Self::default();
+        was
+    }
+
+    fn encode(&self) -> String {
+        format!("{} {}", self.until, self.cooldown_ms)
+    }
+
+    /// Merges the shared state: the later end and the longer cool-down.
+    fn merge(&mut self, stored: &str) {
+        let mut fields = stored
+            .split(' ')
+            .map(|field| field.parse::<u64>().unwrap_or(0));
+        let (until, cooldown) = (fields.next().unwrap_or(0), fields.next().unwrap_or(0));
+        self.until = self.until.max(until);
+        self.cooldown_ms = self.cooldown_ms.max(cooldown);
+    }
+}
+
+/// At shutdown, how long attempts get to clean up before the leases are released anyway.
+const RELEASE_WAIT: Duration = Duration::from_secs(15);
+
 fn poll_wait() -> u64 {
     POLL_MS + (retry::jitter() * POLL_MS as f64) as u64
 }
@@ -46,6 +125,10 @@ pub struct Jobs {
     pub owner: String,
     /// Jobs running here, by certificate ID.
     running: Mutex<HashMap<String, JobKind>>,
+    /// The CA cool-down, and when the shared one was last read.
+    cooldown: Mutex<(Cooldown, u64)>,
+    /// Set at shutdown: no new jobs start.
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 /// The lease owner for this process: the Fly machine ID, which survives restarts so a restarted server takes
@@ -73,6 +156,8 @@ impl Jobs {
             server,
             owner: lease_owner(),
             running: Mutex::new(HashMap::new()),
+            cooldown: Mutex::new((Cooldown::default(), 0)),
+            stopping: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -100,6 +185,9 @@ impl Jobs {
     /// Claims and starts due jobs while there is room. Returns when the next job not yet due may be taken.
     async fn start_due(self: &Arc<Self>, tasks: &mut JoinSet<()>) -> Result<Option<u64>> {
         let running = self.running.lock().expect("running lock").len();
+        if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(None);
+        }
         if running >= self.concurrency {
             // A finishing task wakes the runner.
             return Ok(None);
@@ -113,6 +201,11 @@ impl Jobs {
         if next.is_none() && schedule.len() == limit {
             // Every listed job is due, so there may be more: look again soon.
             next = Some(now + 1_000);
+        }
+        let cooling_until = self.cooling_until(now).await;
+        let cooling = cooling_until > now;
+        if cooling {
+            next = Some(next.map_or(cooling_until, |next| next.min(cooling_until)));
         }
         let due = schedule
             .into_iter()
@@ -130,6 +223,11 @@ impl Jobs {
                     .filter(|kind| **kind == JobKind::Issue)
                     .count();
                 if kind == JobKind::Issue && issuing >= self.issue_slots() {
+                    continue;
+                }
+                // While the CA cools down: no first issuance, and one renewal at a time, which also finds out
+                // whether it works again.
+                if cooling && (kind == JobKind::Issue || running.len() > issuing) {
                     continue;
                 }
                 if running.insert(id.clone(), kind).is_some() {
@@ -161,6 +259,65 @@ impl Jobs {
         Ok(next)
     }
 
+    /// The end of the CA cool-down (Unix ms; in the past when there is none), from the shared state at most
+    /// `COOLDOWN_REFRESH_MS` old.
+    async fn cooling_until(&self, now: u64) -> u64 {
+        let (local, read_at) = *self.cooldown.lock().expect("cooldown lock");
+        if now.saturating_sub(read_at) < COOLDOWN_REFRESH_MS {
+            return local.until;
+        }
+        match self.service.store.meta(COOLDOWN_KEY).await {
+            Ok(stored) => {
+                let mut cooldown = self.cooldown.lock().expect("cooldown lock");
+                if let Some(stored) = stored {
+                    cooldown.0.merge(&stored);
+                }
+                cooldown.1 = now;
+                cooldown.0.until
+            }
+            Err(error) => {
+                warn!(%error, "reading the CA cool-down failed");
+                local.until
+            }
+        }
+    }
+
+    /// Feeds an attempt's outcome to the CA cool-down, and shares a change with every machine.
+    async fn cooldown_outcome(&self, result: Result<(), &anyhow::Error>) {
+        let now = self.service.now();
+        let shared = {
+            let (cooldown, _) = &mut *self.cooldown.lock().expect("cooldown lock");
+            match result {
+                Ok(()) => cooldown.succeeded().then(|| cooldown.encode()),
+                Err(error) => {
+                    let class = crate::metrics::error_class(error);
+                    let retry_after = error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<crate::acme::Problem>())
+                        .and_then(|problem| problem.retry_after)
+                        .map(|retry| retry.as_millis() as u64);
+                    if cooldown.failed(class, retry_after, now) {
+                        crate::metrics::acme_cooldown();
+                        warn!(
+                            cooldown_ms = cooldown.cooldown_ms,
+                            until = %crate::clock::iso(cooldown.until),
+                            error_class = class,
+                            "the CA keeps failing; pausing new certificate issuance"
+                        );
+                        Some(cooldown.encode())
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(value) = shared
+            && let Err(error) = self.service.store.set_meta(COOLDOWN_KEY, &value).await
+        {
+            warn!(%error, "sharing the CA cool-down failed");
+        }
+    }
+
     /// Jobs of first issuance that may run at once: all but one slot, which renewals keep.
     fn issue_slots(&self) -> usize {
         if self.concurrency > 1 {
@@ -170,8 +327,23 @@ impl Jobs {
         }
     }
 
-    /// Gives up this process's job leases, on shutdown.
+    /// At shutdown: starts no more jobs, and ends the attempts running, each after deleting its challenge
+    /// records (a process that exits mid-attempt leaves them in the zone).
+    pub fn stop(&self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.issuer.stop();
+    }
+
+    /// Gives up this process's job leases, on shutdown, once the attempts running have cleaned up (at most
+    /// `RELEASE_WAIT`), so another machine resumes them at once.
     pub async fn release(&self) {
+        let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+        while !self.running.lock().expect("running lock").is_empty()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         if let Err(error) = self.service.store.release_leases(&self.owner).await {
             warn!(%error, "releasing job leases failed");
         }
@@ -199,6 +371,9 @@ impl Jobs {
         let kind = job.kind;
         let owner = &self.owner;
         let started = std::time::Instant::now();
+        if let Err(reason) = self.permitted(&job) {
+            return self.refuse(&job, reason, started).await;
+        }
         if !self.wanted(&job).await {
             return self.abandon(&job, None, started).await;
         }
@@ -249,6 +424,14 @@ impl Jobs {
             return Ok(());
         }
         let now = service.now();
+        if let Err(error) = &result
+            && error.downcast_ref::<crate::acme::Stopped>().is_some()
+        {
+            // Shutting down: nothing failed, and the lease is released for another machine to resume.
+            info!(certificate = %job.certificate_id, "certificate issuance stopped for shutdown");
+            return Ok(());
+        }
+        self.cooldown_outcome(result.as_ref().map(drop)).await;
         match result {
             Ok(issued) => {
                 crate::metrics::acme_attempt(kind.as_str(), "success", started.elapsed());
@@ -334,8 +517,10 @@ impl Jobs {
                 );
                 if let (JobKind::Issue | JobKind::Renew, Some(tunnel)) = (&job.kind, &job.tunnel_id)
                 {
+                    // The tenant sees a summary; the full error (with what the CA answered) stays in the log and
+                    // the job.
                     let state = CertificateState::Failed {
-                        reason: reason.clone(),
+                        reason: public_reason(&error),
                     };
                     service
                         .update_certificate(tunnel, &job.certificate_id, state)
@@ -348,6 +533,66 @@ impl Jobs {
                     .map(drop)
             }
         }
+    }
+
+    /// Whether the job asks only for names it may: a tunnel's own hostname and wildcard, with a CSR for exactly
+    /// those, or the API domain for the server's own certificate. Checked right before every order, whatever
+    /// queued the job (a bind, a renewal, an imported record, the reconcile).
+    fn permitted(&self, job: &Job) -> Result<(), String> {
+        let domain = self.service.domain.to_ascii_lowercase();
+        match (&job.kind, &job.tunnel_id) {
+            (JobKind::Issue | JobKind::Renew, Some(tunnel)) => {
+                crate::csr::check_tunnel_request(tunnel, &domain, &job.identifiers, &job.csr)
+            }
+            (JobKind::Server, None) => {
+                let names_domain =
+                    |names: &[String]| names.len() == 1 && names[0].eq_ignore_ascii_case(&domain);
+                let request = crate::csr::parse(&job.csr)
+                    .ok_or_else(|| "the CSR does not parse or verify".to_owned())?;
+                if names_domain(&job.identifiers) && names_domain(&request.identifiers) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "a server certificate for {:?} is not for {domain}",
+                        job.identifiers
+                    ))
+                }
+            }
+            _ => Err("a tunnel certificate without a tunnel".to_owned()),
+        }
+    }
+
+    /// Ends a job that asks for names it may not, without ordering anything.
+    async fn refuse(&self, job: &Job, reason: String, started: std::time::Instant) -> Result<()> {
+        crate::metrics::acme_attempt(job.kind.as_str(), "refused", started.elapsed());
+        error!(
+            certificate = %job.certificate_id,
+            tunnel = job.tunnel_id.as_deref(),
+            kind = job.kind.as_str(),
+            identifiers = ?job.identifiers,
+            reason,
+            "refused a certificate job for names it may not have"
+        );
+        let reason = format!("Certificate request refused: {reason}");
+        if let (JobKind::Issue | JobKind::Renew, Some(tunnel)) = (&job.kind, &job.tunnel_id) {
+            let state = CertificateState::Failed {
+                reason: reason.clone(),
+            };
+            self.service
+                .update_certificate(tunnel, &job.certificate_id, state)
+                .await?;
+        }
+        self.service
+            .store
+            .finish_job(
+                &job.certificate_id,
+                &self.owner,
+                "failed",
+                Some(reason),
+                self.service.now(),
+            )
+            .await
+            .map(drop)
     }
 
     /// Whether the job's tunnel still waits for its certificate. When that cannot be read, it is assumed to.
@@ -484,6 +729,84 @@ pub async fn run_reconcile(service: Service) {
     }
 }
 
+/// How often one machine sweeps leftover challenge records, and how old they must be.
+const DNS_SWEEP_EVERY_MS: u64 = 10 * MINUTE_MS;
+const DNS_SWEEP_AGE_MS: u64 = HOUR_MS;
+/// Records deleted per sweep at most, so a large backlog stays within Cloudflare's API limits.
+const DNS_SWEEP_LIMIT: usize = 1_000;
+/// In `meta`: `<owner> <until>`, the machine that sweeps.
+const DNS_SWEEPER_KEY: &str = "dns_sweeper";
+
+/// Every few minutes, on one machine at a time, deletes `_acme-challenge` TXT records older than an hour that
+/// no running issuance uses: what attempts could not delete (a process killed mid-attempt, a deactivation that
+/// failed, Cloudflare errors) would otherwise stay in the zone for good, and the zone has a record limit.
+pub async fn run_dns_sweeper(jobs: Arc<Jobs>) {
+    let Issuer::Acme(acme) = jobs.issuer.as_ref() else {
+        return;
+    };
+    let Some(dns) = acme.dns().cloned() else {
+        return;
+    };
+    loop {
+        tokio::time::sleep(Duration::from_millis(
+            DNS_SWEEP_EVERY_MS / 2 + (retry::jitter() * DNS_SWEEP_EVERY_MS as f64) as u64,
+        ))
+        .await;
+        if jobs.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        match sweep_dns(&jobs, &dns).await {
+            Ok(Some(0) | None) => {}
+            Ok(Some(swept)) => info!(swept, "deleted leftover DNS challenge records"),
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "sweeping DNS challenge records failed")
+            }
+        }
+    }
+}
+
+/// One sweep, if this machine holds the sweeper lease. `None` when another machine does.
+pub async fn sweep_dns(jobs: &Jobs, dns: &crate::dns::DnsProvider) -> Result<Option<usize>> {
+    let service = &jobs.service;
+    let store = &service.store;
+    let now = service.now();
+    let current = store.meta(DNS_SWEEPER_KEY).await?;
+    if let Some((owner, until)) = current.as_deref().and_then(|value| value.split_once(' '))
+        && owner != jobs.owner
+        && until.parse::<u64>().is_ok_and(|until| until > now)
+    {
+        return Ok(None);
+    }
+    let lease = format!("{} {}", jobs.owner, now + 2 * DNS_SWEEP_EVERY_MS);
+    if !store
+        .swap_meta(DNS_SWEEPER_KEY, current.as_deref(), &lease)
+        .await?
+    {
+        return Ok(None);
+    }
+    let in_flight: std::collections::HashSet<String> = store
+        .leased_job_identifiers(now)
+        .await?
+        .into_iter()
+        .map(|identifier| {
+            format!(
+                "_acme-challenge.{}",
+                identifier.trim_start_matches("*.").to_ascii_lowercase()
+            )
+        })
+        .collect();
+    let domain = service.domain.to_ascii_lowercase();
+    dns.sweep(
+        &domain,
+        now.saturating_sub(DNS_SWEEP_AGE_MS),
+        &in_flight,
+        DNS_SWEEP_LIMIT,
+        Duration::from_millis(250),
+    )
+    .await
+    .map(Some)
+}
+
 /// The API domain's own certificate: issued through the same jobs, renewed 30 days before expiry, and served
 /// from memory.
 pub struct ServerCertificates {
@@ -616,5 +939,125 @@ impl ServerCertificates {
             };
             tokio::time::sleep(Duration::from_millis(wait)).await;
         }
+    }
+}
+
+/// What a tenant sees of a failed issuance: the kind of failure, never what a server answered (which could be
+/// anything a URL the CA named returned). Worded so `analytics::certificate_failure` buckets it as the full error.
+pub fn public_reason(error: &anyhow::Error) -> String {
+    let full = format!("{error:#}");
+    let status = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<crate::acme::Problem>()
+            .map(|problem| problem.status)
+            .or_else(|| {
+                cause
+                    .downcast_ref::<reqwest::Error>()
+                    .and_then(reqwest::Error::status)
+                    .map(|status| status.as_u16())
+            })
+    });
+    let detail = match crate::analytics::certificate_failure(&full) {
+        "config" => "the server's ACME settings are required but missing".to_owned(),
+        "acme_rate_limit" => {
+            "the certificate authority rateLimited the request (HTTP 429)".to_owned()
+        }
+        "dns" => "the DNS challenge record could not be set".to_owned(),
+        "acme_authorization" => {
+            "the certificate authority did not validate the authorization".to_owned()
+        }
+        "acme_order" => "the ACME order did not complete".to_owned(),
+        "persist" => "Failed to persist certificate state".to_owned(),
+        "acme_http" => match status {
+            Some(status) => format!("the certificate authority answered HTTP {status}"),
+            None => match full.match_indices("HTTP ").find_map(|(index, _)| {
+                let digits = full.get(index + 5..index + 8)?;
+                digits
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+                    .then_some(digits)
+            }) {
+                Some(status) => format!("the certificate authority answered HTTP {status}"),
+                None => "the certificate authority answered with an error".to_owned(),
+            },
+        },
+        _ => format!(
+            "the certificate authority could not be used ({})",
+            crate::metrics::error_class(error)
+        ),
+    };
+    format!("Certificate issuance failed: {detail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tenants_see_the_kind_of_failure_without_what_servers_answered() {
+        for (full, bucket) in [
+            ("ACME_EAB_KID and ACME_EAB_HMAC_KEY are required", "config"),
+            (
+                "urn:ietf:params:acme:error:rateLimited: too many | HTTP 429 | {\"secret\":1}",
+                "acme_rate_limit",
+            ),
+            ("creating the DNS record failed: <html>body</html>", "dns"),
+            (
+                "ACME authorization for x ended in invalid: dns: <body>",
+                "acme_authorization",
+            ),
+            ("ACME order ended in invalid", "acme_order"),
+            (
+                "ACME request to https://ca/x failed | HTTP 500 | internal secrets",
+                "acme_http",
+            ),
+            ("something else entirely: private", "other"),
+        ] {
+            let public = public_reason(&anyhow::anyhow!(full.to_owned()));
+            assert!(
+                !public.contains("secret")
+                    && !public.contains("body")
+                    && !public.contains("private"),
+                "{public}"
+            );
+            assert_eq!(
+                crate::analytics::certificate_failure(&public),
+                bucket,
+                "{public}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ca_cools_down_after_failures_and_doubles_until_it_works() {
+        let mut cooldown = Cooldown::default();
+        // One tunnel's bad request or the DNS provider says nothing about the CA.
+        for _ in 0..10 {
+            assert!(!cooldown.failed("rejected", None, 0));
+            assert!(!cooldown.failed("dns", None, 0));
+        }
+        for _ in 0..COOLDOWN_FAILURES - 1 {
+            assert!(!cooldown.failed("http_5xx", None, 0));
+        }
+        assert!(cooldown.failed("timeout", None, 1_000));
+        assert_eq!(cooldown.until, 1_000 + MINUTE_MS);
+        // A rate limit starts the next one at once, twice as long, or as long as the CA asks (up to an hour).
+        assert!(cooldown.failed("http_429", None, 2 * MINUTE_MS));
+        assert_eq!(cooldown.cooldown_ms, 2 * MINUTE_MS);
+        assert_eq!(cooldown.until, 4 * MINUTE_MS);
+        assert!(cooldown.failed("http_429", Some(30 * MINUTE_MS), 5 * MINUTE_MS));
+        assert_eq!(cooldown.until, 35 * MINUTE_MS);
+        for _ in 0..10 {
+            cooldown.failed("http_429", None, 0);
+        }
+        assert_eq!(cooldown.cooldown_ms, HOUR_MS);
+        assert!(cooldown.succeeded());
+        assert_eq!(cooldown, Cooldown::default());
+        assert!(!cooldown.succeeded());
+
+        let mut other = Cooldown::default();
+        other.merge("5000 60000");
+        other.merge("garbage");
+        assert_eq!((other.until, other.cooldown_ms), (5_000, 60_000));
     }
 }

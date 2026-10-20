@@ -1,6 +1,7 @@
 //! DNS-01 challenge records. DNS for the domain stays on Cloudflare; the provider is an enum so another can be
 //! added without touching issuance.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -45,12 +46,36 @@ struct CloudflareError {
     message: String,
 }
 
-#[derive(Deserialize)]
-struct Listed {
-    id: String,
+#[derive(Debug, Clone, Deserialize)]
+pub struct Listed {
+    pub id: String,
     #[serde(default)]
-    content: String,
+    pub name: String,
+    #[serde(default)]
+    pub content: String,
+    /// RFC 3339.
+    #[serde(default)]
+    pub created_on: String,
 }
+
+#[derive(Deserialize, Default)]
+struct ResultInfo {
+    #[serde(default)]
+    total_pages: u32,
+}
+
+#[derive(Deserialize)]
+struct ListResponse {
+    #[serde(default)]
+    result: Vec<Listed>,
+    #[serde(default)]
+    result_info: ResultInfo,
+}
+
+/// Deleting a record is tried this many times (rate limits, 5xx), a second apart and more.
+const DELETE_TRIES: u32 = 4;
+/// Records listed per page by the sweep.
+const SWEEP_PAGE: u32 = 500;
 
 /// Cloudflare's error for a record that exists with the same name and content.
 const CLOUDFLARE_IDENTICAL_RECORD: u64 = 81058;
@@ -85,11 +110,14 @@ impl DnsProvider {
                     .await
                     .map_err(|_| anyhow!("DNS record creation failed"))?;
                 match body.result {
-                    Some(created) if status.is_success() && body.success => Ok(TxtRecord {
-                        name: name.into(),
-                        value: value.into(),
-                        id: Some(created.id),
-                    }),
+                    Some(created) if status.is_success() && body.success => {
+                        crate::metrics::dns_record("created");
+                        Ok(TxtRecord {
+                            name: name.into(),
+                            value: value.into(),
+                            id: Some(created.id),
+                        })
+                    }
                     _ if body.errors.iter().any(|error| {
                         error.code == CLOUDFLARE_IDENTICAL_RECORD
                             || error.message.contains("identical record already exists")
@@ -173,34 +201,185 @@ impl DnsProvider {
             .map(|record| record.id))
     }
 
-    /// Deletes a record, logging rather than failing: a leftover TXT record is harmless.
-    pub async fn delete_txt(&self, record: &TxtRecord) {
-        let result = match self {
-            Self::Cloudflare {
-                http,
-                api,
-                zone_id,
-                token,
-            } => match &record.id {
-                Some(id) => http
-                    .delete(format!("{api}/zones/{zone_id}/dns_records/{id}"))
-                    .bearer_auth(token)
-                    .timeout(Duration::from_secs(30))
-                    .send()
-                    .await
-                    .map(drop),
-                None => Ok(()),
-            },
+    /// Deletes a record, logging rather than failing: what is left is swept later ([`sweep`](Self::sweep)).
+    /// Rate limits and server errors are retried; a record already gone counts as deleted. Returns whether it
+    /// is gone.
+    pub async fn delete_txt(&self, record: &TxtRecord) -> bool {
+        let deleted = match self {
+            Self::Cloudflare { .. } => {
+                let id = match &record.id {
+                    Some(id) => Some(id.clone()),
+                    // Taken over from an interrupted attempt and not found then: look again.
+                    None => self
+                        .find_txt(&record.name, &record.value)
+                        .await
+                        .unwrap_or_else(|error| {
+                            warn!(%error, name = %record.name, "failed to look up a challenge record");
+                            None
+                        }),
+                };
+                match id {
+                    Some(id) => self.delete_id(&id).await,
+                    None => Ok(()),
+                }
+            }
             Self::ChallTestSrv { http, url } => http
                 .post(format!("{url}/clear-txt"))
                 .json(&json!({ "host": format!("{}.", record.name) }))
                 .send()
                 .await
-                .map(drop),
+                .and_then(reqwest::Response::error_for_status)
+                .map(drop)
+                .map_err(anyhow::Error::from),
         };
-        if let Err(error) = result {
-            warn!(%error, name = %record.name, "failed to delete a challenge record");
+        match deleted {
+            Ok(()) => {
+                crate::metrics::dns_record("deleted");
+                true
+            }
+            Err(error) => {
+                crate::metrics::dns_record("delete_failed");
+                warn!(error = %format!("{error:#}"), name = %record.name, "failed to delete a challenge record");
+                false
+            }
         }
+    }
+
+    /// Deletes a Cloudflare record by ID, again after rate limits and server errors.
+    async fn delete_id(&self, id: &str) -> Result<()> {
+        let Self::Cloudflare {
+            http,
+            api,
+            zone_id,
+            token,
+        } = self
+        else {
+            return Ok(());
+        };
+        let mut pause = Duration::from_secs(1);
+        let mut last = String::new();
+        for attempt in 1..=DELETE_TRIES {
+            match http
+                .delete(format!("{api}/zones/{zone_id}/dns_records/{id}"))
+                .bearer_auth(token)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+            {
+                // Gone already (another attempt or the sweep deleted it).
+                Ok(response) if response.status().is_success() || response.status() == 404 => {
+                    return Ok(());
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    last = format!("HTTP {}", status.as_u16());
+                    if !(status == 429 || status.is_server_error()) {
+                        break;
+                    }
+                    if let Some(wait) = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                    {
+                        pause = pause.max(Duration::from_secs(wait.min(30)));
+                    }
+                }
+                Err(error) => last = error.to_string(),
+            }
+            if attempt < DELETE_TRIES {
+                tokio::time::sleep(pause).await;
+                pause *= 2;
+            }
+        }
+        bail!("deleting DNS record {id} failed: {last}")
+    }
+
+    /// Every `_acme-challenge.*` TXT record in the zone. `None` for providers that cannot list.
+    pub async fn challenge_records(&self) -> Result<Option<Vec<Listed>>> {
+        let Self::Cloudflare {
+            http,
+            api,
+            zone_id,
+            token,
+        } = self
+        else {
+            return Ok(None);
+        };
+        let mut records = Vec::new();
+        let mut page = 1;
+        loop {
+            let mut url = url::Url::parse(&format!("{api}/zones/{zone_id}/dns_records"))?;
+            url.query_pairs_mut()
+                .append_pair("type", "TXT")
+                .append_pair("name.startswith", "_acme-challenge.")
+                .append_pair("per_page", &SWEEP_PAGE.to_string())
+                .append_pair("page", &page.to_string());
+            let body: ListResponse = http
+                .get(url)
+                .bearer_auth(token)
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let count = body.result.len();
+            records.extend(body.result);
+            if count == 0 || page >= body.result_info.total_pages.max(1) || page >= 1_000 {
+                return Ok(Some(records));
+            }
+            page += 1;
+        }
+    }
+
+    /// Deletes challenge records for names under `domain` created before `before` (Unix ms), except for names
+    /// in `in_flight` (issuance running now), at most `limit` of them, `pause` apart (Cloudflare limits its API
+    /// per user). Returns how many it deleted.
+    pub async fn sweep(
+        &self,
+        domain: &str,
+        before: u64,
+        in_flight: &HashSet<String>,
+        limit: usize,
+        pause: Duration,
+    ) -> Result<usize> {
+        let Some(records) = self.challenge_records().await? else {
+            return Ok(0);
+        };
+        let suffix = format!(".{domain}");
+        let mut swept = 0;
+        for record in records {
+            if swept >= limit {
+                break;
+            }
+            let name = record.name.to_ascii_lowercase();
+            let value = record.content.trim_matches('"');
+            // Only what issuance makes: a challenge name under the domain and a SHA-256 in base64url.
+            let ours = name.starts_with("_acme-challenge.")
+                && (name.ends_with(&suffix) || name == format!("_acme-challenge.{domain}"))
+                && value.len() == 43
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+            let old = crate::clock::parse_iso(&record.created_on).is_some_and(|at| at < before);
+            if !ours || !old || in_flight.contains(&name) {
+                continue;
+            }
+            match self.delete_id(&record.id).await {
+                Ok(()) => {
+                    swept += 1;
+                    crate::metrics::dns_record("swept");
+                }
+                Err(error) => {
+                    warn!(error = %format!("{error:#}"), name, "failed to sweep a challenge record");
+                    // Most likely rate limited: stop and come back at the next sweep.
+                    break;
+                }
+            }
+            tokio::time::sleep(pause).await;
+        }
+        Ok(swept)
     }
 }
 

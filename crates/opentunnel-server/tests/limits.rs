@@ -244,3 +244,48 @@ async fn refuses_new_issuance_while_the_backlog_is_full() {
     assert_eq!(info.status(), 200);
     server.stop().await;
 }
+
+/// While the CA cools down (shared in the database by whichever machine saw it fail), first issuance waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn pauses_first_issuance_while_the_ca_cools_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(url) = common::database_url(dir.path()).await else {
+        return;
+    };
+    let store = opentunnel_server::store::Store::open(&url).await.unwrap();
+    let until = opentunnel_server::clock::Clock::system().now_ms() + 3_600_000;
+    store
+        .set_meta("ca_cooldown", &format!("{until} 60000"))
+        .await
+        .unwrap();
+    // A configured API certificate, so no job for it runs first (a success would end the cool-down).
+    let key = rcgen::KeyPair::generate().unwrap();
+    let certificate = rcgen::CertificateParams::new(vec![common::DOMAIN.to_owned()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let (cert_file, key_file) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    std::fs::write(&cert_file, certificate.pem()).unwrap();
+    std::fs::write(&key_file, key.serialize_pem()).unwrap();
+    let cert_arg = format!("--tls-cert-file={}", cert_file.display());
+    let key_arg = format!("--tls-key-file={}", key_file.display());
+    let server = TestServer::start(dir.path(), &[&cert_arg, &key_arg])
+        .await
+        .unwrap();
+    let created = create(&server, None).await;
+    let id = created.body["tunnel"]["id"].as_str().unwrap().to_owned();
+    let hostname = created.body["tunnel"]["hostname"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let token = created.body["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        bind(&server, &id, &token, &csr(&hostname)).await.status,
+        202
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The local CA would have signed it at once.
+    let counts = server.service().store.counts().await.unwrap();
+    assert_eq!(counts["jobs_pending"], 1, "{counts}");
+    server.stop().await;
+}

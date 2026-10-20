@@ -43,7 +43,7 @@ async fn node_with(name: &str, token: &str, config: MeshConfig) -> Node {
     mesh.set_address(address.clone());
     let accepting = mesh.clone();
     tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
+        while let Ok((mut stream, peer)) = listener.accept().await {
             let mesh = accepting.clone();
             tokio::spawn(async move {
                 let mut line = Vec::new();
@@ -54,10 +54,10 @@ async fn node_with(name: &str, token: &str, config: MeshConfig) -> Node {
                 let stream = opentunnel_server::tls::Replay::new(Vec::new(), stream);
                 if let Some(greeting) = line.strip_prefix(MESH_MAGIC) {
                     let greeting = String::from_utf8_lossy(greeting).into_owned();
-                    let _ = mesh.accept(stream, &greeting).await;
+                    let _ = mesh.accept(stream, &greeting, peer, ()).await;
                 } else if let Some(token) = line.strip_prefix(MESH_MAGIC_V1) {
                     let token = String::from_utf8_lossy(token).into_owned();
-                    let _ = mesh.accept_v1(stream, &token).await;
+                    let _ = mesh.accept_v1(stream, &token, peer, ()).await;
                 }
             });
         }
@@ -233,12 +233,11 @@ async fn refuses_a_peer_with_another_token_and_recognises_the_previous_version()
                 .await;
         }
     });
-    assert!(!a.mesh.legacy_present());
     a.mesh.add_peer(&old);
     wait(
         "the previous version to be recognised",
         Duration::from_secs(3),
-        || a.mesh.legacy_present(),
+        || a.mesh.view()["peers"]["legacy"] == 1,
     )
     .await;
     assert_eq!(a.mesh.view()["peers"]["legacy"], 1);
@@ -381,13 +380,72 @@ async fn accepts_the_previous_handshake_only_with_the_right_secret() {
     strict.mesh.halt(false);
 }
 
+/// A linked peer is held to what it proved: the address it connects from, its machine ID while another link
+/// has it, and a sane clock.
+#[tokio::test(flavor = "multi_thread")]
+async fn peers_cannot_claim_other_addresses_ids_or_times() {
+    let a = node("a", "secret").await;
+    let b = node("b", "secret").await;
+    // An authenticated machine that says it is somewhere else (forwards would go there).
+    let liar = node("liar", "secret").await;
+    liar.mesh.set_address_for_tests("127.0.0.9:9");
+    liar.mesh.add_peer(&a.address);
+    b.mesh.add_peer(&a.address);
+    wait("b to link", Duration::from_secs(3), || a.mesh.is_up("b")).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!a.mesh.is_up("liar"));
+    // A second machine calling itself b, at another address, does not take b's place.
+    let impostor = node("b", "secret").await;
+    impostor.mesh.add_peer(&a.address);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        a.mesh.peer_address("b").as_deref(),
+        Some(b.address.as_str())
+    );
+    // An attach dated far in the future counts as now, so a later real attach still wins the route.
+    b.mesh
+        .attached("abcdefghijkl", 1, &["api".into()], u64::MAX);
+    wait("the attach", Duration::from_secs(1), || {
+        a.mesh.locate("abcdefghijkl", "api", None).is_some()
+    })
+    .await;
+    let c = node("c", "secret").await;
+    c.mesh.add_peer(&a.address);
+    wait("c to link", Duration::from_secs(3), || a.mesh.is_up("c")).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    c.mesh.attached(
+        "abcdefghijkl",
+        1,
+        &["api".into()],
+        Clock::system().now_ms() + 1_000,
+    );
+    wait("the newer attach to win", Duration::from_secs(1), || {
+        a.mesh
+            .locate("abcdefghijkl", "api", None)
+            .is_some_and(|location| location.machine_id == "c")
+    })
+    .await;
+    for node in [&a, &b, &liar, &impostor, &c] {
+        node.mesh.halt(false);
+    }
+}
+
 /// 20,000 bridges, then 100 attaches and detaches per second for 10 seconds on one machine while another
 /// follows: every change arrives, quickly, and memory stays modest. A third machine joining late gets the
 /// whole table in one snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_large_table_under_churn() {
     const BRIDGES: u64 = 20_000;
-    let a = node("a", "secret").await;
+    // Snapshots of more than 64 KiB go out in several frames.
+    let a = node_with(
+        "a",
+        "secret",
+        MeshConfig {
+            snapshot_chunk: 64 << 10,
+            ..config()
+        },
+    )
+    .await;
     let b = node("b", "secret").await;
     a.mesh.add_peer(&b.address);
     wait("the link", Duration::from_secs(3), || b.mesh.is_up("a")).await;
@@ -449,7 +507,7 @@ async fn a_large_table_under_churn() {
     assert_eq!(size(&b, "a"), Some(BRIDGES as usize));
     assert!(p99 < Duration::from_millis(100), "p99 {p99:?}");
 
-    // A late joiner gets everything in one snapshot.
+    // A late joiner gets everything in one snapshot, in many frames.
     let c = node("c", "secret").await;
     let joined = Instant::now();
     c.mesh.add_peer(&a.address);
