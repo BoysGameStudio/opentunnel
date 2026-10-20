@@ -28,4 +28,4 @@
 - Server tests need MySQL 8: set `TEST_DATABASE_URL` (see `docs/server.md`); without it they skip.
 - DNS stays on Cloudflare; DNS-01 challenges go through the provider in `crates/opentunnel-server/src/dns.rs`.
 - `packages/website` is built with plain Vite (`bun run ready`, output `dist/website`) and served by the server.
-- Code marked TEMPORARY (the `migration/` directory, `crates/opentunnel-server/src/migration.rs` apart from the export file format, and the `LEGACY_*` settings) exists only for the cutover and is removed once the Worker is decommissioned.
+- The Worker cutover is done: the server's legacy fallback, pull-through import and `LEGACY_*` settings are gone (`migration.rs` keeps only the export file format, with strict import checks); the `migration/` directory is the remaining TEMPORARY Worker tooling. Code marked TEMPORARY in the mesh (`MESH_ACCEPT_V1`) only covers deploys from versions that sent `INTERNAL_TOKEN` itself.

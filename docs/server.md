@@ -37,7 +37,7 @@ visitor ──TLS──▶ :443 ─┬─ SNI <route>.<id>.opentunnel.xyz ─▶
    not ready, deeper names) is closed, exactly as before.
 4. No bridge for the route on this machine: the visitor is forwarded to the
    machine that has one ([Multiple regions](#multiple-regions)), and only if
-   no machine has it, to the legacy Worker (migration) or closed.
+   no machine has it, closed.
 
 ## Bridge limits
 
@@ -97,6 +97,7 @@ lags behind its budget slows the bridge to its pace, at most 5 s per frame.
 | `CertificateWorkflow` (ZeroSSL, EAB, DNS-01, retries, `describeError`) | `acme.rs` + `dns.rs` + durable, leased `jobs` rows resumed after restarts; transient failures retried for a day, others three times (see below) |
 | Workflow instance named after the certificate ID | Job keyed by certificate ID (`ensure_issuance` adds it only if missing) |
 | Cloudflare-managed certificate for `opentunnel.xyz` | `jobs::ServerCertificates`: the same ACME issuance for the domain, renewed 30 days before expiry, hot-swapped |
+| Worker export (the migration, finished October 2026) | The same file format for backups: `opentunnel-server export`/`import`, `POST /api/admin/{export,import}`; imports take only records the server could have written itself (see [Limits](#limits)). The relay fallback to the Worker and the pull-through import are gone |
 | Static assets | `website.rs`: `dist/website` in memory, Cloudflare's HTML handling (`/index.html` → `/`), ETags |
 | Pipelines `EVENTS` binding | `analytics.rs`: identical event envelopes and payloads, posted in batches to `ANALYTICS_URL` |
 
@@ -205,8 +206,6 @@ Nothing assumes a single writer, so two servers on one database stay correct:
   (`AUTHZ_PENDING_FIX_MS`) whose last attempt ended on a pending authorization,
   failed or still retrying, is likewise queued once more with a fresh window
   (a job a server is running is left alone).
-- The legacy pull-through import is the same insert-first import, so two
-  machines importing one tunnel at once insert it once.
 - The domain's key is created insert-if-absent and its job is requested with a
   compare-and-set on `meta`.
 
@@ -252,7 +251,13 @@ the deploy fails, and the old machines keep serving.
 
 Back it up with `opentunnel-server export <file>` (or
 `POST /api/admin/export`); `opentunnel-server import <file>` writes an export
-into the database at `DATABASE_URL`. PlanetScale's own backups also cover it.
+into the database at `DATABASE_URL`, refusing (and listing under `rejected`)
+any record that is not exactly what the server writes: a tunnel ID that is one
+DNS label, the hostname `<id>.<domain>`, a SHA-256 token hash, and a CSR and
+identifiers only for the tunnel's own hostname and its wildcard.
+PlanetScale's own backups also cover it. (The admin export of the whole table
+in one response is larger than PlanetScale's 64 MiB result limit since
+~17,000 tunnels; use PlanetScale's backups or `pscale database dump`.)
 
 ## Configuration
 
@@ -303,7 +308,7 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `METRICS_LISTEN` | `off` | Prometheus metrics at `/metrics` (`[::]:9091` on Fly: every interface, as Fly's scraper does not reach the 6PN address; unauthenticated, not in `[[services]]`); see [Observability](#observability) |
 | `SHUTDOWN_DRAIN_MS` | `10000` | after SIGTERM, how long the server keeps accepting and serving while bridges move elsewhere |
 | `LOG_FORMAT` | `text` | `json` writes one JSON object per line (`json` on Fly) |
-| `LEGACY_WORKER_URL`, `RELAY_TOKEN`, `LEGACY_EXPORT_TOKEN` | | TEMPORARY, migration only ([cutover.md](cutover.md)) |
+| `MESH_VERIFY_ADDRESS` | `true` | a peer's mesh address must be where its connection comes from and, on Fly, what `<machine>.vm.<app>.internal` resolves to ([Multiple regions](#multiple-regions)) |
 
 Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
 
@@ -312,7 +317,7 @@ Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
 - `fly logs -a opentunnel`; `RUST_LOG=opentunnel_server=debug` for per-connection detail. Metrics and
   JSON logs: [Observability](#observability).
 - `POST /api/admin/stats` (bearer `ADMIN_TOKEN`) returns tunnel, alarm, job,
-  attached-bridge and legacy-forward counts. The top-level connection and
+  and attached-bridge counts. The top-level connection and
   bridge counts are the answering machine's; `machine` has its ID, region and
   forwarding counters (`forwarded_out`, `forwarded_in`, `forward_failures`)
   and live Tokio tasks and open file descriptors (`tasks`, `fds`, which should
@@ -368,6 +373,30 @@ against the same budget.
   tunnel does not have counts; binding its current CSR again (a resumed
   provision) answers as before, and renewals and requeued jobs are the
   server's own. Over it, the bind answers 429 the same way.
+- **Only a tunnel's own names**: right before every ACME order, the job
+  runner checks that a tunnel's job asks for exactly `<id>.<domain>` (and
+  optionally `*.<id>.<domain>`) of that tunnel, with a CSR whose common name
+  is the hostname and whose names are exactly those, and that a server job
+  asks only for the API domain. Anything else (the apex or its wildcard,
+  another tunnel's names, a CSR for other names; for example from a tampered
+  record) is refused without contacting the CA (`acme_attempts{outcome="refused"}`,
+  an `error` log, the tunnel's certificate `failed`). Imports are checked the
+  same way.
+- **CA cool-down**: five failed attempts in a row that point at the CA
+  (network errors, timeouts, 5xx, unreadable answers, nonce trouble), or one
+  rate limit, pause new issuance on every machine: for a minute, then twice
+  as long each time it happens again before an attempt succeeds, up to an
+  hour, and at least as long as a rate limit's `Retry-After`. The state is
+  shared in `meta` (`ca_cooldown`) and read at most every 15 s. While it
+  lasts no first issuance starts, and one renewal at a time does, which also
+  finds out whether the CA works again (a success ends the cool-down).
+  `opentunnel_acme_cooldowns_total` counts them; the log says "the CA keeps
+  failing; pausing new certificate issuance".
+- **Challenge records**: each attempt creates at most two TXT records (the
+  hostname and its wildcard share `_acme-challenge.<id>.<domain>`), a tunnel
+  has at most one first issuance at a time (and a renewal that a new bind
+  abandons), and new certificates per tunnel and the backlog are limited as
+  above, so records in the zone are bounded by the attempts running.
 - **Backlog**: while more than 200 certificate jobs are pending in the whole
   database (`ISSUANCE_BACKLOG_LIMIT`; the count is read at most every 5 s per
   machine, and when it cannot be read nothing is refused), creating tunnels
@@ -428,7 +457,7 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_bridge_backpressure_total` | counter | `event` (`stall`, `reset`) | a bridge reader waited 5 s for visitors to take data; a connection reset because its visitor did not keep up ([Bridge limits](#bridge-limits)) |
 | `opentunnel_bridge_detaches_total` | counter | `reason` (`client_close`, `drop`, `idle_retire`, `drain`, `delete`, `server_close`) | attached bridges that ended |
 | `opentunnel_visitor_connections_open` | gauge | | public tunnel connections held here (including forwarded ones) |
-| `opentunnel_visitor_connections_total` | counter | `outcome` (`served_local`, `forwarded_out`, `forwarded_in`, `legacy_relay`, `rejected_unknown_tunnel`, `rejected_unknown_route`, `rejected_no_bridge`, `rejected_cert_not_ready`, `rejected_too_many_connections`, `rejected_bad_hello`, `rejected_timeout`, `error`) | a forwarded visitor counts on both machines (`forwarded_out`, `forwarded_in`) |
+| `opentunnel_visitor_connections_total` | counter | `outcome` (`served_local`, `forwarded_out`, `forwarded_in`, `rejected_unknown_tunnel`, `rejected_unknown_route`, `rejected_no_bridge`, `rejected_cert_not_ready`, `rejected_too_many_connections`, `rejected_bad_hello`, `rejected_timeout`, `error`) | a forwarded visitor counts on both machines (`forwarded_out`, `forwarded_in`) |
 | `opentunnel_visitor_bytes_total` | counter | `direction` (`in`, `out`) | counted on the machine with the bridge |
 | `opentunnel_visitor_connection_duration_seconds` | histogram | | connections carried over a bridge here |
 | `opentunnel_cluster_forward_failures_total` | counter | `reason` (`refused`, `connect`, `timeout`, `io`) | |
@@ -441,9 +470,11 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_db_query_duration_seconds` | histogram | `operation` (the `Store` method) | |
 | `opentunnel_db_errors_total` | counter | `operation` | failed and timed out statements |
 | `opentunnel_db_pool_connections` | gauge | `state` (`idle`, `in_use`) | |
-| `opentunnel_acme_attempts_total` | counter | `kind` (`issue`, `renew`, `server`), `outcome` (`success`, `retry`, `failed`, `abandoned`) | `failed` gave up; `abandoned`: the tunnel no longer wants it |
+| `opentunnel_acme_attempts_total` | counter | `kind` (`issue`, `renew`, `server`), `outcome` (`success`, `retry`, `failed`, `abandoned`, `refused`) | `failed` gave up; `abandoned`: the tunnel no longer wants it; `refused`: names the tunnel may not have |
 | `opentunnel_acme_failures_total` | counter | `kind`, `class` (`network`, `timeout`, `http_5xx`, `http_429`, `bad_body`, `nonce`, `bad_nonce`, `authz_pending`, `dns`, `rejected`, `other`) | every failed attempt |
 | `opentunnel_acme_issuance_duration_seconds` | histogram | `kind`, `outcome` | one attempt |
+| `opentunnel_acme_cooldowns_total` | counter | | CA cool-downs this machine started ([Limits](#limits)) |
+| `opentunnel_acme_dns_records_total` | counter | `event` (`created`, `deleted`, `delete_failed`, `swept`) | DNS-01 challenge TXT records; `swept`: leftovers the periodic sweep deleted |
 | `opentunnel_certificate_jobs` | gauge | `status` (`pending`, `failed`: in the last 24 h) | the whole database, refreshed every minute on every machine (so take `max`, not `sum`) |
 | `opentunnel_certificates_expiring` | gauge | | ready certificates of tunnels with a bridge here that expire within 14 days |
 
@@ -547,7 +578,21 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   (`started_at`, then a random `epoch`), then the link dialed by the lower
   address. Failed dials back off from 200 ms to 5 s. An address that leaves DNS
   is dialed for 30 s more.
-- **Links.** A challenge and response proves both sides hold
+- **Challenge records.** An attempt deletes its records when it ends
+  (deletes that Cloudflare rate limits or fails with 5xx are retried; one
+  already gone counts as deleted), unless an authorization it answered could
+  not be deactivated, when the CA might still check them. At shutdown every
+  attempt in progress is ended and cleans up first (the job is resumed
+  elsewhere): until October 2026 a machine stopped by a deploy (or a failed
+  blue-green deploy deleting green machines that had started) exited
+  mid-attempt and left its records, ~1,300 of them, mostly from deploys and
+  their retries. Every 10 minutes one machine (a lease in `meta`,
+  `dns_sweeper`) lists `_acme-challenge.*` TXT records and deletes, at most
+  1,000 at 4 a second, those older than an hour under the domain whose value
+  is a challenge value, except names of jobs some machine is running.
+  `opentunnel_acme_dns_records_total{event}` counts `created`, `deleted`,
+  `delete_failed` and `swept`.
+
   `INTERNAL_TOKEN` without sending it (`peer_auth.rs`): the dialer sends
   `OPENTUNNEL-MESH/2 <machine> <nonce>\n`, the acceptor answers
   `OPENTUNNEL-MESH/2 <machine> <nonce> <proof>\n`, and the dialer, once that
@@ -556,7 +601,18 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   checked in constant time; a machine that answers at a peer address without
   the secret learns only a fresh proof it cannot reuse, and a `hello` naming
   another machine than the one that proved itself ends the link. The link is
-  authenticated, not encrypted (6PN itself is WireGuard between hosts). Then
+  authenticated, not encrypted (6PN itself is WireGuard between hosts). The
+  `hello` address (where forwards to the peer's bridges go) must be the
+  address the connection comes from (or was dialed at) and, on Fly, what
+  `<machine>.vm.<app>.internal` resolves to; a machine ID already linked from
+  another address is refused rather than taking its place. Before a peer has
+  proven the secret it can make a machine hold at most a header line (1 KiB,
+  10 s), and at most 256 such connections at once; its `hello` may be 4 KiB,
+  later frames 16 MiB (snapshots go out in several frames,
+  `snapshot`/`snapshot_part`, of at most 4 MiB of entries each). Peers'
+  `attached_at` more than 5 s ahead of this machine's clock counts as now, so
+  no peer can win every route forever, and a `tunnel deleted` event closes
+  bridges only once the database says the tunnel is deleted. Then
   frames: a big-endian `u32` length and a JSON object
   with a `type`. First `hello` (format version, machine ID, region, internal
   address, epoch, `started_at`, draining), then a `snapshot` of the sender's
@@ -611,8 +667,9 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   local visitor (`max_conns`, backpressure, analytics, the `open` message with
   the real visitor address), but never forwards again. It answers `1` before
   the stream or `0` when it has no bridge; on `0` or a failed connection the
-  sender looks once more, skipping that machine, and otherwise falls back to
-  the legacy Worker (if configured) or closes. The sender then copies both
+  sender looks once more, skipping that machine, and otherwise closes. A
+  signed forward or route check counts only from a machine linked now, from
+  its linked address. The sender then copies both
   directions (`net::splice`, 32 KiB buffers, half-closes passed on, the same
   idle and half-close timeouts as local visitors); a reset or timeout on one
   side resets the other.
@@ -710,16 +767,6 @@ ways, and nothing breaks unless an old machine never dials a new one (then
 the pair is not linked until the old machine stops: visitors on one side for
 bridges on the other are closed, as in a partition). Once no machine of that
 version runs, set `MESH_ACCEPT_V1=false` and remove the TEMPORARY code.
-
-The deploy that introduced the mesh ran next to machines of the previous
-version, which keep their bridges in the `bridges` table and answer the mesh
-greeting with an HTTP 400. New machines count those as `legacy` peers and,
-while one answers, look a route the mesh does not know up in `bridges` too
-(TEMPORARY, `Cluster::locate_legacy`), and forward to it with the unchanged
-forward protocol; old machines do not see new machines' bridges, so for the
-minute both run, a visitor on an old machine for a bridge on a new one is
-closed. A deletion through a new machine reaches old machines through their own
-heartbeat (within a minute). Old machines need nothing from new ones.
 
 ## Capacity
 
@@ -857,13 +904,14 @@ docker rm -f ot-mysql    # when done; it holds the test databases
   cached answers and mesh events, imports), the API contract replay against the Worker's recorded responses,
   the Rust client end to end (provisioning, passthrough, shared tunnels,
   restarts, migrated tunnels, renewal on attach, a database outage), the
-  migration paths against a fake Worker, two and three servers on one database
+  imports and job names (`tests/migration.rs`: hostile records refused, jobs
+  for other names refused), two and three servers on one database
   linked by the mesh (`tests/cluster.rs`: forwarding right after an attach,
   detaches, route conflicts and deletes across machines, machines in one region
   holding different routes, a crashed machine, a frozen one dropped after 5 s,
   a restart replacing its old entries, a partition healing, created and
-  certificate-ready tunnels routable at once, a machine of the previous
-  version, and jobs running once), the mesh alone (`tests/mesh.rs`: one link
+  certificate-ready tunnels routable at once, signed requests, deletions the
+  database does not confirm ignored, and jobs running once), the mesh alone (`tests/mesh.rs`: one link
   per pair, replication, newer claims, leaving, events, bad tokens, the
   challenge never revealing the secret, the previous versions, and 20,000
   bridges with 100 changes a second), signed forwards and route checks

@@ -1,5 +1,9 @@
 # Cutover: Cloudflare Worker → Fly
 
+> Done (October 2026). The server no longer has the legacy relay fallback, the pull-through import or the
+> `LEGACY_*` settings; this is the record of how it went. Imports now refuse records the server could not have
+> written itself (docs/server.md, "Storage").
+
 How to move opentunnel.xyz from the Cloudflare Worker (`opentunnel-production`,
 Durable Objects, AWS TCP relay) to the Rust server on Fly without any user
 doing anything. Installed clients keep their tunnel IDs, tokens, hostnames and
