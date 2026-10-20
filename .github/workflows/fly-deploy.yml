@@ -49,6 +49,19 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP/flyctl" flyctl
           echo "$RUNNER_TEMP/flyctl" >> "$GITHUB_PATH"
 
-      - run: flyctl deploy --remote-only --config fly.toml
+      # Blue-green needs Fly to place a second machine per region at once, which fails whenever one region is
+      # short on capacity (the deploy rolls back untouched). Retry a few times, then replace machines in place,
+      # one at a time, which needs no extra capacity; the server drains connections on SIGTERM either way.
+      - name: Deploy
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl deploy --remote-only --config fly.toml --build-only --push --image-label "$GITHUB_SHA"
+          image="registry.fly.io/opentunnel:$GITHUB_SHA"
+          for attempt in 1 2 3; do
+            flyctl deploy --config fly.toml --image "$image" && exit 0
+            echo "::warning::blue-green deploy attempt $attempt failed (usually Fly capacity in one region); retrying"
+            sleep 60
+          done
+          echo "::warning::falling back to a rolling deploy"
+          flyctl deploy --config fly.toml --image "$image" --strategy rolling
