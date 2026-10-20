@@ -45,6 +45,7 @@ pub struct Metrics {
     accept_errors: Family<Labels, Counter>,
     api_handshakes: Family<Labels, Counter>,
     connections_shed: Family<Labels, Counter>,
+    limited: Family<Labels, Counter>,
 
     bridges_attached: Gauge,
     bridge_attaches: Family<Labels, Counter>,
@@ -103,6 +104,7 @@ impl Metrics {
             accept_errors: Family::default(),
             api_handshakes: Family::default(),
             connections_shed: Family::default(),
+            limited: Family::default(),
             bridges_attached: Gauge::default(),
             bridge_attaches: Family::default(),
             bridge_detaches: Family::default(),
@@ -165,6 +167,11 @@ impl Metrics {
             "connections_shed",
             "Public connections closed at once because the machine is saturated, by reason (handshakes: too many API TLS handshakes waiting; connections: at the connection limit)",
             metrics.connections_shed.clone(),
+        );
+        r.register(
+            "requests_limited",
+            "API requests refused by a limit, by limit (create_rate: tunnels created per client address, 429; issuance_rate: new certificates per tunnel, 429; issuance_backlog: too many certificate jobs pending, 503)",
+            metrics.limited.clone(),
         );
         r.register(
             "bridges_attached",
@@ -311,6 +318,11 @@ pub fn connection_shed(reason: &'static str) {
         .connections_shed
         .get_or_create(&[("reason", reason)])
         .inc();
+}
+
+/// An API request was refused by a limit: `create_rate`, `issuance_rate` or `issuance_backlog`.
+pub fn limited(limit: &'static str) {
+    get().limited.get_or_create(&[("limit", limit)]).inc();
 }
 
 /// A TLS handshake for the API domain ended: `ok`, `failed` or `timeout`.

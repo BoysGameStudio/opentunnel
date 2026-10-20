@@ -5,8 +5,12 @@
 //!   every few seconds) and any static addresses. Both sides of a pair dial (the higher address after a short
 //!   delay); when two links to one machine come up, both sides keep the same one: the newer life of the machine
 //!   (`started_at`, `epoch`), then the link dialed by the lower address.
-//! - **Links.** On the internal listener: `OPENTUNNEL-MESH/1 <token>\n` both ways (the token is checked in
-//!   constant time), then frames: a big-endian `u32` length and a JSON [`Frame`]. Each side sends `hello`, then a
+//! - **Links.** On the internal listener, a challenge and response that never sends the shared secret: the dialer
+//!   sends `OPENTUNNEL-MESH/2 <machine> <nonce>\n`, the acceptor answers `OPENTUNNEL-MESH/2 <machine> <nonce>
+//!   <proof>\n` and the dialer `<proof>\n`, each proof an HMAC-SHA256 keyed with the secret over both nonces,
+//!   both machine IDs and the role (`peer_auth.rs`, checked in constant time). Then frames: a big-endian `u32`
+//!   length and a JSON [`Frame`]; a `hello` from another machine than the one that proved itself ends the link.
+//!   Each side sends `hello`, then a
 //!   `snapshot` of its own bridges, then `attached`/`detached` deltas numbered by a per-machine sequence, `event`s,
 //!   and a `ping` every second when idle. A peer that sends nothing for `dead` (5 s) is down; a closed or failed
 //!   link is down at once. Either way its bridges leave the table, and it is dialed again with backoff.
@@ -18,7 +22,11 @@
 //!   the service as [`Notice`]s. Events sent while a link is down are lost, so every link that comes up is a
 //!   [`Notice::LinkUp`], on which the service treats its cached answers as stale and looks for deleted tunnels.
 //!
-//! A machine of the previous version answers the mesh greeting with an HTTP error; it is counted as `legacy`.
+//! A machine of a version before the mesh answers the mesh greeting with an HTTP error; it is counted as `legacy`.
+//! TEMPORARY: a machine of the version before this handshake dials with `OPENTUNNEL-MESH/1 <secret>\n`; with
+//! `MESH_ACCEPT_V1` that greeting is accepted when the secret is right, and answered with the same line it sent
+//! (which tells it nothing it did not know). Such links are marked, so forwards and control requests to that
+//! machine use the format it understands; nothing ever sends the secret to a machine that did not send it first.
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
@@ -39,10 +47,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::clock::Clock;
-use crate::crypto::{hash_token, token_matches};
+use crate::peer_auth::{Secret, nonce};
 
-/// The first line of a mesh link, from both sides: `OPENTUNNEL-MESH/1 <token>\n`.
-pub const MESH_MAGIC: &[u8] = b"OPENTUNNEL-MESH/1 ";
+/// The first line of a mesh link from the dialer, `OPENTUNNEL-MESH/2 <machine> <nonce>\n`, and the acceptor's
+/// answer, `OPENTUNNEL-MESH/2 <machine> <nonce> <proof>\n`.
+pub const MESH_MAGIC: &[u8] = b"OPENTUNNEL-MESH/2 ";
+/// TEMPORARY: the previous version's greeting, `OPENTUNNEL-MESH/1 <secret>\n`, from both sides.
+pub const MESH_MAGIC_V1: &[u8] = b"OPENTUNNEL-MESH/1 ";
+const ACCEPT_LABEL: &str = "opentunnel mesh/2 accept";
+const DIAL_LABEL: &str = "opentunnel mesh/2 dial";
 /// The frame format's version, in `hello`. Unknown frame types and fields are ignored, so additions need no bump.
 pub const VERSION: u32 = 1;
 const MAX_FRAME: usize = 256 << 20;
@@ -73,6 +86,8 @@ pub struct MeshConfig {
     pub discovery: Duration,
     pub ping: Duration,
     pub dead: Duration,
+    /// TEMPORARY: accept links from machines that send the secret itself (`OPENTUNNEL-MESH/1`).
+    pub accept_v1: bool,
 }
 
 impl Default for MeshConfig {
@@ -83,6 +98,7 @@ impl Default for MeshConfig {
             discovery: Duration::from_secs(5),
             ping: Duration::from_secs(1),
             dead: Duration::from_secs(5),
+            accept_v1: true,
         }
     }
 }
@@ -222,6 +238,8 @@ struct Peer {
     connected_at: u64,
     seq: u64,
     entries: HashMap<u64, Entry>,
+    /// TEMPORARY: linked with `OPENTUNNEL-MESH/1`, so it takes forwards and control requests in that format.
+    v1: bool,
 }
 
 #[derive(Default)]
@@ -302,8 +320,7 @@ pub struct Mesh {
     pub epoch: u64,
     pub started_at: u64,
     address: OnceLock<String>,
-    token: String,
-    token_hash: String,
+    secret: Secret,
     clock: Clock,
     config: MeshConfig,
     statics: Mutex<Vec<String>>,
@@ -351,6 +368,36 @@ async fn read_frame<R: AsyncRead + Unpin>(
     serde_json::from_slice(buffer).context("decoding a frame")
 }
 
+/// A machine ID as it may appear in a handshake line.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 191
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b' ')
+}
+
+fn valid_nonce(nonce: &str) -> bool {
+    (16..=128).contains(&nonce.len()) && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// One handshake line without its newline, within the handshake timeout.
+async fn read_line<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Result<String> {
+    let mut line = Vec::new();
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        (&mut *reader).take(1024).read_until(b'\n', &mut line),
+    )
+    .await
+    .map_err(|_| anyhow!("no greeting"))??;
+    let line = line
+        .strip_suffix(b"\n")
+        .ok_or_else(|| anyhow!("no greeting"))?;
+    Ok(std::str::from_utf8(line)
+        .context("a greeting that is not text")?
+        .to_owned())
+}
+
 fn random_u64() -> u64 {
     let mut bytes = [0u8; 8];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes)
@@ -374,8 +421,7 @@ impl Mesh {
             epoch: random_u64(),
             started_at: clock.now_ms(),
             address: OnceLock::new(),
-            token_hash: hash_token(&token),
-            token,
+            secret: Secret::new(&token),
             clock,
             config,
             statics: Mutex::new(statics),
@@ -568,6 +614,17 @@ impl Mesh {
         found
     }
 
+    /// TEMPORARY: whether the machine is linked with the previous version's handshake, so it proved it holds the
+    /// secret by sending it, and takes forwards and control requests only in that version's format.
+    pub fn linked_v1(&self, machine_id: &str) -> bool {
+        self.remote
+            .lock()
+            .expect("mesh remote lock")
+            .peers
+            .get(machine_id)
+            .is_some_and(|peer| peer.v1)
+    }
+
     /// Whether a machine of this ID is linked now.
     pub fn is_up(&self, machine_id: &str) -> bool {
         self.remote
@@ -733,26 +790,73 @@ impl Mesh {
 
     // --- Links ---------------------------------------------------------------------------------------------
 
-    fn authorized(&self, token: &str) -> bool {
-        !token.is_empty() && token_matches(token, &self.token_hash)
-    }
-
-    fn greeting(&self) -> Vec<u8> {
-        let mut line = MESH_MAGIC.to_vec();
-        line.extend_from_slice(self.token.as_bytes());
-        line.push(b'\n');
-        line
-    }
-
-    /// Takes a link another machine dialed, after its greeting line (`token`). `stream` continues after it.
-    pub async fn accept<S>(self: &Arc<Self>, stream: S, token: &str) -> Result<()>
+    /// Takes a link another machine dialed, after the start of its greeting line (`<machine> <nonce>`, after
+    /// [`MESH_MAGIC`]). `stream` continues after that line.
+    pub async fn accept<S>(self: &Arc<Self>, stream: S, greeting: &str) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
-        if !self.authorized(token) {
+        let mut fields = greeting.split(' ');
+        let (Some(dialer), Some(dial_nonce), None) = (fields.next(), fields.next(), fields.next())
+        else {
+            bail!("a malformed mesh greeting");
+        };
+        if !valid_id(dialer) || !valid_nonce(dial_nonce) {
+            bail!("a malformed mesh greeting");
+        }
+        if dialer == self.machine_id {
+            bail!("linked to itself");
+        }
+        let (read, mut write) = tokio::io::split(stream);
+        let own_nonce = nonce();
+        let proof = self.secret.sign(&[
+            ACCEPT_LABEL,
+            dialer,
+            &self.machine_id,
+            dial_nonce,
+            &own_nonce,
+        ]);
+        let mut line = MESH_MAGIC.to_vec();
+        line.extend_from_slice(format!("{} {own_nonce} {proof}\n", self.machine_id).as_bytes());
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, write.write_all(&line))
+            .await
+            .map_err(|_| anyhow!("the handshake timed out"))??;
+        let mut reader = BufReader::new(read);
+        let answer = read_line(&mut reader).await?;
+        let expected = [DIAL_LABEL, dialer, &self.machine_id, dial_nonce, &own_nonce];
+        if !self.secret.verify(&expected, &answer) {
+            bail!("a mesh peer failed the challenge");
+        }
+        self.link(
+            tokio::io::join(reader, write),
+            false,
+            Some(dialer.to_owned()),
+            false,
+        )
+        .await
+    }
+
+    /// TEMPORARY: takes a link from a machine of the previous version, which greeted with the secret itself.
+    /// It is answered with the line it sent, as that version expects, only when the secret is right.
+    pub async fn accept_v1<S>(self: &Arc<Self>, stream: S, token: &str) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        if !self.config.accept_v1 {
+            bail!("a mesh link of the previous version, which is no longer accepted");
+        }
+        if !self.secret.matches(token) {
             bail!("mesh link with a bad token");
         }
-        self.link(stream, false).await
+        let (read, mut write) = tokio::io::split(stream);
+        let mut line = MESH_MAGIC_V1.to_vec();
+        line.extend_from_slice(token.as_bytes());
+        line.push(b'\n');
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, write.write_all(&line))
+            .await
+            .map_err(|_| anyhow!("the handshake timed out"))??;
+        self.link(tokio::io::join(read, write), false, None, true)
+            .await
     }
 
     async fn dial(self: &Arc<Self>, address: SocketAddr) -> Result<(), DialError> {
@@ -762,33 +866,60 @@ impl Mesh {
         let _ = stream.set_nodelay(true);
         crate::net::keepalive(&stream);
         let (read, mut write) = stream.into_split();
-        write.write_all(&self.greeting()).await?;
-        // The other side greets back, or (the previous version) answers with HTTP.
+        let own_nonce = nonce();
+        let mut greeting = MESH_MAGIC.to_vec();
+        greeting.extend_from_slice(format!("{} {own_nonce}\n", self.machine_id).as_bytes());
+        write.write_all(&greeting).await?;
+        // The other side answers with its challenge and proof, or (a version before the mesh, or before this
+        // handshake) with HTTP.
         let mut reader = BufReader::new(read);
-        let mut line = Vec::new();
-        tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            (&mut reader).take(1024).read_until(b'\n', &mut line),
-        )
-        .await
-        .map_err(|_| anyhow!("no greeting"))??;
-        if line.starts_with(b"HTTP/") {
+        let line = read_line(&mut reader).await?;
+        if line.starts_with("HTTP/") {
             return Err(DialError::Legacy);
         }
-        let token = line
-            .strip_prefix(MESH_MAGIC)
-            .and_then(|rest| rest.strip_suffix(b"\n"))
-            .and_then(|token| std::str::from_utf8(token).ok())
-            .ok_or_else(|| anyhow!("no greeting"))?;
-        if !self.authorized(token) {
-            return Err(anyhow!("the peer greeted with a bad token").into());
+        let mut fields = line
+            .strip_prefix(std::str::from_utf8(MESH_MAGIC).expect("ASCII"))
+            .ok_or_else(|| anyhow!("no greeting"))?
+            .split(' ');
+        let (Some(acceptor), Some(accept_nonce), Some(proof), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(anyhow!("a malformed greeting").into());
+        };
+        if !valid_id(acceptor) || !valid_nonce(accept_nonce) {
+            return Err(anyhow!("a malformed greeting").into());
         }
+        let parts = |label: &'static str| -> [&str; 5] {
+            [
+                label,
+                self.machine_id.as_str(),
+                acceptor,
+                own_nonce.as_str(),
+                accept_nonce,
+            ]
+        };
+        if !self.secret.verify(&parts(ACCEPT_LABEL), proof) {
+            return Err(anyhow!("the peer failed the challenge").into());
+        }
+        if acceptor == self.machine_id {
+            return Err(anyhow!("linked to itself").into());
+        }
+        let answer = format!("{}\n", self.secret.sign(&parts(DIAL_LABEL)));
+        write.write_all(answer.as_bytes()).await?;
+        let acceptor = acceptor.to_owned();
         let stream = tokio::io::join(reader, write);
-        Ok(self.link(stream, true).await?)
+        Ok(self.link(stream, true, Some(acceptor), false).await?)
     }
 
-    /// Runs a link after the greeting (sent by the dialer, checked by the acceptor) until it ends.
-    async fn link<S>(self: &Arc<Self>, stream: S, dialed: bool) -> Result<()>
+    /// Runs a link after the handshake until it ends. `machine` is the machine that proved itself, if the
+    /// handshake named one; `v1` a link of the previous version.
+    async fn link<S>(
+        self: &Arc<Self>,
+        stream: S,
+        dialed: bool,
+        machine: Option<String>,
+        v1: bool,
+    ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -799,7 +930,14 @@ impl Mesh {
         let mut reader = BufReader::new(read);
         let mut writer = BufWriter::new(write);
         let result = self
-            .run_link(&mut reader, &mut writer, dialed, link, queue, &cancel)
+            .run_link(
+                &mut reader,
+                &mut writer,
+                (dialed, machine, v1),
+                link,
+                queue,
+                &cancel,
+            )
             .await;
         self.unsubscribe(link);
         cancel.cancel();
@@ -816,7 +954,7 @@ impl Mesh {
         self: &Arc<Self>,
         reader: &mut R,
         writer: &mut W,
-        dialed: bool,
+        (dialed, machine, v1): (bool, Option<String>, bool),
         link: u64,
         mut queue: mpsc::Receiver<Bytes>,
         cancel: &CancellationToken,
@@ -827,9 +965,6 @@ impl Mesh {
     {
         let mut buffer = Vec::new();
         let peer = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-            if !dialed {
-                writer.write_all(&self.greeting()).await?;
-            }
             writer
                 .write_all(&encode(&Frame::Hello(self.hello())))
                 .await?;
@@ -844,13 +979,16 @@ impl Mesh {
         if peer.machine_id == self.machine_id {
             bail!("linked to itself");
         }
+        if machine.is_some_and(|machine| machine != peer.machine_id) {
+            bail!("the peer said hello as another machine than it proved to be");
+        }
         let dialer = if dialed {
             self.address().to_owned()
         } else {
             peer.address.clone()
         };
         let machine = peer.machine_id.clone();
-        if !self.register(peer, link, dialer, cancel.clone()) {
+        if !self.register(peer, link, dialer, cancel.clone(), v1) {
             debug!(peer = %machine, "a duplicate mesh link closed");
             return Ok(());
         }
@@ -912,7 +1050,14 @@ impl Mesh {
 
     /// Records a new link to a peer, unless a better one exists: the newer life of the machine wins, then the
     /// link dialed by the lower address, then the newer link. Both sides decide alike.
-    fn register(&self, hello: Hello, link: u64, dialer: String, cancel: CancellationToken) -> bool {
+    fn register(
+        &self,
+        hello: Hello,
+        link: u64,
+        dialer: String,
+        cancel: CancellationToken,
+        v1: bool,
+    ) -> bool {
         if self
             .partitioned
             .lock()
@@ -957,6 +1102,7 @@ impl Mesh {
                 connected_at: self.now(),
                 seq: 0,
                 entries,
+                v1,
             },
         );
         drop(remote);

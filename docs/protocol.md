@@ -59,6 +59,16 @@ meaning: `Cloudflare 525: the SSL handshake with the server failed (HTTP
 525)`. `spec/vectors/api-retry.json` lists the delays, the statuses and the
 messages.
 
+The hosted service limits what one client can make it do on the shared ACME
+account: creating tunnels per client address, and binding a new CSR (not the
+one the tunnel already has) per tunnel. Over a limit it answers `429` with
+`Retry-After` (seconds) and `{"_tag":"RateLimitedError","message":"..."}`;
+while too much certificate issuance is queued, creating a tunnel or binding a
+new CSR answers `503` (`ServiceUnavailableError`) with `Retry-After`. Both are
+retried as above and then reported with their message; a `Retry-After` beyond
+8 s is not waited for. The limits are the server's
+([server.md](server.md#limits)).
+
 When a client with a saved identity checks its certificate before connecting
 and the check still fails transiently after the retries, it keeps using the
 saved certificate if it has not expired. The bridge WebSocket reconnects with

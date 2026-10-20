@@ -1,14 +1,14 @@
 //! Background work that replaces the certificate Workflow and the Durable Object alarms: durable issuance jobs
 //! (resumed after a restart), renewal alarms, the sweep for silent bridges, and the API domain's certificate.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use opentunnel::protocol::api::CertificateState;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::acme::Challenge;
 use crate::clock::{DAY_MS, HOUR_MS, MINUTE_MS};
@@ -44,7 +44,8 @@ pub struct Jobs {
     pub server: Option<Arc<ServerCertificates>>,
     /// This process's name on job leases.
     pub owner: String,
-    running: Mutex<HashSet<String>>,
+    /// Jobs running here, by certificate ID.
+    running: Mutex<HashMap<String, JobKind>>,
 }
 
 /// The lease owner for this process: the Fly machine ID, which survives restarts so a restarted server takes
@@ -71,7 +72,7 @@ impl Jobs {
             retry_delay_ms,
             server,
             owner: lease_owner(),
-            running: Mutex::new(HashSet::new()),
+            running: Mutex::new(HashMap::new()),
         })
     }
 
@@ -105,28 +106,35 @@ impl Jobs {
         }
         let store = &self.service.store;
         let limit = self.concurrency + running + 1;
-        let schedule = store.job_schedule(&self.owner, limit).await?;
         let now = self.service.now();
-        let mut next = schedule.iter().map(|(_, at)| *at).find(|at| *at > now);
+        // Due jobs come first, renewals before first issuance.
+        let schedule = store.job_schedule(&self.owner, now, limit).await?;
+        let mut next = schedule.iter().map(|(_, at, _)| *at).find(|at| *at > now);
         if next.is_none() && schedule.len() == limit {
             // Every listed job is due, so there may be more: look again soon.
             next = Some(now + 1_000);
         }
         let due = schedule
             .into_iter()
-            .filter(|(_, at)| *at <= now)
-            .map(|(id, _)| id);
-        for id in due {
-            if self.running.lock().expect("running lock").len() >= self.concurrency {
-                break;
-            }
-            if !self
-                .running
-                .lock()
-                .expect("running lock")
-                .insert(id.clone())
+            .filter(|(_, at, _)| *at <= now)
+            .map(|(id, _, kind)| (id, kind));
+        for (id, kind) in due {
             {
-                continue;
+                let mut running = self.running.lock().expect("running lock");
+                if running.len() >= self.concurrency {
+                    break;
+                }
+                // One slot stays free for renewals, so first issuance cannot take them all.
+                let issuing = running
+                    .values()
+                    .filter(|kind| **kind == JobKind::Issue)
+                    .count();
+                if kind == JobKind::Issue && issuing >= self.issue_slots() {
+                    continue;
+                }
+                if running.insert(id.clone(), kind).is_some() {
+                    continue;
+                }
             }
             // Another server may have taken it since it was listed.
             let job = match store.claim_job(&id, &self.owner, self.service.now()).await {
@@ -151,6 +159,15 @@ impl Jobs {
             });
         }
         Ok(next)
+    }
+
+    /// Jobs of first issuance that may run at once: all but one slot, which renewals keep.
+    fn issue_slots(&self) -> usize {
+        if self.concurrency > 1 {
+            self.concurrency - 1
+        } else {
+            self.concurrency
+        }
     }
 
     /// Gives up this process's job leases, on shutdown.
@@ -450,6 +467,11 @@ pub async fn run_reconcile(service: Service) {
             Ok(0) => {}
             Ok(resumed) => info!(resumed, "resumed certificate issuance without a job"),
             Err(error) => error!(%error, "resuming certificate issuance failed"),
+        }
+        match service.store.prune_rate_limits(service.now()).await {
+            Ok(0) => {}
+            Ok(pruned) => debug!(pruned, "pruned rate limits"),
+            Err(error) => warn!(%error, "pruning rate limits failed"),
         }
         match service.retry_failed_issuance().await {
             Ok(0) => {}

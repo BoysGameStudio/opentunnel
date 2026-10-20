@@ -85,6 +85,12 @@ MySQL 8, in production the PlanetScale database `opentunnel` (org
   mesh keeps that in memory ([Multiple regions](#multiple-regions)); this
   version only reads it while a machine of the previous version is still
   running (a deploy from it). TEMPORARY: drop it in a later schema version.
+- `rate_limits`: one row per limited key (`create:<client address>`,
+  `issue:<tunnel>`) with the time its budget is full again ([Limits](#limits));
+  rows in the past are pruned every 5 minutes. Added without a schema version:
+  a database at schema 2 gets it at startup when it is missing (`CREATE TABLE
+  IF NOT EXISTS`, no DDL once it exists), so servers of the previous version,
+  which refuse a newer schema, still start against it (a rollback).
 - `schema_migrations`: the schema version.
 
 The schema keeps to what Vitess allows: a primary key on every table, no
@@ -226,11 +232,16 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `DNS_PROVIDER` | `cloudflare` | or `challtestsrv` (Pebble's test DNS) |
 | `CLOUDFLARE_ZONE_ID` | the opentunnel.xyz zone | |
 | `CLOUDFLARE_API_TOKEN` | | secret: DNS edit on the zone, only for DNS-01 |
-| `ISSUANCE_CONCURRENCY` | `4` | ACME orders at once |
+| `ISSUANCE_CONCURRENCY` | `4` | ACME orders at once per machine; one of them is kept for renewals |
+| `CREATE_RATE_PER_HOUR` / `CREATE_RATE_BURST` | `30` / `10` | tunnels one client address (IPv6: its /64) may create, cluster-wide: this many an hour on average, the burst at once; `0` disables ([Limits](#limits)) |
+| `ISSUANCE_RATE_PER_DAY` / `ISSUANCE_RATE_BURST` | `5` / `5` | new certificates (a bind with a new CSR) one tunnel may request a day on average, and at once; `0` disables |
+| `ISSUANCE_BACKLOG_LIMIT` | `200` | while more certificate jobs are pending, creating tunnels and new certificates answer 503; `0` disables |
+| `TRUSTED_PROXY_RANGES` | Cloudflare's ranges | CIDRs (comma-separated) whose `CF-Connecting-IP` names the client; `off` trusts none |
 | `ANALYTICS_URL`, `ANALYTICS_TOKEN` | | the platform event stream's HTTP endpoint and bearer token; analytics are off without the URL |
 | `ADMIN_TOKEN` | | secret: enables `POST /api/admin/{import,export,stats}` |
 | `INTERNAL_LISTEN` | `off` | the internal listener for other machines: mesh links, forwarded visitors, route checks (`[::]:9000` on Fly, bound to `FLY_PRIVATE_IP`); `off` runs a single machine without the mesh |
-| `INTERNAL_TOKEN` | | secret shared by all machines, required with `INTERNAL_LISTEN` |
+| `INTERNAL_TOKEN` | | secret shared by all machines, required with `INTERNAL_LISTEN`; never sent, only proven ([Multiple regions](#multiple-regions)) |
+| `MESH_ACCEPT_V1` | `true` | TEMPORARY: accept mesh links, forwards and route checks from the version that sent `INTERNAL_TOKEN` itself (for the deploy from it); set `false`, then remove, once none run |
 | `INTERNAL_ADDRESS` | `[FLY_PRIVATE_IP]:<port>` | where other machines reach this one |
 | `FLY_MACHINE_ID`, `FLY_REGION`, `FLY_PRIVATE_IP`, `FLY_APP_NAME` | random, `local`, , | set by Fly: the machine's ID in the mesh (also the job lease owner), region, 6PN address, and app (for `MESH_DNS`) |
 | `MESH_DNS` | `<FLY_APP_NAME>.internal` | a name whose AAAA/A records are the other machines, at this machine's internal port; `off` disables it |
@@ -239,7 +250,7 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `MESH_PING_MS` / `MESH_DEAD_MS` | `1000` / `5000` | an idle link pings this often; a peer silent this long is down |
 | `CONNECTION_IDLE_TIMEOUT_MS` | `900000` | a tunnel connection with no traffic either way for this long is reset |
 | `HALF_CLOSE_TIMEOUT_MS` | `60000` | once either direction of a tunnel connection has ended, the other is reset after this long without traffic |
-| `METRICS_LISTEN` | `off` | Prometheus metrics at `/metrics` (`[::]:9091` on Fly, unauthenticated, not in `[[services]]`); see [Observability](#observability) |
+| `METRICS_LISTEN` | `off` | Prometheus metrics at `/metrics` (`[::]:9091` on Fly, bound to `FLY_PRIVATE_IP` like the internal listener, unauthenticated, not in `[[services]]`); see [Observability](#observability) |
 | `SHUTDOWN_DRAIN_MS` | `10000` | after SIGTERM, how long the server keeps accepting and serving while bridges move elsewhere |
 | `LOG_FORMAT` | `text` | `json` writes one JSON object per line (`json` on Fly) |
 | `LEGACY_WORKER_URL`, `RELAY_TOKEN`, `LEGACY_EXPORT_TOKEN` | | TEMPORARY, migration only ([cutover.md](cutover.md)) |
@@ -288,14 +299,66 @@ Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
 - The domain certificate is requested on first start and checked hourly;
   until it exists, TLS to the domain fails while tunnel traffic works.
 
+## Limits
+
+Creating a tunnel needs no account, and each new certificate is an ACME order
+on the one shared ZeroSSL account plus DNS writes in the Cloudflare zone, so
+the server limits what any one client can make it do. All limits are
+cluster-wide: rates live in the `rate_limits` table, one conditional `UPDATE`
+per request (an `INSERT` for a key not seen before), so every machine counts
+against the same budget.
+
+- **Tunnels per client address**: 30 an hour on average, 10 at once
+  (`CREATE_RATE_PER_HOUR`, `CREATE_RATE_BURST`), counted per IPv4 address and
+  per IPv6 /64. Over it, `POST /api/tunnel` answers 429 with `Retry-After` and
+  `{"_tag":"RateLimitedError","message":"Too many tunnels created from this
+  address; try again in N minutes"}`.
+- **New certificates per tunnel**: 5 a day on average, 5 at once
+  (`ISSUANCE_RATE_PER_DAY`, `ISSUANCE_RATE_BURST`). Only a bind with a CSR the
+  tunnel does not have counts; binding its current CSR again (a resumed
+  provision) answers as before, and renewals and requeued jobs are the
+  server's own. Over it, the bind answers 429 the same way.
+- **Backlog**: while more than 200 certificate jobs are pending in the whole
+  database (`ISSUANCE_BACKLOG_LIMIT`; the count is read at most every 5 s per
+  machine, and when it cannot be read nothing is refused), creating tunnels
+  and binding new CSRs answer 503 (`ServiceUnavailableError`, `certificate
+  issuance is busy; try again later`) with `Retry-After: 30`, instead of
+  queueing without bound.
+- **Renewals first**: the job runner takes due renewals (and the domain's own
+  certificate) before due first issuance, and first issuance never takes the
+  last of a machine's `ISSUANCE_CONCURRENCY` slots, so a flood of new
+  certificates cannot hold up renewals.
+
+Rates use GCRA: each key stores when its budget is full again, a request
+passes while that is at most `(burst - 1) × interval` ahead and pushes it one
+`interval` (an hour / 30, a day / 5) further. Both clients retry 429 and 503
+a few times, waiting `Retry-After` up to 8 s, then report the message
+([protocol.md](protocol.md#retries-and-errors)).
+
+**The client address.** `opentunnel.xyz` is proxied by Cloudflare, so the
+PROXY header's source of an API connection is a Cloudflare edge. The client is
+`CF-Connecting-IP` only when that source is in Cloudflare's published ranges
+(`limits::CLOUDFLARE_RANGES`, from cloudflare.com/ips-v4 and ips-v6, October
+2026; `TRUSTED_PROXY_RANGES` overrides them); from anywhere else the header is
+ignored and the source itself is counted, so a client connecting to Fly
+directly cannot spoof its way around the limit. Update the list when
+Cloudflare publishes new ranges (an edge outside it would make all its
+clients share one budget).
+
+`opentunnel_requests_limited_total{limit}` counts refusals (`create_rate`,
+`issuance_rate`, `issuance_backlog`).
+
 ## Observability
 
 ### Metrics
 
 Every machine serves Prometheus metrics (OpenMetrics text) at `GET /metrics` on
-`METRICS_LISTEN` (`[::]:9091`). It needs no token: no `[[services]]` entry
-exposes the port, so only Fly's scraper and the private network reach it, and
-nothing in it is secret. `fly.toml`'s `[metrics]` section has Fly scrape it
+`METRICS_LISTEN` (`[::]:9091`, bound to the machine's 6PN address
+`FLY_PRIVATE_IP`, where Fly's scraper reaches it). It needs no token: no
+`[[services]]` entry exposes the port, so only Fly's scraper and the private
+network reach it, which is the whole `anomaly-807` organization, so nothing in
+it may be secret or per tenant: no tunnel IDs, hostnames or client addresses,
+only machine IDs and fixed label values. `fly.toml`'s `[metrics]` section has Fly scrape it
 every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 `instance` labels. No metric has a per-tunnel label.
 
@@ -308,6 +371,7 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_accept_errors_total` | counter | `error` (`emfile`, `other`) | failed accepts; `emfile` is running out of descriptors |
 | `opentunnel_api_tls_handshakes_total` | counter | `result` (`ok`, `failed`, `timeout`) | TLS for the API domain; through Cloudflare a failed handshake is a 525 |
 | `opentunnel_connections_shed_total` | counter | `reason` (`handshakes`, `connections`) | public connections closed unserved because the machine is saturated: no API TLS handshake slot within 1 s, or at the connection limit (as many as three quarters of the memory hold at 64 KB each, at most 60,000; logged at startup) ([Capacity](#capacity)) |
+| `opentunnel_requests_limited_total` | counter | `limit` (`create_rate`, `issuance_rate`, `issuance_backlog`) | API requests refused by a [limit](#limits) |
 | `opentunnel_bridges_attached` | gauge | | |
 | `opentunnel_bridge_attaches_total` | counter | `result` (`ok`, `bad_token`, `cert_not_ready`, `invalid_route`, `route_conflict`, `error`) | |
 | `opentunnel_bridge_detaches_total` | counter | `reason` (`client_close`, `drop`, `idle_retire`, `drain`, `delete`, `server_close`) | attached bridges that ended |
@@ -418,7 +482,7 @@ checks, acting on events); with `INTERNAL_LISTEN=off` none of it runs.
                     ┌── mesh link (TCP over 6PN, :9000): snapshot, attached/detached, events, pings ──┐
 client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "attached" to every peer         machine B (syd) ◀─ visitor
                                  ▲                                                             │ table: tunnel/route → A
-                                 └──── TCP over 6PN to A:9000: "OPENTUNNEL-FORWARD/1 <secret> <id> <route> <visitor>\n"
+                                 └──── TCP over 6PN to A:9000: "OPENTUNNEL-FORWARD/2 B A <time> <nonce> <id> <route> <visitor> <proof>\n"
                                        + ClientHello ──▶ "1" ──▶ raw bytes both ways ──────────┘
 ```
 
@@ -431,8 +495,17 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   (`started_at`, then a random `epoch`), then the link dialed by the lower
   address. Failed dials back off from 200 ms to 5 s. An address that leaves DNS
   is dialed for 30 s more.
-- **Links.** Both sides send `OPENTUNNEL-MESH/1 <INTERNAL_TOKEN>\n` (checked
-  in constant time), then frames: a big-endian `u32` length and a JSON object
+- **Links.** A challenge and response proves both sides hold
+  `INTERNAL_TOKEN` without sending it (`peer_auth.rs`): the dialer sends
+  `OPENTUNNEL-MESH/2 <machine> <nonce>\n`, the acceptor answers
+  `OPENTUNNEL-MESH/2 <machine> <nonce> <proof>\n`, and the dialer, once that
+  proof checks out, `<proof>\n`. Each proof is HMAC-SHA256 keyed with the
+  secret over its role (`accept`, `dial`), both machine IDs and both nonces,
+  checked in constant time; a machine that answers at a peer address without
+  the secret learns only a fresh proof it cannot reuse, and a `hello` naming
+  another machine than the one that proved itself ends the link. The link is
+  authenticated, not encrypted (6PN itself is WireGuard between hosts). Then
+  frames: a big-endian `u32` length and a JSON object
   with a `type`. First `hello` (format version, machine ID, region, internal
   address, epoch, `started_at`, draining), then a `snapshot` of the sender's
   own bridges with its sequence number, then `attached`/`detached` deltas
@@ -476,8 +549,12 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   the cached copy is used.
 - **Forwarding.** A visitor for a route with no local bridge: look up the
   route in the table (the newest attach if two machines claim it), connect to
-  the holder's internal address, send the header (shared secret, tunnel,
-  route, the visitor's address from PROXY v2) and the buffered ClientHello.
+  the holder's internal address, send the header (sender and receiver machine
+  IDs, the time, a nonce, tunnel, route, the visitor's address from PROXY v2,
+  and an HMAC-SHA256 over all of them keyed with the shared secret) and the
+  buffered ClientHello. The receiver checks that the header is for it, signed
+  within 30 s of its clock, and that it has not seen the nonce (so a captured
+  header cannot be replayed).
   The receiver parses the ClientHello itself and routes it exactly like a
   local visitor (`max_conns`, backpressure, analytics, the `open` message with
   the real visitor address), but never forwards again. It answers `1` before
@@ -489,7 +566,8 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   side resets the other.
 - **Route conflicts.** Attaching checks the table for the requested routes on
   other live machines and asks only those (`GET /internal/tunnel/<id>/routes`
-  on the internal listener, `Authorization: Bearer <INTERNAL_TOKEN>`, which
+  on the internal listener, signed like a forward in an `x-opentunnel-auth`
+  header over the method and path, which
   retires silent bridges before answering); only a live answer is a
   `route_conflict`, so a machine that is down, draining or cannot be asked
   never blocks a client that moved. Two machines accepting the same route in
@@ -522,8 +600,10 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   `attaches_within_one_database_round_trip` in `service.rs` checks the attach
   against a database 100 ms away.
 - **The internal port** binds only the machine's 6PN address and is not in
-  `fly.toml`'s services, so it is unreachable from the Internet. Its first line
-  selects mesh link, forward, or HTTP.
+  `fly.toml`'s services, so it is unreachable from the Internet. 6PN is
+  organization-wide, though (any app in `anomaly-807` reaches it), so nothing
+  on it trusts the network: every link, forward and route check proves the
+  secret as above. Its first line selects mesh link, forward, or HTTP.
 
 Failure modes:
 
@@ -562,6 +642,22 @@ curl -s -X POST https://opentunnel.xyz/api/admin/stats -H "authorization: Bearer
 `fly scale count 2 --region iad` adds a second machine there: it joins the mesh
 by itself. Every machine must have `INTERNAL_TOKEN` before it runs with
 `INTERNAL_LISTEN` (staged secrets apply on the next deploy).
+
+The deploy that replaced sending `INTERNAL_TOKEN` (October 2026) runs next
+to machines that greet with `OPENTUNNEL-MESH/1 <secret>`, forward with
+`OPENTUNNEL-FORWARD/1 <secret> ...` and ask with a bearer secret, and answer
+anything else with HTTP 400. New machines never send the secret to anyone who
+did not send it first: they greet with the challenge, which an old machine
+answers with HTTP (`legacy` in the peer states for up to a minute), but they
+accept an old machine's own greeting when its secret is right and answer it
+with the line it sent, which tells it nothing new (`MESH_ACCEPT_V1`). Such a
+link is marked, and only to a machine marked that way do new machines forward
+and send route checks in the old format. So links come up as soon as the old
+machine dials (within its next discovery, 5 s), forwarding keeps working both
+ways, and nothing breaks unless an old machine never dials a new one (then
+the pair is not linked until the old machine stops: visitors on one side for
+bridges on the other are closed, as in a partition). Once no machine of that
+version runs, set `MESH_ACCEPT_V1=false` and remove the TEMPORARY code.
 
 The deploy that introduced the mesh ran next to machines of the previous
 version, which keep their bridges in the `bridges` table and answer the mesh
@@ -717,7 +813,13 @@ docker rm -f ot-mysql    # when done; it holds the test databases
   certificate-ready tunnels routable at once, a machine of the previous
   version, and jobs running once), the mesh alone (`tests/mesh.rs`: one link
   per pair, replication, newer claims, leaving, events, bad tokens, the
-  previous version, and 20,000 bridges with 100 changes a second), and
+  challenge never revealing the secret, the previous versions, and 20,000
+  bridges with 100 changes a second), signed forwards and route checks
+  (`tests/cluster.rs`: replayed, stale, misaddressed and badly signed requests
+  refused), the limits (`tests/limits.rs`: per client address, a spoofed
+  `CF-Connecting-IP` ignored, the header believed from trusted proxies, per
+  tunnel, the backlog; unit tests for the Cloudflare ranges and IPv6 /64
+  keys; `store.rs` for GCRA under concurrency), and
   connections whose peers vanish (`tests/leaks.rs`: visitors that close while
   the target never ends, silent visitors, a bridge that goes away, partial
   ClientHellos; tasks and descriptors return to their baseline).

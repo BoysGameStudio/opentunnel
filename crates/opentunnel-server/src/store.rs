@@ -99,7 +99,19 @@ const SCHEMA: &[&str] = &[
   KEY bridges_machine (machine_id),
   KEY bridges_updated (updated_at)
 ) DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin"#,
+    RATE_LIMITS,
 ];
+
+/// Rate limits (`limits.rs`). Added without a schema version, so servers of the previous version still start
+/// against a database that has it: [`migrate`] creates it when it is missing.
+const RATE_LIMITS: &str = r#"CREATE TABLE IF NOT EXISTS rate_limits (
+  -- `create:<client address>` or `issue:<tunnel>`.
+  name VARCHAR(191) NOT NULL PRIMARY KEY,
+  -- When the key's budget is full again (GCRA's theoretical arrival time), Unix ms; a row in the past is the same
+  -- as none, and is pruned.
+  tat BIGINT NOT NULL,
+  KEY rate_limits_tat (tat)
+) DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin"#;
 
 /// Every statement gives up after this long, so a stalled database cannot hang a request.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -367,6 +379,18 @@ async fn migrate(connection: &mut MySqlConnection) -> Result<()> {
             return Err(NewerSchema(version).into());
         }
         if version == SCHEMA_VERSION {
+            // Tables added without a version: created only while missing, so no DDL runs once they exist.
+            match connection
+                .execute("SELECT 1 FROM rate_limits LIMIT 0")
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if mysql_code(&error) == Some(1146) => {
+                    connection.execute(RATE_LIMITS).await.map_err(db)?;
+                    info!("created the rate_limits table");
+                }
+                Err(error) => return Err(db(error)),
+            }
             return Ok(());
         }
     }
@@ -1140,6 +1164,86 @@ impl Store {
         .await
     }
 
+    /// Certificate jobs pending, cluster-wide, for the issuance backlog limit.
+    pub async fn pending_jobs(&self) -> Result<u64> {
+        timed("pending_jobs", async {
+            let pending: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE status = 'pending'")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db)?;
+            Ok(pending.max(0) as u64)
+        })
+        .await
+    }
+
+    /// Takes one request from `name`'s budget (GCRA, see `limits.rs`) at `now`. Usually one statement: a
+    /// conditional update that only succeeds within the budget; a key not seen before is inserted.
+    pub async fn take_rate(
+        &self,
+        name: &str,
+        now: u64,
+        rate: crate::limits::Rate,
+    ) -> Result<crate::limits::Verdict> {
+        use crate::limits::Verdict;
+        let (now, interval, tolerance) = (
+            now as i64,
+            rate.interval_ms as i64,
+            rate.tolerance_ms as i64,
+        );
+        timed("take_rate", async {
+            for _ in 0..2 {
+                let taken = sqlx::query(
+                    "UPDATE rate_limits SET tat = GREATEST(tat, ?) + ?
+                     WHERE name = ? AND GREATEST(tat, ?) <= ?",
+                )
+                .bind(now)
+                .bind(interval)
+                .bind(name)
+                .bind(now)
+                .bind(now + tolerance)
+                .execute(&self.pool)
+                .await
+                .map_err(db)?;
+                if taken.rows_affected() == 1 {
+                    return Ok(Verdict::Allowed);
+                }
+                let inserted = sqlx::query("INSERT INTO rate_limits (name, tat) VALUES (?, ?)")
+                    .bind(name)
+                    .bind(now + interval)
+                    .execute(&self.pool)
+                    .await;
+                match inserted {
+                    Ok(_) => return Ok(Verdict::Allowed),
+                    // It exists: over budget, or inserted by someone else in between (then try once more).
+                    Err(error) if mysql_code(&error) == Some(ER_DUP_ENTRY) => {}
+                    Err(error) => return Err(db(error)),
+                }
+            }
+            let tat: Option<i64> = sqlx::query_scalar("SELECT tat FROM rate_limits WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?;
+            let retry_after_ms = tat.map_or(0, |tat| tat - tolerance - now).max(1) as u64;
+            Ok(Verdict::Limited { retry_after_ms })
+        })
+        .await
+    }
+
+    /// Deletes rate limit rows whose budget is full again (the same as no row). Returns how many.
+    pub async fn prune_rate_limits(&self, now: u64) -> Result<u64> {
+        timed("prune_rate_limits", async {
+            let pruned = sqlx::query("DELETE FROM rate_limits WHERE tat < ? LIMIT 10000")
+                .bind(now as i64)
+                .execute(&self.pool)
+                .await
+                .map_err(db)?;
+            Ok(pruned.rows_affected())
+        })
+        .await
+    }
+
     /// Pending jobs due at `now` that nobody else holds, without taking them.
     pub async fn due_job_ids(&self, owner: &str, now: u64, limit: usize) -> Result<Vec<String>> {
         timed("due_job_ids", async {
@@ -1390,24 +1494,34 @@ impl Store {
         .await
     }
 
-    /// Up to `limit` pending jobs with when `owner` may take each (Unix ms), soonest first: when it is due and
-    /// any lease of another process has expired. The job runner's one query per wakeup.
-    pub async fn job_schedule(&self, owner: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+    /// Up to `limit` pending jobs with when `owner` may take each (Unix ms) and their kind: when it is due and
+    /// any lease of another process has expired. Those that may be taken at `now` come first, renewals and the
+    /// server's own before first issuance (so a flood of new certificates cannot hold renewals up), then the
+    /// rest soonest first. The job runner's one query per wakeup.
+    pub async fn job_schedule(
+        &self,
+        owner: &str,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<(String, u64, JobKind)>> {
         timed("job_schedule", async {
-            let rows: Vec<(String, i64)> = sqlx::query_as(
+            let rows: Vec<(String, i64, String)> = sqlx::query_as(
                 "SELECT certificate_id,
                    GREATEST(run_at, CASE WHEN lease_until IS NULL OR lease_owner = ? THEN 0 ELSE lease_until + 1 END)
-                     AS ready_at
-                 FROM jobs WHERE status = 'pending' ORDER BY ready_at LIMIT ?",
+                     AS ready_at,
+                   kind
+                 FROM jobs WHERE status = 'pending'
+                 ORDER BY ready_at > ?, kind = 'issue', ready_at LIMIT ?",
             )
             .bind(owner)
+            .bind(now as i64)
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
             Ok(rows
                 .into_iter()
-                .map(|(id, ready_at)| (id, ready_at.max(0) as u64))
+                .map(|(id, ready_at, kind)| (id, ready_at.max(0) as u64, JobKind::parse(&kind)))
                 .collect())
         })
         .await
@@ -2095,7 +2209,7 @@ mod tests {
         let Some(store) = test_store().await else {
             return;
         };
-        assert!(store.job_schedule("a", 10).await.unwrap().is_empty());
+        assert!(store.job_schedule("a", 30, 10).await.unwrap().is_empty());
         store.add_job(job("cert_due"), 10).await.unwrap();
         store.add_job(job("cert_later"), 500).await.unwrap();
         store.add_job(job("cert_leased"), 10).await.unwrap();
@@ -2104,24 +2218,134 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let issue = JobKind::Issue;
         // Another owner's lease holds the job until it expires; the owner's own lease does not.
         assert_eq!(
-            store.job_schedule("a", 10).await.unwrap(),
+            store.job_schedule("a", 30, 10).await.unwrap(),
             [
-                ("cert_due".to_owned(), 10),
-                ("cert_later".to_owned(), 500),
-                ("cert_leased".to_owned(), 20 + LEASE_MS + 1),
+                ("cert_due".to_owned(), 10, issue),
+                ("cert_later".to_owned(), 500, issue),
+                ("cert_leased".to_owned(), 20 + LEASE_MS + 1, issue),
             ]
         );
         assert_eq!(
-            store.job_schedule("b", 2).await.unwrap(),
-            [("cert_due".to_owned(), 10), ("cert_leased".to_owned(), 10)]
+            store.job_schedule("b", 30, 2).await.unwrap(),
+            [
+                ("cert_due".to_owned(), 10, issue),
+                ("cert_leased".to_owned(), 10, issue)
+            ]
+        );
+        // Due renewals come before due first issuance, even when queued later.
+        store
+            .add_job(
+                Job {
+                    kind: JobKind::Renew,
+                    ..job("cert_renew")
+                },
+                25,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.job_schedule("b", 30, 2).await.unwrap(),
+            [
+                ("cert_renew".to_owned(), 25, JobKind::Renew),
+                ("cert_due".to_owned(), 10, issue),
+            ]
+        );
+        // Not yet due: soonest first, after everything due.
+        assert_eq!(
+            store.job_schedule("a", 20, 10).await.unwrap()[..2],
+            [
+                ("cert_due".to_owned(), 10, issue),
+                ("cert_renew".to_owned(), 25, JobKind::Renew),
+            ]
         );
         store
             .finish_job("cert_leased", "b", "done", None, 30)
             .await
             .unwrap();
-        assert_eq!(store.job_schedule("a", 10).await.unwrap().len(), 2);
+        assert_eq!(store.job_schedule("a", 30, 10).await.unwrap().len(), 3);
+        assert_eq!(store.pending_jobs().await.unwrap(), 3);
+    }
+
+    /// A database the previous version migrated (schema 2, before `rate_limits`) gets the table without a new
+    /// schema version, so that version still starts against it.
+    #[tokio::test]
+    async fn adds_the_rate_limits_table_to_a_database_at_this_version() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        sqlx::query("DROP TABLE rate_limits")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let rate = crate::limits::Rate {
+            interval_ms: 100,
+            tolerance_ms: 0,
+        };
+        assert_eq!(
+            store.take_rate("k", 1_000, rate).await.unwrap(),
+            crate::limits::Verdict::Allowed
+        );
+        store.migrate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rates_allow_a_burst_then_one_per_interval() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let rate = crate::limits::Rate {
+            interval_ms: 100,
+            tolerance_ms: 200,
+        };
+        use crate::limits::Verdict::{Allowed, Limited};
+        // A burst of three, then one every interval.
+        for _ in 0..3 {
+            assert_eq!(store.take_rate("k", 1_000, rate).await.unwrap(), Allowed);
+        }
+        assert_eq!(
+            store.take_rate("k", 1_000, rate).await.unwrap(),
+            Limited {
+                retry_after_ms: 100
+            }
+        );
+        assert_eq!(
+            store.take_rate("k", 1_050, rate).await.unwrap(),
+            Limited { retry_after_ms: 50 }
+        );
+        assert_eq!(store.take_rate("k", 1_100, rate).await.unwrap(), Allowed);
+        assert!(matches!(
+            store.take_rate("k", 1_100, rate).await.unwrap(),
+            Limited { .. }
+        ));
+        // Other keys have their own budget.
+        assert_eq!(
+            store.take_rate("other", 1_100, rate).await.unwrap(),
+            Allowed
+        );
+        // Concurrent first requests for a new key: exactly the burst goes through.
+        let results =
+            futures_util::future::join_all((0..10).map(|_| store.take_rate("new", 5_000, rate)))
+                .await;
+        let allowed = results
+            .into_iter()
+            .filter(|result| *result.as_ref().unwrap() == Allowed)
+            .count();
+        assert_eq!(allowed, 3);
+        // Rows whose budget is full again are pruned; the rest stay.
+        assert_eq!(store.prune_rate_limits(1_401).await.unwrap(), 2);
+        assert!(matches!(
+            store.take_rate("new", 5_000, rate).await.unwrap(),
+            Limited { .. }
+        ));
     }
 
     #[tokio::test]

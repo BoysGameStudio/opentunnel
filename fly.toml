@@ -40,7 +40,8 @@ kill_timeout = "30s"
   # Mesh links, forwarded visitors and route checks between machines, on the private network only: the server
   # binds it to FLY_PRIVATE_IP (6PN), and no [[services]] entry exposes it. Requires the INTERNAL_TOKEN secret.
   INTERNAL_LISTEN = "[::]:9000"
-  # Prometheus metrics for Fly's scraper ([metrics] below); no [[services]] entry exposes the port.
+  # Prometheus metrics for Fly's scraper ([metrics] below), bound to FLY_PRIVATE_IP like the internal listener; no
+  # [[services]] entry exposes the port.
   METRICS_LISTEN = "[::]:9091"
   LOG_FORMAT = "json"
 

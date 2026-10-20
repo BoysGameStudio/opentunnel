@@ -112,6 +112,11 @@ impl Server {
             analytics,
         );
         service.set_timeouts(config.timeouts());
+        service.set_limits(Arc::new(crate::limits::Limits::from_config(
+            &config,
+            store.clone(),
+            clock.clone(),
+        )?));
 
         let (issuer, local_ca) = match config.issuer {
             IssuerKind::Local => {
@@ -392,7 +397,7 @@ impl Server {
                 }
             };
             crate::metrics::api_handshake("ok");
-            Box::pin(http::serve_connection(self.app.clone(), tls)).await;
+            Box::pin(http::serve_connection(self.app.clone(), tls, accepted.peer)).await;
             return;
         }
         http::count(&self.app.stats.tunnel_connections);
@@ -467,7 +472,7 @@ impl Server {
     pub async fn serve_http(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let mut errors = AcceptErrors::new("HTTP accept failed");
         loop {
-            let (stream, _) = match listener.accept().await {
+            let (stream, peer) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     errors.failed(error).await;
@@ -480,7 +485,7 @@ impl Server {
             let mode = self.config.http_mode;
             tokio::spawn(async move {
                 match mode {
-                    HttpMode::Serve => http::serve_connection(app, stream).await,
+                    HttpMode::Serve => http::serve_connection(app, stream, peer).await,
                     HttpMode::Redirect => http::serve_redirect(domain, stream).await,
                 }
             });
@@ -503,7 +508,11 @@ impl Server {
             }
         };
         let internal_listener = self.bind_internal().await?;
-        let metrics_listener = crate::metrics::bind(&self.config.metrics_listen).await?;
+        let metrics_listener = crate::metrics::bind(&private_only(
+            &self.config.metrics_listen,
+            self.config.private_ip,
+        ))
+        .await?;
         self.start_background().await?;
         if let Some(listener) = metrics_listener {
             tokio::spawn(crate::metrics::serve(listener, self.metrics_sampler()));
@@ -555,6 +564,18 @@ impl Server {
         }
         info!("shut down");
         Ok(())
+    }
+}
+
+/// `address` with an unspecified IP (`[::]`, `0.0.0.0`) narrowed to the machine's private network address, when
+/// it has one: on Fly the 6PN address, so nothing listens on every interface.
+fn private_only(address: &str, private: Option<std::net::IpAddr>) -> String {
+    match (address.parse::<SocketAddr>(), private) {
+        (Ok(mut parsed), Some(private)) if parsed.ip().is_unspecified() => {
+            parsed.set_ip(private);
+            parsed.to_string()
+        }
+        _ => address.to_owned(),
     }
 }
 

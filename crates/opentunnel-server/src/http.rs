@@ -147,6 +147,49 @@ fn tunnel_not_found(id: &str) -> Response<Body> {
     )
 }
 
+/// Where an API connection came from: the PROXY header's source, or the TCP peer.
+#[derive(Debug, Clone, Copy)]
+pub struct Source(pub std::net::SocketAddr);
+
+/// `Retry-After` in whole seconds, at least one.
+fn retry_after(mut response: Response<Body>, ms: u64) -> Response<Body> {
+    let seconds = ms.div_ceil(1000).max(1);
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&seconds.to_string()).expect("digits"),
+    );
+    response
+}
+
+/// 429: a limit on what one client or tunnel may ask for. Clients retry it after `Retry-After` (at most 8 s)
+/// a few times, then report the message.
+fn rate_limited(message: &str, ms: u64) -> Response<Body> {
+    let minutes = ms.div_ceil(60_000).max(1);
+    let when = if minutes == 1 {
+        "a minute".to_owned()
+    } else {
+        format!("{minutes} minutes")
+    };
+    retry_after(
+        ordered(
+            StatusCode::TOO_MANY_REQUESTS,
+            &[
+                ("_tag", "RateLimitedError".into()),
+                ("message", format!("{message}; try again in {when}").into()),
+            ],
+        ),
+        ms,
+    )
+}
+
+/// 503 while too many certificate jobs are pending.
+fn backlogged() -> Response<Body> {
+    retry_after(
+        unavailable("certificate issuance is busy; try again later"),
+        crate::limits::BACKLOG_RETRY_MS,
+    )
+}
+
 fn unavailable(message: impl ToString) -> Response<Body> {
     ordered(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -404,6 +447,13 @@ impl App {
 
     async fn create(&self, request: Request<Incoming>) -> Response<Body> {
         let client = analytics::client(user_agent(request.headers()));
+        let source = request.extensions().get::<Source>().copied();
+        let address = match (self.service.limits(), source) {
+            (Some(limits), Some(Source(source))) => {
+                Some(limits.proxies.client(source.ip(), request.headers()))
+            }
+            _ => None,
+        };
         let body = match payload(request).await {
             Ok(body) => body,
             Err(response) => return response,
@@ -427,6 +477,23 @@ impl App {
                 );
             }
             Some(_) => return response(StatusCode::BAD_REQUEST),
+        }
+        if let Some(limits) = self.service.limits() {
+            if limits.backlogged().await {
+                return backlogged();
+            }
+            if let Some(address) = address {
+                match limits.create(address).await {
+                    Ok(crate::limits::Verdict::Allowed) => {}
+                    Ok(crate::limits::Verdict::Limited { retry_after_ms }) => {
+                        return rate_limited(
+                            "Too many tunnels created from this address",
+                            retry_after_ms,
+                        );
+                    }
+                    Err(error) => return unavailable(error),
+                }
+            }
         }
         let id = slug();
         let token = token();
@@ -500,6 +567,10 @@ impl App {
                 ],
             ),
             Ok(Bind::Unavailable(message)) => unavailable(message),
+            Ok(Bind::RateLimited(ms)) => {
+                rate_limited("Too many new certificates requested for this tunnel", ms)
+            }
+            Ok(Bind::Backlogged) => backlogged(),
             Err(error) => unavailable(error),
         }
     }
@@ -578,7 +649,7 @@ fn connect_path(path: &str) -> Option<&str> {
 }
 
 /// Serves HTTP/1.1 and HTTP/2 on one connection, with upgrades for the bridge.
-pub async fn serve_connection<I>(app: Arc<App>, io: I)
+pub async fn serve_connection<I>(app: Arc<App>, io: I, source: std::net::SocketAddr)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -591,8 +662,9 @@ where
     } else {
         app.shutdown.draining.clone()
     };
-    let service = hyper::service::service_fn(move |request: Request<Incoming>| {
+    let service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
         let app = app.clone();
+        request.extensions_mut().insert(Source(source));
         async move {
             let http1 = request.version() < hyper::Version::HTTP_2;
             let draining = app.shutdown.draining.clone();

@@ -1,11 +1,12 @@
 //! The mesh on its own, without servers or a database: links between several machines, duplicate links, the
-//! previous version, bad tokens, and a table of 20,000 bridges under churn.
+//! previous versions, bad secrets, the challenge never revealing the secret, and a table of 20,000 bridges under
+//! churn.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use opentunnel_server::clock::Clock;
-use opentunnel_server::mesh::{Event, MESH_MAGIC, Mesh, MeshConfig, Notice};
+use opentunnel_server::mesh::{Event, MESH_MAGIC, MESH_MAGIC_V1, Mesh, MeshConfig, Notice};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -26,6 +27,10 @@ fn config() -> MeshConfig {
 
 /// A machine: a mesh behind its own internal listener, which only takes mesh links.
 async fn node(name: &str, token: &str) -> Node {
+    node_with(name, token, config()).await
+}
+
+async fn node_with(name: &str, token: &str, config: MeshConfig) -> Node {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let (mesh, notices) = Mesh::new(
@@ -33,7 +38,7 @@ async fn node(name: &str, token: &str) -> Node {
         "local".into(),
         token.into(),
         Clock::system(),
-        config(),
+        config,
     );
     mesh.set_address(address.clone());
     let accepting = mesh.clone();
@@ -46,16 +51,14 @@ async fn node(name: &str, token: &str) -> Node {
                 while stream.read_exact(&mut byte).await.is_ok() && byte[0] != b'\n' {
                     line.push(byte[0]);
                 }
-                let Some(token) = line.strip_prefix(MESH_MAGIC) else {
-                    return;
-                };
-                let token = String::from_utf8_lossy(token).into_owned();
-                let _ = mesh
-                    .accept(
-                        opentunnel_server::tls::Replay::new(Vec::new(), stream),
-                        &token,
-                    )
-                    .await;
+                let stream = opentunnel_server::tls::Replay::new(Vec::new(), stream);
+                if let Some(greeting) = line.strip_prefix(MESH_MAGIC) {
+                    let greeting = String::from_utf8_lossy(greeting).into_owned();
+                    let _ = mesh.accept(stream, &greeting).await;
+                } else if let Some(token) = line.strip_prefix(MESH_MAGIC_V1) {
+                    let token = String::from_utf8_lossy(token).into_owned();
+                    let _ = mesh.accept_v1(stream, &token).await;
+                }
             });
         }
     });
@@ -109,6 +112,7 @@ async fn links_every_pair_once_and_replicates_the_table() {
         assert_eq!(node.mesh.peers().len(), 2);
         assert_eq!(node.mesh.view()["complete"], true);
     }
+    assert!(!nodes[0].mesh.linked_v1("m2"));
 
     nodes[0]
         .mesh
@@ -240,6 +244,141 @@ async fn refuses_a_peer_with_another_token_and_recognises_the_previous_version()
     assert_eq!(a.mesh.view()["peers"]["legacy"], 1);
     a.mesh.halt(false);
     stranger.mesh.halt(false);
+}
+
+/// What a machine sends to whatever answers at a peer address never contains the secret, and an impostor that
+/// does not hold it cannot complete the handshake either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_challenge_never_reveals_the_secret() {
+    const SECRET: &str = "the-shared-secret";
+    let a = node("a", SECRET).await;
+    // An impostor listening at a peer address: it records what it is sent and answers like a machine of this
+    // version that does not know the secret.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let impostor = listener.local_addr().unwrap().to_string();
+    let (seen_tx, mut seen) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let seen_tx = seen_tx.clone();
+            tokio::spawn(async move {
+                let mut received = vec![0u8; 512];
+                let read = stream.read(&mut received).await.unwrap_or(0);
+                received.truncate(read);
+                let _ = stream
+                    .write_all(
+                        format!(
+                            "OPENTUNNEL-MESH/2 impostor {} {}\n",
+                            "ab".repeat(16),
+                            "00".repeat(32)
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                let mut rest = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut rest))
+                    .await;
+                received.extend_from_slice(&rest);
+                let _ = seen_tx.send(received);
+            });
+        }
+    });
+    a.mesh.add_peer(&impostor);
+    let received = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8_lossy(&received);
+    assert!(text.starts_with("OPENTUNNEL-MESH/2 a "), "{text}");
+    assert!(!text.contains(SECRET), "{text}");
+    // The impostor's proof was wrong: a sent nothing after its greeting, and has no peer.
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(a.mesh.peers().is_empty());
+
+    // Dialing a: the answer proves nothing to an impostor and contains no secret; a wrong proof ends the link.
+    let mut stream = tokio::net::TcpStream::connect(&a.address).await.unwrap();
+    stream
+        .write_all(format!("OPENTUNNEL-MESH/2 impostor {}\n", "cd".repeat(16)).as_bytes())
+        .await
+        .unwrap();
+    let mut answer = vec![0u8; 512];
+    let read = stream.read(&mut answer).await.unwrap();
+    let answer = String::from_utf8_lossy(&answer[..read]).into_owned();
+    assert!(answer.starts_with("OPENTUNNEL-MESH/2 a "), "{answer}");
+    assert!(!answer.contains(SECRET));
+    stream
+        .write_all(format!("{}\n", "00".repeat(32)).as_bytes())
+        .await
+        .unwrap();
+    let mut rest = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut rest)).await;
+    assert!(
+        rest.is_empty(),
+        "sent {:?} after a wrong proof",
+        String::from_utf8_lossy(&rest)
+    );
+    assert!(a.mesh.peers().is_empty());
+    a.mesh.halt(false);
+}
+
+/// TEMPORARY: a machine of the previous version greets with the secret itself. It is linked when the secret is
+/// right (and answered with its own line), marked so forwards to it use its format, and refused otherwise or once
+/// `accept_v1` is off.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepts_the_previous_handshake_only_with_the_right_secret() {
+    let a = node("a", "secret").await;
+    for (token, accepted) in [("wrong", false), ("secret", true)] {
+        let mut stream = tokio::net::TcpStream::connect(&a.address).await.unwrap();
+        stream
+            .write_all(format!("OPENTUNNEL-MESH/1 {token}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut answer = vec![0u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut answer))
+            .await
+            .map_or(0, |read| read.unwrap_or(0));
+        let answer = String::from_utf8_lossy(&answer[..read]).into_owned();
+        if !accepted {
+            assert!(answer.is_empty(), "{answer}");
+            continue;
+        }
+        assert!(answer.starts_with("OPENTUNNEL-MESH/1 secret\n"), "{answer}");
+        // Its hello, as the previous version sends it.
+        let hello = serde_json::json!({
+            "type": "hello", "version": 1, "machine_id": "old", "region": "local", "address": "127.0.0.1:1",
+            "epoch": 1, "started_at": 1, "draining": false,
+        });
+        let body = serde_json::to_vec(&hello).unwrap();
+        stream.write_u32(body.len() as u32).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        wait("the old machine to link", Duration::from_secs(2), || {
+            a.mesh.is_up("old")
+        })
+        .await;
+        assert!(a.mesh.linked_v1("old"));
+        drop(stream);
+    }
+    a.mesh.halt(false);
+
+    let strict = node_with(
+        "strict",
+        "secret",
+        MeshConfig {
+            accept_v1: false,
+            ..config()
+        },
+    )
+    .await;
+    let mut stream = tokio::net::TcpStream::connect(&strict.address)
+        .await
+        .unwrap();
+    stream
+        .write_all(b"OPENTUNNEL-MESH/1 secret\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut answer)).await;
+    assert!(answer.is_empty(), "{}", String::from_utf8_lossy(&answer));
+    strict.mesh.halt(false);
 }
 
 /// 20,000 bridges, then 100 attaches and detaches per second for 10 seconds on one machine while another

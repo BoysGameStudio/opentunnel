@@ -694,3 +694,117 @@ async fn forwards_to_machines_of_the_previous_version() {
     drop(tunnel);
     new.stop().await;
 }
+
+/// Requests between machines prove the shared secret without carrying it: a signed control request is answered
+/// once, and not when replayed, stale, for another machine or signed with another secret. TEMPORARY: the previous
+/// version's bearer secret and forward header are accepted only while `MESH_ACCEPT_V1` is on.
+#[tokio::test(flavor = "multi_thread")]
+async fn internal_requests_prove_the_secret_without_sending_it() {
+    use opentunnel_server::peer_auth::{Secret, nonce};
+    let dir = tempfile::tempdir().unwrap();
+    let Some(a) = machine(dir.path(), "machine-a", "iad").await else {
+        return;
+    };
+    let path = "/internal/tunnel/abcdefghijkl/routes";
+    let url = format!("http://{}{path}", a.internal());
+    let signed = |secret: &str, receiver: &str, timestamp: u64, nonce: &str| {
+        let timestamp = timestamp.to_string();
+        let proof = Secret::new(secret).sign(&[
+            "opentunnel control/2",
+            "machine-x",
+            receiver,
+            &timestamp,
+            nonce,
+            "GET",
+            path,
+        ]);
+        format!("machine-x {receiver} {timestamp} {nonce} {proof}")
+    };
+    let get = |auth: Option<(&'static str, String)>| {
+        let url = url.clone();
+        async move {
+            let mut request = reqwest::Client::new().get(url);
+            if let Some((name, value)) = auth {
+                request = request.header(name, value);
+            }
+            request.send().await.unwrap().status().as_u16()
+        }
+    };
+    let now = a.service().now();
+    let once = nonce();
+    let good = signed("cluster-secret", "machine-a", now, &once);
+    assert_eq!(get(Some(("x-opentunnel-auth", good.clone()))).await, 200);
+    assert_eq!(
+        get(Some(("x-opentunnel-auth", good))).await,
+        401,
+        "replayed"
+    );
+    for (auth, why) in [
+        (
+            signed("cluster-secret", "machine-b", now, &nonce()),
+            "another machine",
+        ),
+        (
+            signed("cluster-secret", "machine-a", now - 60_000, &nonce()),
+            "stale",
+        ),
+        (
+            signed("cluster-secret", "machine-a", now + 60_000, &nonce()),
+            "future",
+        ),
+        (
+            signed("other-secret", "machine-a", now, &nonce()),
+            "another secret",
+        ),
+        ("machine-x machine-a".to_owned(), "malformed"),
+    ] {
+        assert_eq!(get(Some(("x-opentunnel-auth", auth))).await, 401, "{why}");
+    }
+    assert_eq!(get(None).await, 401);
+    assert_eq!(
+        get(Some(("authorization", "Bearer wrong".into()))).await,
+        401
+    );
+    // TEMPORARY: the previous version's bearer secret.
+    assert_eq!(
+        get(Some(("authorization", "Bearer cluster-secret".into()))).await,
+        200
+    );
+    // A forward with a bad proof is closed without an answer.
+    let mut stream = TcpStream::connect(a.internal()).await.unwrap();
+    let timestamp = now.to_string();
+    stream
+        .write_all(
+            format!(
+                "OPENTUNNEL-FORWARD/2 machine-x machine-a {timestamp} {} abcdefghijkl @ 127.0.0.1:1 {}\n",
+                nonce(),
+                "00".repeat(32)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut answer)).await;
+    assert!(answer.is_empty());
+    a.stop().await;
+
+    let strict = machine_with(
+        dir.path(),
+        "machine-strict",
+        "iad",
+        &["--mesh-accept-v1=false"],
+    )
+    .await
+    .unwrap();
+    let url = format!("http://{}{path}", strict.internal());
+    let status = reqwest::Client::new()
+        .get(url)
+        .bearer_auth("cluster-secret")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 401);
+    strict.stop().await;
+}

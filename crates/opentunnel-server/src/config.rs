@@ -195,6 +195,12 @@ pub struct Config {
     #[arg(long, env = "MESH_DEAD_MS", default_value_t = 5_000)]
     pub mesh_dead_ms: u64,
 
+    /// TEMPORARY (the deploy that replaced sending the secret with a challenge): accept mesh links, forwards and
+    /// control requests from machines of the previous version, which send `INTERNAL_TOKEN` itself, when it is
+    /// right. Nothing here sends it to a machine that did not send it first. Turn off once none are left.
+    #[arg(long, env = "MESH_ACCEPT_V1", default_value_t = true, action = clap::ArgAction::Set)]
+    pub mesh_accept_v1: bool,
+
     /// A tunnel connection with no traffic in either direction for this long is closed.
     #[arg(long, env = "CONNECTION_IDLE_TIMEOUT_MS", default_value_t = 900_000)]
     pub connection_idle_timeout_ms: u64,
@@ -203,6 +209,35 @@ pub struct Config {
     /// traffic.
     #[arg(long, env = "HALF_CLOSE_TIMEOUT_MS", default_value_t = 60_000)]
     pub half_close_timeout_ms: u64,
+
+    /// Tunnels one client address may create: this many an hour on average (cluster-wide, counted in the
+    /// database; IPv6 addresses by /64). 0 disables the limit.
+    #[arg(long, env = "CREATE_RATE_PER_HOUR", default_value_t = 30)]
+    pub create_rate_per_hour: u32,
+
+    /// ... and this many at once.
+    #[arg(long, env = "CREATE_RATE_BURST", default_value_t = 10)]
+    pub create_rate_burst: u32,
+
+    /// New certificates (a bind with a new CSR) one tunnel may request: this many a day on average. Binding the
+    /// CSR it already has, and renewals, do not count. 0 disables the limit.
+    #[arg(long, env = "ISSUANCE_RATE_PER_DAY", default_value_t = 5)]
+    pub issuance_rate_per_day: u32,
+
+    /// ... and this many at once.
+    #[arg(long, env = "ISSUANCE_RATE_BURST", default_value_t = 5)]
+    pub issuance_rate_burst: u32,
+
+    /// While more certificate jobs than this are pending (cluster-wide), creating tunnels and requesting new
+    /// certificates answer 503 instead of queueing more. 0 disables it.
+    #[arg(long, env = "ISSUANCE_BACKLOG_LIMIT", default_value_t = 200)]
+    pub issuance_backlog_limit: u64,
+
+    /// Proxies whose `CF-Connecting-IP` header names the client (CIDRs, comma-separated). Defaults to
+    /// Cloudflare's published ranges; `off` trusts no header. Requests from anywhere else are counted by their own
+    /// address, whatever headers they send.
+    #[arg(long, env = "TRUSTED_PROXY_RANGES", value_delimiter = ',')]
+    pub trusted_proxy_ranges: Vec<String>,
 
     /// Serves Prometheus metrics at `/metrics`, e.g. `[::]:9091` (Fly's scraper; no `[[services]]` entry exposes
     /// it). `off` (the default) disables it.
@@ -273,6 +308,7 @@ impl Config {
             discovery: ms(self.mesh_discovery_ms),
             ping: ms(self.mesh_ping_ms),
             dead: ms(self.mesh_dead_ms),
+            accept_v1: self.mesh_accept_v1,
         }
     }
 

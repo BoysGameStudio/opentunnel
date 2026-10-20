@@ -86,6 +86,8 @@ pub struct Inner {
     pull_through: std::sync::OnceLock<crate::migration::SharedPullThrough>,
     /// The other machines, when this is one of many.
     cluster: std::sync::OnceLock<Arc<Cluster>>,
+    /// Limits on creating tunnels and issuing certificates; none when unset (tests).
+    limits: std::sync::OnceLock<Arc<crate::limits::Limits>>,
     /// When refreshing a cached record last failed, Unix ms.
     refresh_failed_at: AtomicU64,
     /// Bumped when mesh events may have been missed: routing reads cached entries of older generations again.
@@ -322,8 +324,15 @@ pub enum Bind {
     Unauthorized,
     InProgress,
     InvalidRequest(String),
-    InvalidHostname { provided: String, expected: String },
+    InvalidHostname {
+        provided: String,
+        expected: String,
+    },
     Unavailable(String),
+    /// The tunnel requested too many new certificates lately: try again after this many ms.
+    RateLimited(u64),
+    /// Too many certificate jobs are pending: try again later.
+    Backlogged,
 }
 
 pub enum Attach {
@@ -376,6 +385,7 @@ impl Service {
             next_bridge: AtomicU64::new(1),
             pull_through: std::sync::OnceLock::new(),
             cluster: std::sync::OnceLock::new(),
+            limits: std::sync::OnceLock::new(),
             refresh_failed_at: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             timeouts: std::sync::OnceLock::new(),
@@ -398,6 +408,14 @@ impl Service {
 
     pub fn cluster(&self) -> Option<&Arc<Cluster>> {
         self.cluster.get()
+    }
+
+    pub fn set_limits(&self, limits: Arc<crate::limits::Limits>) {
+        let _ = self.limits.set(limits);
+    }
+
+    pub fn limits(&self) -> Option<&Arc<crate::limits::Limits>> {
+        self.limits.get()
     }
 
     pub fn set_pull_through(&self, pull: crate::migration::SharedPullThrough) {
@@ -831,6 +849,15 @@ impl Service {
             )
         {
             return Ok(Bind::InProgress);
+        }
+        // A new certificate: an ACME order and DNS changes on the shared account, so it is limited.
+        if let Some(limits) = self.limits() {
+            if limits.backlogged().await {
+                return Ok(Bind::Backlogged);
+            }
+            if let crate::limits::Verdict::Limited { retry_after_ms } = limits.issuance(id).await? {
+                return Ok(Bind::RateLimited(retry_after_ms));
+            }
         }
 
         let certificate_id = format!("cert_{}", uuid());
