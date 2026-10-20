@@ -23,7 +23,7 @@ use crate::tls;
 /// Transient ones are retried for `retry::RETRY_WINDOW_MS`.
 pub const ATTEMPTS: u32 = 3;
 const PERSIST_FAILED: &str = "Failed to persist certificate state: tunnel or certificate not found";
-/// Imported issuance gets this long to finish on the Worker before this server takes it over.
+/// Issuance without a job is resumed once it is this old (`Service::resume_orphaned_issuance`).
 pub const ORPHAN_GRACE_MS: u64 = 15 * MINUTE_MS;
 /// Without a known reason to wake earlier (a due job or alarm, or a local notification), the job runner and the
 /// alarm loop look at the database again after this long plus up to as much again of jitter, which spreads the

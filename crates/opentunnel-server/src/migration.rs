@@ -1,17 +1,19 @@
-//! Exports and imports of every tunnel record, in the format the Cloudflare Worker's export introduced (the
-//! migration from it is over; the format stays, for backups and restores). Imported records are checked as
+//! Exports and imports of every tunnel record, in the format the Cloudflare Worker's export introduced, for
+//! backups and restores. Imported records are checked as
 //! strictly as the API checks its own writes: a record could otherwise make the server order a certificate for
 //! any name in the zone (`csr::check_tunnel_request`).
 
 use anyhow::Result;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::clock::Clock;
 use crate::record::StoredTunnel;
 use crate::store::{ImportOutcome, Store};
 
-/// The export file: what `bun migration/worker.ts export` writes and `opentunnel-server export` writes.
+/// The export file, as `opentunnel-server export` and `POST /api/admin/export` write it (and the Worker's export did).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportFile {
@@ -113,19 +115,68 @@ pub async fn import(
     Ok(summary)
 }
 
-pub async fn export(store: &Store, clock: &Clock) -> Result<ExportFile> {
-    Ok(ExportFile {
-        version: 1,
-        exported_at: Some(clock.iso()),
-        records: store
-            .export_tunnels()
-            .await?
-            .into_iter()
-            .map(|(record, alarm)| ExportedRecord {
-                object_id: None,
-                record: Some(record),
-                alarm: alarm.map(|alarm| alarm as f64),
-            })
-            .collect(),
-    })
+/// Tunnels read per query of an export. Records are a few KB each (certificate chains and CSRs), so a page stays
+/// far below PlanetScale's 64 MiB result limit, which the whole table passed at ~17,000 tunnels.
+pub const EXPORT_PAGE: usize = 500;
+
+/// An export file, read a page at a time (keyset by ID) and sent as it is read: the opening with `records: [`,
+/// one record per line, then the closing. Readers of the whole file see the same [`ExportFile`] as ever. Pages are
+/// read one after another, not in one transaction, so a record changed meanwhile is exported as it was when its
+/// page was read. A failure is sent last; whatever was sent before it is not a complete file.
+pub fn export(store: Store, clock: Clock, page: usize) -> mpsc::Receiver<Result<Bytes>> {
+    let (tx, rx) = mpsc::channel(4);
+    tokio::spawn(async move {
+        let result = export_pages(&store, &clock, page.max(1), &tx).await;
+        if let Err(error) = result {
+            warn!(error = %format!("{error:#}"), "export failed");
+            let _ = tx.send(Err(error)).await;
+        }
+    });
+    rx
+}
+
+async fn export_pages(
+    store: &Store,
+    clock: &Clock,
+    page: usize,
+    tx: &mpsc::Sender<Result<Bytes>>,
+) -> Result<()> {
+    let send = |chunk: Vec<u8>| async {
+        tx.send(Ok(Bytes::from(chunk)))
+            .await
+            .map_err(|_| anyhow::anyhow!("the export's reader went away"))
+    };
+    let opening = format!(
+        "{{\"version\":1,\"exportedAt\":{},\"records\":[",
+        serde_json::to_string(&clock.iso())?
+    );
+    send(opening.into_bytes()).await?;
+    let mut after: Option<String> = None;
+    let mut first = true;
+    loop {
+        let rows = store.export_page(after.as_deref(), page).await?;
+        let Some((last, _, _)) = rows.last() else {
+            break;
+        };
+        after = Some(last.clone());
+        let full = rows.len() == page;
+        let mut chunk = Vec::new();
+        for (_, record, alarm) in rows {
+            chunk.extend_from_slice(if first { b"\n" } else { b",\n" });
+            first = false;
+            serde_json::to_writer(
+                &mut chunk,
+                &ExportedRecord {
+                    object_id: None,
+                    record: Some(record),
+                    alarm: alarm.map(|alarm| alarm as f64),
+                },
+            )?;
+        }
+        send(chunk).await?;
+        if !full {
+            break;
+        }
+    }
+    send(b"\n]}\n".to_vec()).await
 }

@@ -19,7 +19,7 @@
 
 ## Hosted Service
 
-- The hosted service is one Rust binary, `crates/opentunnel-server`, deployed to Fly.io by the root `Dockerfile` and `fly.toml` (app `opentunnel`, region `iad`, storage in PlanetScale MySQL through `DATABASE_URL`). `docs/server.md` describes it; `docs/cutover.md` is the runbook for moving off the Cloudflare Worker.
+- The hosted service is one Rust binary, `crates/opentunnel-server`, deployed to Fly.io by the root `Dockerfile` and `fly.toml` (app `opentunnel`, region `iad`, storage in PlanetScale MySQL through `DATABASE_URL`). `docs/server.md` describes it.
 - It is not published and keeps its own version (`publish = false`), outside the release group.
 - Keep runtime-neutral schemas, bridge framing, and HTTP contracts in `packages/protocol`; the server reuses the Rust wire types in `crates/opentunnel/src/protocol`.
 - The HTTP API must answer exactly as `crates/opentunnel-server/tests/fixtures/worker-contract.json` records (paths, status codes, bodies, key order); installed clients depend on it.
@@ -28,4 +28,5 @@
 - Server tests need MySQL 8: set `TEST_DATABASE_URL` (see `docs/server.md`); without it they skip.
 - DNS stays on Cloudflare; DNS-01 challenges go through the provider in `crates/opentunnel-server/src/dns.rs`.
 - `packages/website` is built with plain Vite (`bun run ready`, output `dist/website`) and served by the server.
-- The Worker cutover is done: the server's legacy fallback, pull-through import and `LEGACY_*` settings are gone (`migration.rs` keeps only the export file format, with strict import checks); the `migration/` directory is the remaining TEMPORARY Worker tooling. Code marked TEMPORARY in the mesh (`MESH_ACCEPT_V1`) only covers deploys from versions that sent `INTERNAL_TOKEN` itself.
+- The server replaced a Cloudflare Worker (October 2026); nothing of the Worker remains but the export file format (`migration.rs`, for backups and restores, with strict import checks) and the recorded HTTP contract.
+- Deploys are blue-green, so a new version briefly runs next to the previous one on the mesh and the database: changes to the mesh, forward and internal API handshakes must interoperate with the version in production, and schema changes must not break it (it refuses a newer `SCHEMA_VERSION` at startup, so add or drop tables it does not depend on without a version bump).

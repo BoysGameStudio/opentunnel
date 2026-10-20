@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use hyper::body::Frame;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
@@ -24,7 +26,28 @@ use crate::service::{Bind, CertificateLookup, Lookup, Service};
 use crate::website::{Resolved, Website};
 use crate::websocket;
 
-pub type Body = Full<Bytes>;
+/// Responses are whole, except the admin export, which streams ([`streamed`]).
+pub type Body = UnsyncBoxBody<Bytes, BoxError>;
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A whole response body.
+pub fn full(bytes: impl Into<Bytes>) -> Body {
+    Full::new(bytes.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+/// A response body sent as `chunks` arrive. An error aborts the response (the client sees it cut short, not a
+/// complete body).
+pub fn streamed<E: Into<BoxError> + Send + 'static>(
+    chunks: tokio::sync::mpsc::Receiver<Result<Bytes, E>>,
+) -> Body {
+    let frames = futures_util::stream::unfold(chunks, |mut chunks| async move {
+        let chunk = chunks.recv().await?;
+        Some((chunk.map(Frame::data).map_err(Into::into), chunks))
+    });
+    StreamBody::new(frames).boxed_unsync()
+}
 
 const OPENAPI: &str = include_str!("openapi.json");
 const MAX_BODY: usize = 1024 * 1024;
@@ -94,15 +117,13 @@ pub trait Admin: Send + Sync {
 }
 
 pub fn response(status: StatusCode) -> Response<Body> {
-    let mut response = Response::new(Full::new(Bytes::new()));
+    let mut response = Response::new(full(Bytes::new()));
     *response.status_mut() = status;
     response
 }
 
 pub fn json_response(status: StatusCode, body: &impl Serialize) -> Response<Body> {
-    let mut response = Response::new(Full::new(Bytes::from(
-        serde_json::to_vec(body).expect("responses serialize"),
-    )));
+    let mut response = Response::new(full(serde_json::to_vec(body).expect("responses serialize")));
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -112,7 +133,7 @@ pub fn json_response(status: StatusCode, body: &impl Serialize) -> Response<Body
 }
 
 pub fn text_response(status: StatusCode, text: &str) -> Response<Body> {
-    let mut response = Response::new(Full::new(Bytes::from(text.to_owned())));
+    let mut response = Response::new(full(text.to_owned()));
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -207,7 +228,7 @@ fn ordered(status: StatusCode, fields: &[(&str, Value)]) -> Response<Body> {
         out.push_str(&serde_json::to_string(value).expect("values serialize"));
     }
     out.push('}');
-    let mut response = Response::new(Full::new(Bytes::from(out)));
+    let mut response = Response::new(full(out));
     *response.status_mut() = status;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -333,7 +354,7 @@ impl App {
                 let mut response = if matches {
                     response(StatusCode::NOT_MODIFIED)
                 } else {
-                    let mut response = Response::new(Full::new(asset.body.clone()));
+                    let mut response = Response::new(full(asset.body.clone()));
                     response.headers_mut().insert(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static(asset.content_type),
@@ -374,7 +395,7 @@ impl App {
         let path = request.uri().path().to_owned();
         if path == "/openapi.json" {
             return if matches!(*request.method(), Method::GET | Method::HEAD) {
-                let mut response = Response::new(Full::new(Bytes::from_static(OPENAPI.as_bytes())));
+                let mut response = Response::new(full(Bytes::from_static(OPENAPI.as_bytes())));
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),

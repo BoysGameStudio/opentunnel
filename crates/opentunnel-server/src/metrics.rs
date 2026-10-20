@@ -231,7 +231,7 @@ impl Metrics {
         );
         r.register(
             "mesh_peers",
-            "Other machines this one knows of, by state (up: linked; connecting, unreachable, legacy: answers without the mesh)",
+            "Other machines this one knows of, by state (up: linked; connecting, unreachable)",
             metrics.mesh_peers.clone(),
         );
         r.register(
@@ -486,7 +486,7 @@ pub fn mesh_lookup(result: &'static str) {
         .inc();
 }
 
-/// Peers by state: up, connecting, unreachable, legacy.
+/// Peers by state: up, connecting, unreachable.
 pub fn set_mesh_peers(counts: &[(&'static str, usize)]) {
     let peers = &get().mesh_peers;
     for (state, count) in counts {

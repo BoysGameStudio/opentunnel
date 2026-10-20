@@ -91,13 +91,19 @@ async fn main() -> Result<()> {
         }
         Command::Export { file } => {
             let store = Store::open(&database_url(&cli.config)?).await?;
-            let export = migration::export(&store, &clock).await?;
-            let text = serde_json::to_string_pretty(&export)? + "\n";
-            if file.as_os_str() == "-" {
-                print!("{text}");
+            let mut out: Box<dyn std::io::Write> = if file.as_os_str() == "-" {
+                Box::new(std::io::stdout())
             } else {
-                std::fs::write(&file, text)?;
+                Box::new(std::io::BufWriter::new(
+                    std::fs::File::create(&file)
+                        .with_context(|| format!("creating {}", file.display()))?,
+                ))
+            };
+            let mut chunks = migration::export(store, clock, migration::EXPORT_PAGE);
+            while let Some(chunk) = chunks.recv().await {
+                out.write_all(&chunk?)?;
             }
+            out.flush()?;
             Ok(())
         }
         Command::AccountKey => {

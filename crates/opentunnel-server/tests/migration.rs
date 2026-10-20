@@ -179,3 +179,84 @@ async fn the_job_runner_refuses_names_that_are_not_the_tunnels() {
     }
     panic!("{}", store.counts().await.unwrap());
 }
+
+/// The export reads the table a page at a time and streams it: more tunnels than a page come back once each, in
+/// ID order, as one export file that imports again unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn exports_every_record_in_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(server) = TestServer::start(dir.path(), &[]).await else {
+        return;
+    };
+    let count = opentunnel_server::migration::EXPORT_PAGE * 2 + 37;
+    let records: Vec<Value> = (0..count)
+        .map(|index| {
+            record(
+                &format!("export{index:06}"),
+                json!({ "lastConnectedAt": "2026-10-09T00:00:00.000Z" }),
+            )
+        })
+        .collect();
+    assert_eq!(import(&server, records).await["inserted"], count);
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/admin/export", server.api))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let text = response.text().await.unwrap();
+    let file: opentunnel_server::migration::ExportFile = serde_json::from_str(&text).unwrap();
+    assert_eq!(file.version, 1);
+    assert!(file.exported_at.is_some());
+    let ids: Vec<String> = file
+        .records
+        .iter()
+        .map(|entry| entry.record.as_ref().unwrap().id.clone())
+        .collect();
+    let expected: Vec<String> = (0..count)
+        .map(|index| format!("export{index:06}"))
+        .collect();
+    assert_eq!(ids, expected);
+    let again: Value = reqwest::Client::new()
+        .post(format!("{}/api/admin/import", server.api))
+        .bearer_auth("admin-secret")
+        .body(text)
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["unchanged"], count, "{again}");
+    assert_eq!(again["rejected"].as_array().unwrap().len(), 0);
+
+    // Pages that end exactly at the last record, and an empty table.
+    let exported = |url: String, page: usize| async move {
+        let store = opentunnel_server::store::Store::open(&url).await.unwrap();
+        let mut chunks = opentunnel_server::migration::export(
+            store,
+            opentunnel_server::clock::Clock::system(),
+            page,
+        );
+        let mut text = Vec::new();
+        while let Some(chunk) = chunks.recv().await {
+            text.extend_from_slice(&chunk.unwrap());
+        }
+        serde_json::from_slice::<opentunnel_server::migration::ExportFile>(&text)
+            .unwrap()
+            .records
+            .len()
+    };
+    let url = common::database_url(dir.path()).await.unwrap();
+    assert_eq!(exported(url.clone(), count).await, count);
+    assert_eq!(exported(url, 1).await, count);
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(
+        exported(common::database_url(empty.path()).await.unwrap(), 3).await,
+        0
+    );
+    server.stop().await;
+}

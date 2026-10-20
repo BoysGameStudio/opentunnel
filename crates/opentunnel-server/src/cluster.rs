@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hyper::body::Incoming;
-use hyper::{Method, Request, Response, StatusCode, header};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 
 use crate::clock::Clock;
 use crate::http::{Body, Stats, count, json_response, response};
-use crate::mesh::{Event, Location, MESH_MAGIC, MESH_MAGIC_V1, Mesh, MeshConfig, Notice};
+use crate::mesh::{Event, Location, MESH_MAGIC, Mesh, MeshConfig, Notice};
 use crate::net::{self, AcceptErrors, Timeouts};
 use crate::peer_auth::{self, Nonces, Secret};
 use crate::relay::{self, Accepted, Origin};
@@ -40,8 +40,6 @@ use crate::service::Service;
 /// `OPENTUNNEL-FORWARD/2 <sender> <receiver> <timestamp> <nonce> <tunnel> <route> <visitor> <proof>\n`, the proof
 /// an HMAC-SHA256 keyed with the shared secret over every other field.
 pub const FORWARD_MAGIC: &[u8] = b"OPENTUNNEL-FORWARD/2 ";
-/// TEMPORARY: the previous version's, `OPENTUNNEL-FORWARD/1 <secret> <tunnel> <route> <visitor>\n`.
-pub const FORWARD_MAGIC_V1: &[u8] = b"OPENTUNNEL-FORWARD/1 ";
 const FORWARD_LABEL: &str = "opentunnel forward/2";
 /// Control requests carry `<sender> <receiver> <timestamp> <nonce> <proof>`, the proof over the method and path
 /// too.
@@ -64,10 +62,6 @@ pub struct Cluster {
     pub region: String,
     pub mesh: Arc<Mesh>,
     secret: Secret,
-    /// TEMPORARY: the secret itself, sent only to machines linked with the previous version's handshake (which
-    /// sent it first).
-    token: String,
-    accept_v1: bool,
     nonces: Nonces,
     clock: Clock,
     http: reqwest::Client,
@@ -102,7 +96,6 @@ impl Cluster {
             .pool_max_idle_per_host(2)
             .no_proxy()
             .build()?;
-        let accept_v1 = mesh.accept_v1;
         let (mesh, notices) = Mesh::new(
             machine_id.clone(),
             region.clone(),
@@ -115,8 +108,6 @@ impl Cluster {
             region,
             mesh,
             secret: Secret::new(&token),
-            token,
-            accept_v1,
             nonces: Nonces::default(),
             clock,
             http,
@@ -132,11 +123,6 @@ impl Cluster {
 
     pub fn address(&self) -> &str {
         self.mesh.address()
-    }
-
-    /// TEMPORARY: whether a request of the previous version, which carries the secret itself, is accepted.
-    fn authorized_v1(&self, token: &str) -> bool {
-        self.accept_v1 && self.secret.matches(token)
     }
 
     /// Whether a signed request from `sender` comes from where that machine is linked: a request signed by a
@@ -263,25 +249,17 @@ impl Cluster {
         net::keepalive(&stream);
         let mut header = Vec::with_capacity(256 + accepted.initial.len());
         let visitor = accepted.peer.to_string();
-        if self.mesh.linked_v1(&location.machine_id) {
-            // TEMPORARY: a machine of the previous version, which proved it holds the secret by sending it.
-            header.extend_from_slice(FORWARD_MAGIC_V1);
-            header.extend_from_slice(
-                format!("{} {tunnel} {route} {visitor}\n", self.token).as_bytes(),
-            );
-        } else {
-            let signed = self.sign(
-                FORWARD_LABEL,
-                &location.machine_id,
-                &[tunnel, route, &visitor],
-            );
-            // The proof goes last, after the fields it covers.
-            let (identity, proof) = signed.rsplit_once(' ').expect("signed fields");
-            header.extend_from_slice(FORWARD_MAGIC);
-            header.extend_from_slice(
-                format!("{identity} {tunnel} {route} {visitor} {proof}\n").as_bytes(),
-            );
-        }
+        let signed = self.sign(
+            FORWARD_LABEL,
+            &location.machine_id,
+            &[tunnel, route, &visitor],
+        );
+        // The proof goes last, after the fields it covers.
+        let (identity, proof) = signed.rsplit_once(' ').expect("signed fields");
+        header.extend_from_slice(FORWARD_MAGIC);
+        header.extend_from_slice(
+            format!("{identity} {tunnel} {route} {visitor} {proof}\n").as_bytes(),
+        );
         header.extend_from_slice(&accepted.initial);
         tokio::time::timeout(ACK_TIMEOUT, stream.write_all(&header))
             .await
@@ -302,16 +280,10 @@ impl Cluster {
         for location in self.mesh.holders(tunnel, routes) {
             let path = format!("/internal/tunnel/{tunnel}/routes");
             let url = format!("http://{}{path}", location.address);
-            let request = self.http.get(url);
-            let request = if self.mesh.linked_v1(&location.machine_id) {
-                // TEMPORARY: a machine of the previous version, which proved it holds the secret by sending it.
-                request.bearer_auth(&self.token)
-            } else {
-                request.header(
-                    CONTROL_AUTH,
-                    self.sign(CONTROL_LABEL, &location.machine_id, &["GET", &path]),
-                )
-            };
+            let request = self.http.get(url).header(
+                CONTROL_AUTH,
+                self.sign(CONTROL_LABEL, &location.machine_id, &["GET", &path]),
+            );
             let held = request
                 .send()
                 .await
@@ -489,23 +461,14 @@ async fn internal_connection(
     })
     .await
     .context("header timeout")??;
-    if buffer.starts_with(MESH_MAGIC) || buffer.starts_with(MESH_MAGIC_V1) {
-        let v1 = buffer.starts_with(MESH_MAGIC_V1);
+    if buffer.starts_with(MESH_MAGIC) {
         let greeting = std::str::from_utf8(&buffer[MESH_MAGIC.len()..line_end])?.to_owned();
         let rest = buffer.split_off(line_end + 1);
         let _ = stream.set_nodelay(true);
         let stream = crate::tls::Replay::new(rest, stream);
-        return if v1 {
-            cluster
-                .mesh
-                .accept_v1(stream, &greeting, peer, permit)
-                .await
-        } else {
-            cluster.mesh.accept(stream, &greeting, peer, permit).await
-        };
+        return cluster.mesh.accept(stream, &greeting, peer, permit).await;
     }
-    let v1 = buffer.starts_with(FORWARD_MAGIC_V1);
-    if !v1 && !buffer.starts_with(FORWARD_MAGIC) {
+    if !buffer.starts_with(FORWARD_MAGIC) {
         let io = crate::tls::Replay::new(buffer, stream);
         let handler = hyper::service::service_fn(move |request| {
             let service = service.clone();
@@ -528,37 +491,29 @@ async fn internal_connection(
     }
     let line = std::str::from_utf8(&buffer[FORWARD_MAGIC.len()..line_end])?;
     let fields: Vec<&str> = line.split(' ').collect();
-    let (tunnel, visitor) = match fields.as_slice() {
-        [
-            sender,
-            receiver,
-            timestamp,
-            nonce,
-            tunnel,
-            route,
-            visitor,
-            proof,
-        ] if !v1 => {
-            cluster
-                .verify(
-                    FORWARD_LABEL,
-                    (sender, receiver, timestamp, nonce, proof),
-                    &[tunnel, route, visitor],
-                )
-                .with_context(|| format!("a forward from {peer}"))?;
-            cluster.check_sender(sender, peer)?;
-            (*tunnel, *visitor)
-        }
-        [token, tunnel, _route, visitor] if v1 => {
-            if !cluster.authorized_v1(token) {
-                bail!("forward with a bad token from {peer}");
-            }
-            (*tunnel, *visitor)
-        }
-        _ => bail!("malformed forward header"),
+    let [
+        sender,
+        receiver,
+        timestamp,
+        nonce,
+        tunnel,
+        route,
+        visitor,
+        proof,
+    ] = fields.as_slice()
+    else {
+        bail!("malformed forward header");
     };
+    cluster
+        .verify(
+            FORWARD_LABEL,
+            (sender, receiver, timestamp, nonce, proof),
+            &[tunnel, route, visitor],
+        )
+        .with_context(|| format!("a forward from {peer}"))?;
+    cluster.check_sender(sender, peer)?;
     drop(permit);
-    let tunnel = tunnel.to_owned();
+    let tunnel = (*tunnel).to_owned();
     let visitor: SocketAddr = visitor.parse().context("forwarded visitor address")?;
     let rest = buffer.split_off(line_end + 1);
     let accepted = relay::accept_with(stream, visitor, false, rest).await?;
@@ -600,13 +555,7 @@ async fn control(
                 }
             }
         }
-        Some(_) => false,
-        // TEMPORARY: the previous version's bearer secret.
-        None => headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|token| cluster.authorized_v1(token)),
+        _ => false,
     };
     if !authorized {
         return response(StatusCode::UNAUTHORIZED);

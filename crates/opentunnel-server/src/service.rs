@@ -43,8 +43,7 @@ const REFRESH_BACKOFF_MS: u64 = 5_000;
 /// Idle cached entries (no bridges) are dropped after this long, so a tunnel found missing is not read again on
 /// every connection from scanners or the clients of deleted tunnels.
 pub const MISSING_TTL_MS: u64 = 30_000;
-/// While the mesh is not complete (a peer starting, unreachable, or of the previous version), its events may be
-/// missed: routing then trusts "missing" for `MISSING_TTL_MS` and "certificate not ready" for this long.
+/// While the mesh is not complete (a peer starting or unreachable), its events may be missed: routing then trusts "missing" for `MISSING_TTL_MS` and "certificate not ready" for this long.
 const NOT_READY_TTL_MS: u64 = 5_000;
 /// With every peer linked, the machine that creates or changes a tunnel tells the others at once (mesh events),
 /// so cached answers need no expiry for correctness; this only bounds a bug.
@@ -1264,8 +1263,8 @@ impl Service {
         }
     }
 
-    /// Resumes issuance that has no job: records imported mid-issuance from the Worker, whose Workflow
-    /// instances stayed behind. Only issuance older than `grace_ms` is resumed, so the Worker can finish first.
+    /// Resumes issuance that has no job: records restored mid-issuance from an export (whose jobs are not in
+    /// it). Only issuance older than `grace_ms` is resumed, so a job being added right now is not raced.
     pub async fn resume_orphaned_issuance(&self, grace_ms: u64) -> Result<usize> {
         let now = self.now();
         let mut resumed = 0;

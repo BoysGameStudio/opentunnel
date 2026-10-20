@@ -1,12 +1,12 @@
 //! The mesh on its own, without servers or a database: links between several machines, duplicate links, the
-//! previous versions, bad secrets, the challenge never revealing the secret, and a table of 20,000 bridges under
+//! bad secrets, the old handshake refused, the challenge never revealing the secret, and a table of 20,000 bridges under
 //! churn.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use opentunnel_server::clock::Clock;
-use opentunnel_server::mesh::{Event, MESH_MAGIC, MESH_MAGIC_V1, Mesh, MeshConfig, Notice};
+use opentunnel_server::mesh::{Event, MESH_MAGIC, Mesh, MeshConfig, Notice};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -55,9 +55,6 @@ async fn node_with(name: &str, token: &str, config: MeshConfig) -> Node {
                 if let Some(greeting) = line.strip_prefix(MESH_MAGIC) {
                     let greeting = String::from_utf8_lossy(greeting).into_owned();
                     let _ = mesh.accept(stream, &greeting, peer, ()).await;
-                } else if let Some(token) = line.strip_prefix(MESH_MAGIC_V1) {
-                    let token = String::from_utf8_lossy(token).into_owned();
-                    let _ = mesh.accept_v1(stream, &token, peer, ()).await;
                 }
             });
         }
@@ -112,7 +109,6 @@ async fn links_every_pair_once_and_replicates_the_table() {
         assert_eq!(node.mesh.peers().len(), 2);
         assert_eq!(node.mesh.view()["complete"], true);
     }
-    assert!(!nodes[0].mesh.linked_v1("m2"));
 
     nodes[0]
         .mesh
@@ -213,7 +209,7 @@ async fn events_reach_every_peer_and_a_new_link_is_announced() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn refuses_a_peer_with_another_token_and_recognises_the_previous_version() {
+async fn refuses_a_peer_with_another_token_or_without_the_mesh() {
     let a = node("a", "secret").await;
     let stranger = node("stranger", "other").await;
     a.mesh.add_peer(&stranger.address);
@@ -223,7 +219,7 @@ async fn refuses_a_peer_with_another_token_and_recognises_the_previous_version()
     assert!(stranger.mesh.peers().is_empty());
     assert_eq!(a.mesh.view()["complete"], false);
 
-    // The previous version's internal listener answers anything but a forward with HTTP.
+    // Something that answers with HTTP instead of the mesh is not linked.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let old = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
@@ -235,12 +231,12 @@ async fn refuses_a_peer_with_another_token_and_recognises_the_previous_version()
     });
     a.mesh.add_peer(&old);
     wait(
-        "the previous version to be recognised",
+        "the HTTP answer to count as unreachable",
         Duration::from_secs(3),
-        || a.mesh.view()["peers"]["legacy"] == 1,
+        || a.mesh.view()["peers"]["unreachable"] == 1,
     )
     .await;
-    assert_eq!(a.mesh.view()["peers"]["legacy"], 1);
+    assert!(a.mesh.peers().is_empty());
     a.mesh.halt(false);
     stranger.mesh.halt(false);
 }
@@ -319,57 +315,12 @@ async fn the_challenge_never_reveals_the_secret() {
     a.mesh.halt(false);
 }
 
-/// TEMPORARY: a machine of the previous version greets with the secret itself. It is linked when the secret is
-/// right (and answered with its own line), marked so forwards to it use its format, and refused otherwise or once
-/// `accept_v1` is off.
+/// The handshake that sent the secret itself (`OPENTUNNEL-MESH/1 <secret>`, before October 2026) is refused,
+/// even with the right secret.
 #[tokio::test(flavor = "multi_thread")]
-async fn accepts_the_previous_handshake_only_with_the_right_secret() {
+async fn refuses_the_old_handshake() {
     let a = node("a", "secret").await;
-    for (token, accepted) in [("wrong", false), ("secret", true)] {
-        let mut stream = tokio::net::TcpStream::connect(&a.address).await.unwrap();
-        stream
-            .write_all(format!("OPENTUNNEL-MESH/1 {token}\n").as_bytes())
-            .await
-            .unwrap();
-        let mut answer = vec![0u8; 4096];
-        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut answer))
-            .await
-            .map_or(0, |read| read.unwrap_or(0));
-        let answer = String::from_utf8_lossy(&answer[..read]).into_owned();
-        if !accepted {
-            assert!(answer.is_empty(), "{answer}");
-            continue;
-        }
-        assert!(answer.starts_with("OPENTUNNEL-MESH/1 secret\n"), "{answer}");
-        // Its hello, as the previous version sends it.
-        let hello = serde_json::json!({
-            "type": "hello", "version": 1, "machine_id": "old", "region": "local", "address": "127.0.0.1:1",
-            "epoch": 1, "started_at": 1, "draining": false,
-        });
-        let body = serde_json::to_vec(&hello).unwrap();
-        stream.write_u32(body.len() as u32).await.unwrap();
-        stream.write_all(&body).await.unwrap();
-        wait("the old machine to link", Duration::from_secs(2), || {
-            a.mesh.is_up("old")
-        })
-        .await;
-        assert!(a.mesh.linked_v1("old"));
-        drop(stream);
-    }
-    a.mesh.halt(false);
-
-    let strict = node_with(
-        "strict",
-        "secret",
-        MeshConfig {
-            accept_v1: false,
-            ..config()
-        },
-    )
-    .await;
-    let mut stream = tokio::net::TcpStream::connect(&strict.address)
-        .await
-        .unwrap();
+    let mut stream = tokio::net::TcpStream::connect(&a.address).await.unwrap();
     stream
         .write_all(b"OPENTUNNEL-MESH/1 secret\n")
         .await
@@ -377,7 +328,8 @@ async fn accepts_the_previous_handshake_only_with_the_right_secret() {
     let mut answer = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut answer)).await;
     assert!(answer.is_empty(), "{}", String::from_utf8_lossy(&answer));
-    strict.mesh.halt(false);
+    assert!(a.mesh.peers().is_empty());
+    a.mesh.halt(false);
 }
 
 /// A linked peer is held to what it proved: the address it connects from, its machine ID while another link

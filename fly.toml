@@ -4,7 +4,7 @@
 # and keep a mesh of links over the private network, through which they know where every bridge is and forward a
 # visitor whose bridge is elsewhere (docs/server.md, "Multiple regions"). Both services are raw TCP (no Fly TLS or HTTP handlers),
 # so tenant TLS passes through to the tunnel clients untouched. Raw TCP on 443 needs a dedicated IPv4:
-# `fly ips allocate-v4` (see docs/cutover.md). Secrets: `fly secrets set` (docs/server.md).
+# `fly ips allocate-v4`. Secrets: `fly secrets set` (docs/server.md).
 
 app = "opentunnel"
 primary_region = "iad"

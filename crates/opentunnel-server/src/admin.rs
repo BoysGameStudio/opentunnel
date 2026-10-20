@@ -2,8 +2,8 @@
 //!
 //! - `POST /api/admin/import[?force=1]`: imports an export file (a restore), refusing any record the server could
 //!   not have written itself (`migration::check`)
-//! - `POST /api/admin/export`: every record, in the same format
-//! - `POST /api/admin/stats`: counts for checking a cutover, this machine's counters, and every machine's bridges
+//! - `POST /api/admin/export`: every record, in the same format, streamed a page at a time
+//! - `POST /api/admin/stats`: tunnel, alarm and job counts, this machine's counters, and every machine's bridges
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -68,13 +68,21 @@ impl Admin for TokenAdmin {
                         ),
                     }
                 }
-                "export" => match migration::export(&service.store, &service.clock).await {
-                    Ok(file) => json_response(StatusCode::OK, &file),
-                    Err(error) => json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &json!({ "error": format!("{error:#}") }),
-                    ),
-                },
+                "export" => {
+                    // Streamed as it is read, so neither PlanetScale's result limit nor Cloudflare's 100 s wait
+                    // for a response applies to the whole table.
+                    let chunks = migration::export(
+                        service.store.clone(),
+                        service.clock.clone(),
+                        migration::EXPORT_PAGE,
+                    );
+                    let mut response = Response::new(crate::http::streamed(chunks));
+                    response.headers_mut().insert(
+                        hyper::header::CONTENT_TYPE,
+                        hyper::header::HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
                 "stats" => match service.store.counts().await {
                     Ok(mut counts) => {
                         // This machine's counters (top level, as before, and under `machine`).

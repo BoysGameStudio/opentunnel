@@ -651,8 +651,8 @@ async fn changes_reach_other_machines_caches_at_once() {
 }
 
 /// Requests between machines prove the shared secret without carrying it: a signed control request is answered
-/// once, and not when replayed, stale, for another machine or signed with another secret. TEMPORARY: the previous
-/// version's bearer secret and forward header are accepted only while `MESH_ACCEPT_V1` is on.
+/// once, and not when replayed, stale, for another machine or signed with another secret. The bearer secret and
+/// the forward header carrying it (before October 2026) are refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn internal_requests_prove_the_secret_without_sending_it() {
     use opentunnel_server::peer_auth::{Secret, nonce};
@@ -726,10 +726,10 @@ async fn internal_requests_prove_the_secret_without_sending_it() {
         get(Some(("authorization", "Bearer wrong".into()))).await,
         401
     );
-    // TEMPORARY: the previous version's bearer secret.
+    // The bearer secret itself, as machines before October 2026 sent it.
     assert_eq!(
         get(Some(("authorization", "Bearer cluster-secret".into()))).await,
-        200
+        401
     );
     // A forward with a bad proof is closed without an answer.
     let mut stream = TcpStream::connect(a.internal()).await.unwrap();
@@ -748,27 +748,21 @@ async fn internal_requests_prove_the_secret_without_sending_it() {
     let mut answer = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut answer)).await;
     assert!(answer.is_empty());
+    // One carrying the secret itself is not a forward at all (the listener takes it for bad HTTP).
+    let mut stream = TcpStream::connect(a.internal()).await.unwrap();
+    stream
+        .write_all(b"OPENTUNNEL-FORWARD/1 cluster-secret abcdefghijkl @ 127.0.0.1:1\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut answer)).await;
+    assert!(
+        answer.is_empty() || answer.starts_with(b"HTTP/1.1 4"),
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
     a.stop().await;
     b.stop().await;
-
-    let strict = machine_with(
-        dir.path(),
-        "machine-strict",
-        "iad",
-        &["--mesh-accept-v1=false"],
-    )
-    .await
-    .unwrap();
-    let url = format!("http://{}{path}", strict.internal());
-    let status = reqwest::Client::new()
-        .get(url)
-        .bearer_auth("cluster-secret")
-        .send()
-        .await
-        .unwrap()
-        .status();
-    assert_eq!(status, 401);
-    strict.stop().await;
 }
 
 /// A deletion another machine announces closes bridges only when the database says the tunnel is deleted.

@@ -85,7 +85,6 @@ There are two client implementations that share one protocol:
 | `packages/protocol` | TypeScript schemas, bridge framing, and the HTTP API contract |
 | `packages/website` | The landing page, built with Vite and served by the server |
 | `packages/cli` | npm launcher and publish script for the Rust CLI |
-| `migration` | Temporary tooling for the move off the Cloudflare Worker ([docs/cutover.md](docs/cutover.md)) |
 
 The wire protocol and on-disk layout are specified in
 [docs/protocol.md](docs/protocol.md). Both clients are tested against the

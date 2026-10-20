@@ -20,7 +20,9 @@ use tracing::{info, warn};
 
 use crate::record::StoredTunnel;
 
-/// The schema version this server writes. A database at a newer version is refused.
+/// The schema version this server writes. A database at a newer version is refused, so tables are added and
+/// dropped without a new version where servers of the previous version do not depend on them (a rollback, or one
+/// of them restarting during a deploy, still starts).
 const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &[&str] = &[
@@ -40,8 +42,6 @@ const SCHEMA: &[&str] = &[
   issuing TINYINT NOT NULL DEFAULT 0,
   -- The renewal alarm (the Durable Object's storage alarm), Unix milliseconds.
   alarm_at BIGINT NULL,
-  -- Reserved for assigning tunnels to regions; NULL is the primary region.
-  region VARCHAR(32) NULL,
   updated_at BIGINT NOT NULL,
   imported_at BIGINT NULL,
   -- 0 while the row is exactly as last imported, so a later import may refresh it; 1 once this server wrote it.
@@ -80,24 +80,6 @@ const SCHEMA: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS meta (
   name VARCHAR(191) NOT NULL PRIMARY KEY,
   value MEDIUMTEXT NOT NULL
-) DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin"#,
-    // Version 2: the bridge registry of servers before the cluster mesh (`mesh.rs`), which keeps that in memory.
-    // TEMPORARY: only read while machines of the previous version still run (a deploy); drop it in a later schema
-    // version once none are left.
-    r#"CREATE TABLE IF NOT EXISTS bridges (
-  tunnel_id VARCHAR(191) NOT NULL,
-  route VARCHAR(63) NOT NULL,
-  machine_id VARCHAR(191) NOT NULL,
-  -- The bridge on that machine, so a late removal cannot delete a newer bridge's row.
-  bridge_id BIGINT NOT NULL,
-  region VARCHAR(32) NOT NULL,
-  -- The machine's internal listener on the private network, host:port.
-  address VARCHAR(191) NOT NULL,
-  -- Refreshed by the machine's heartbeat; readers ignore rows that stopped being refreshed.
-  updated_at BIGINT NOT NULL,
-  PRIMARY KEY (tunnel_id, route, machine_id),
-  KEY bridges_machine (machine_id),
-  KEY bridges_updated (updated_at)
 ) DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin"#,
     RATE_LIMITS,
 ];
@@ -347,6 +329,7 @@ async fn migrate(connection: &mut MySqlConnection) -> Result<()> {
                 }
                 Err(error) => return Err(db(error)),
             }
+            drop_bridges(connection).await;
             return Ok(());
         }
     }
@@ -363,6 +346,20 @@ async fn migrate(connection: &mut MySqlConnection) -> Result<()> {
     .await
     .map_err(db)?;
     Ok(())
+}
+
+/// Drops `bridges`, the bridge registry of servers before the mesh (schema 2), which nothing reads any more: only
+/// while it exists, so no DDL runs once it is gone. Servers of the previous version never touch it either. A
+/// failure (PlanetScale's safe migrations refuse direct DDL) is logged and leaves it for a deploy request.
+async fn drop_bridges(connection: &mut MySqlConnection) {
+    match connection.execute("SELECT 1 FROM bridges LIMIT 0").await {
+        Ok(_) => match connection.execute("DROP TABLE IF EXISTS bridges").await {
+            Ok(_) => info!("dropped the unused bridges table"),
+            Err(error) => warn!(%error, "could not drop the unused bridges table"),
+        },
+        Err(error) if mysql_code(&error) == Some(1146) => {}
+        Err(error) => warn!(%error, "could not check for the unused bridges table"),
+    }
 }
 
 async fn timed<T>(operation: &'static str, future: impl Future<Output = Result<T>>) -> Result<T> {
@@ -998,19 +995,27 @@ impl Store {
         Ok(outcome)
     }
 
-    pub async fn export_tunnels(&self) -> Result<Vec<(StoredTunnel, Option<u64>)>> {
-        timed("export_tunnels", async {
-            let rows: Vec<(String, Option<i64>)> =
-                sqlx::query_as("SELECT record, alarm_at FROM tunnels ORDER BY id")
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(db)?;
+    /// Up to `limit` tunnels with IDs after `after`, in ID order, with their renewal alarms: one page of an export.
+    /// The whole table no longer fits in one result (PlanetScale refuses results over 64 MiB).
+    pub async fn export_page(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, StoredTunnel, Option<u64>)>> {
+        timed("export_page", async {
+            let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+                "SELECT id, record, alarm_at FROM tunnels WHERE id > ? ORDER BY id LIMIT ?",
+            )
+            .bind(after.unwrap_or(""))
+            .bind(limit as u64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db)?;
             rows.into_iter()
-                .map(|(record, alarm)| {
-                    Ok((
-                        serde_json::from_str(&record)?,
-                        alarm.map(|alarm| alarm as u64),
-                    ))
+                .map(|(id, record, alarm)| {
+                    let record = serde_json::from_str(&record)
+                        .with_context(|| format!("the record of {id}"))?;
+                    Ok((id, record, alarm.map(|alarm| alarm as u64)))
                 })
                 .collect()
         })
@@ -2160,6 +2165,30 @@ mod tests {
             store.take_rate("k", 1_000, rate).await.unwrap(),
             crate::limits::Verdict::Allowed
         );
+        store.migrate().await.unwrap();
+    }
+
+    /// The bridge registry of servers before the mesh is dropped from a database at this version.
+    #[tokio::test]
+    async fn drops_the_bridges_table() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        sqlx::query(
+            "CREATE TABLE bridges (tunnel_id VARCHAR(191) NOT NULL PRIMARY KEY) DEFAULT CHARSET = utf8mb4",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        store.migrate().await.unwrap();
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.tables
+             WHERE table_schema = DATABASE() AND table_name = 'bridges'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, 0);
         store.migrate().await.unwrap();
     }
 

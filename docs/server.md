@@ -96,10 +96,16 @@ lags behind its budget slows the bridge to its pace, at most 5 s per frame.
 | Durable Object alarm (renewal) | `alarm_at` per tunnel in MySQL, fired by `jobs::run_alarms`; same `alarm`, `scheduleRenewal`, `onAttached` logic |
 | `CertificateWorkflow` (ZeroSSL, EAB, DNS-01, retries, `describeError`) | `acme.rs` + `dns.rs` + durable, leased `jobs` rows resumed after restarts; transient failures retried for a day, others three times (see below) |
 | Workflow instance named after the certificate ID | Job keyed by certificate ID (`ensure_issuance` adds it only if missing) |
-| Cloudflare-managed certificate for `opentunnel.xyz` | `jobs::ServerCertificates`: the same ACME issuance for the domain, renewed 30 days before expiry, hot-swapped |
-| Worker export (the migration, finished October 2026) | The same file format for backups: `opentunnel-server export`/`import`, `POST /api/admin/{export,import}`; imports take only records the server could have written itself (see [Limits](#limits)). The relay fallback to the Worker and the pull-through import are gone |
+| Cloudflare-managed certificate for `opentunnel.xyz` | A Cloudflare Origin CA certificate (`TLS_CERT_FILE`/`TLS_KEY_FILE`, from the `ORIGIN_*_PEM` secrets): the domain is on the Public Suffix List, so no public CA issues for it, and Cloudflare proxies it. Without those settings (development, other domains) `jobs::ServerCertificates` issues one through the configured issuer, renewed 30 days before expiry, hot-swapped |
+| Worker export | The same file format for backups: `opentunnel-server export`/`import`, `POST /api/admin/{export,import}`; imports take only records the server could have written itself (see [Limits](#limits)) |
 | Static assets | `website.rs`: `dist/website` in memory, Cloudflare's HTML handling (`/index.html` → `/`), ETags |
 | Pipelines `EVENTS` binding | `analytics.rs`: identical event envelopes and payloads, posted in batches to `ANALYTICS_URL` |
+
+The move (October 2026) imported the Worker's records, then pointed visitors
+and then the API domain at Fly while the server relayed tunnels it did not
+know yet to the Worker and imported them on first use; once no client was
+left on the Worker, the Worker, its Durable Objects, the AWS relay, that
+fallback and the migration tooling were deleted.
 
 Two things changed by necessity: analytics no longer carry `country` and
 `colo` (they came from Cloudflare's request metadata), and a tunnel's `state`
@@ -120,25 +126,28 @@ MySQL 8, in production the PlanetScale database `opentunnel` (org
   token hash, hostname, certificate state, CSR and identifiers,
   `lastConnectedAt`, `renewal`, `deletedAt`, ...; `LONGTEXT` because MySQL's
   `JSON` type would reorder keys), `revision`, `deleted` and `issuing`
-  (derived from the record for queries), `alarm_at`, `region` (reserved), and
+  (derived from the record for queries), `alarm_at`, and
   `local_update`, which is 0 while a row is exactly as imported so a later
-  import may refresh it.
+  import may refresh it. Databases created before October 2026 also have an
+  unused, nullable `region` column (reserved once, never written); drop it
+  with a PlanetScale deploy request when convenient.
 - `jobs`: issuance jobs (`issue`, `renew`, `server`) with a status
   (`pending`, `done`, `failed`, `abandoned`), attempts, the next run time, and
   a lease (`lease_owner`, `lease_until`).
 - `server_certificates`: the domain's key, CSR, certificate and expiry.
 - `meta`: the API certificate's current job and the local test CA when
   `ISSUER=local` (servers before the mesh also kept `machine:<id>` rows here).
-- `bridges` (schema 2): the bridge registry of servers before the mesh. The
-  mesh keeps that in memory ([Multiple regions](#multiple-regions)); this
-  version only reads it while a machine of the previous version is still
-  running (a deploy from it). TEMPORARY: drop it in a later schema version.
 - `rate_limits`: one row per limited key (`create:<client address>`,
   `issue:<tunnel>`) with the time its budget is full again ([Limits](#limits));
   rows in the past are pruned every 5 minutes. Added without a schema version:
   a database at schema 2 gets it at startup when it is missing (`CREATE TABLE
   IF NOT EXISTS`, no DDL once it exists), so servers of the previous version,
   which refuse a newer schema, still start against it (a rollback).
+- `bridges`, the bridge registry of servers before the mesh (schema 2), is
+  dropped at startup when it exists (`DROP TABLE IF EXISTS`, no DDL once it is
+  gone), likewise without a schema version: no running version reads it. If
+  PlanetScale refuses direct DDL (safe migrations), the server logs `could not
+  drop the unused bridges table` and carries on; drop it with a deploy request.
 - `schema_migrations`: the schema version.
 
 The schema keeps to what Vitess allows: a primary key on every table, no
@@ -146,10 +155,10 @@ foreign keys, triggers or stored procedures. On startup the server creates
 missing tables with `CREATE TABLE IF NOT EXISTS` and records the version; once
 the database is at its version it runs no DDL at all (so PlanetScale's safe
 migrations may be turned on afterwards; later schema changes then go through a
-deploy request). A database at a newer version is refused. Schema 2 only adds
-the `bridges` table; with safe migrations on, create it through a deploy
-request (the statement is in `store.rs`) before deploying, or the new server
-keeps retrying at startup.
+deploy request). A database at a newer version is refused, so a version bump
+also stops the previous version from starting (a rollback, or one of its
+machines restarting during a blue-green deploy): tables it does not depend on
+are added and dropped without one, as above.
 
 Nothing assumes a single writer, so two servers on one database stay correct:
 
@@ -255,9 +264,20 @@ into the database at `DATABASE_URL`, refusing (and listing under `rejected`)
 any record that is not exactly what the server writes: a tunnel ID that is one
 DNS label, the hostname `<id>.<domain>`, a SHA-256 token hash, and a CSR and
 identifiers only for the tunnel's own hostname and its wildcard.
-PlanetScale's own backups also cover it. (The admin export of the whole table
-in one response is larger than PlanetScale's 64 MiB result limit since
-~17,000 tunnels; use PlanetScale's backups or `pscale database dump`.)
+PlanetScale's own backups also cover it. The export reads the table 500
+tunnels at a time, keyset by ID (the whole table in one result passed
+PlanetScale's 64 MiB limit at ~17,000 tunnels), and writes each page as it is
+read: the admin endpoint streams the response (chunked), so it starts at once
+and Cloudflare's 100 s wait for a response does not apply. The file is the same
+JSON as ever (one record per line inside `records`); pages are not one
+snapshot, so a record changed during the export is as it was when its page was
+read. A failure midway cuts the response short (`curl` reports a transfer
+error, and the file is not valid JSON) rather than ending it cleanly.
+
+```bash
+curl -sf -X POST https://opentunnel.xyz/api/admin/export -H "authorization: Bearer $ADMIN_TOKEN" -o export.json
+jq '.records | length' export.json   # ≈ tunnels + deleted in /api/admin/stats; the file holds token hashes, keep it private
+```
 
 ## Configuration
 
@@ -293,7 +313,6 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `ADMIN_TOKEN` | | secret: enables `POST /api/admin/{import,export,stats}` |
 | `INTERNAL_LISTEN` | `off` | the internal listener for other machines: mesh links, forwarded visitors, route checks (`[::]:9000` on Fly, bound to `FLY_PRIVATE_IP`); `off` runs a single machine without the mesh |
 | `INTERNAL_TOKEN` | | secret shared by all machines, required with `INTERNAL_LISTEN`; never sent, only proven ([Multiple regions](#multiple-regions)) |
-| `MESH_ACCEPT_V1` | `true` | TEMPORARY: accept mesh links, forwards and route checks from the version that sent `INTERNAL_TOKEN` itself (for the deploy from it); set `false`, then remove, once none run |
 | `INTERNAL_ADDRESS` | `[FLY_PRIVATE_IP]:<port>` | where other machines reach this one |
 | `FLY_MACHINE_ID`, `FLY_REGION`, `FLY_PRIVATE_IP`, `FLY_APP_NAME` | random, `local`, , | set by Fly: the machine's ID in the mesh (also the job lease owner), region, 6PN address, and app (for `MESH_DNS`) |
 | `MESH_DNS` | `<FLY_APP_NAME>.internal` | a name whose AAAA/A records are the other machines, at this machine's internal port; `off` disables it |
@@ -325,7 +344,7 @@ Set secrets with `fly secrets set NAME=value ... -a opentunnel`.
   answering machine's mesh view: bridges in total and per region, every
   machine it is linked to (itself as `link: "self"`) with its bridges, tunnels,
   routes, epoch, sequence number and whether it is draining, the state of every
-  peer address (`peers`: `up`, `connecting`, `unreachable`, `legacy`), and
+  peer address (`peers`: `up`, `connecting`, `unreachable`), and
   `complete` (every peer linked). The request lands on the machine nearest the
   caller's Cloudflare colo; every machine should show the same machines and
   bridge counts.
@@ -397,6 +416,21 @@ against the same budget.
   has at most one first issuance at a time (and a renewal that a new bind
   abandons), and new certificates per tunnel and the backlog are limited as
   above, so records in the zone are bounded by the attempts running.
+- **Challenge record cleanup**: an attempt deletes its records when it ends
+  (deletes that Cloudflare rate limits or fails with 5xx are retried; one
+  already gone counts as deleted), unless an authorization it answered could
+  not be deactivated, when the CA might still check them. At shutdown every
+  attempt in progress is ended and cleans up first (the job is resumed
+  elsewhere): until October 2026 a machine stopped by a deploy (or a failed
+  blue-green deploy deleting green machines that had started) exited
+  mid-attempt and left its records, ~1,300 of them, mostly from deploys and
+  their retries. Every 10 minutes one machine (a lease in `meta`,
+  `dns_sweeper`) lists `_acme-challenge.*` TXT records and deletes, at most
+  1,000 at 4 a second, those older than an hour under the domain whose value
+  is a challenge value, except names of jobs some machine is running.
+  `opentunnel_acme_dns_records_total{event}` counts `created`, `deleted`,
+  `delete_failed` and `swept`.
+
 - **Backlog**: while more than 200 certificate jobs are pending in the whole
   database (`ISSUANCE_BACKLOG_LIMIT`; the count is read at most every 5 s per
   machine, and when it cannot be read nothing is refused), creating tunnels
@@ -462,7 +496,7 @@ every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 | `opentunnel_visitor_connection_duration_seconds` | histogram | | connections carried over a bridge here |
 | `opentunnel_cluster_forward_failures_total` | counter | `reason` (`refused`, `connect`, `timeout`, `io`) | |
 | `opentunnel_mesh_lookups_total` | counter | `result` (`hit`, `miss`) | a visitor without a local bridge: another machine holds the route, or none does |
-| `opentunnel_mesh_peers` | gauge | `state` (`up`, `connecting`, `unreachable`, `legacy`) | other machines this one knows by address; `legacy` answers without the mesh (the previous version) |
+| `opentunnel_mesh_peers` | gauge | `state` (`up`, `connecting`, `unreachable`) | other machines this one knows by address; `unreachable` includes one that answers without the mesh |
 | `opentunnel_mesh_links_total` | counter | `event` (`up`, `down`) | mesh links that came up or went down (reconnects) |
 | `opentunnel_mesh_table_bridges` | gauge | `machine` | bridges in this machine's table per machine holding them (itself included) |
 | `opentunnel_mesh_propagation_seconds` | histogram | `kind` (`attached`, `detached`, `event`) | from a peer announcing a change to this machine applying it, by the two machines' clocks |
@@ -578,21 +612,7 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   (`started_at`, then a random `epoch`), then the link dialed by the lower
   address. Failed dials back off from 200 ms to 5 s. An address that leaves DNS
   is dialed for 30 s more.
-- **Challenge records.** An attempt deletes its records when it ends
-  (deletes that Cloudflare rate limits or fails with 5xx are retried; one
-  already gone counts as deleted), unless an authorization it answered could
-  not be deactivated, when the CA might still check them. At shutdown every
-  attempt in progress is ended and cleans up first (the job is resumed
-  elsewhere): until October 2026 a machine stopped by a deploy (or a failed
-  blue-green deploy deleting green machines that had started) exited
-  mid-attempt and left its records, ~1,300 of them, mostly from deploys and
-  their retries. Every 10 minutes one machine (a lease in `meta`,
-  `dns_sweeper`) lists `_acme-challenge.*` TXT records and deletes, at most
-  1,000 at 4 a second, those older than an hour under the domain whose value
-  is a challenge value, except names of jobs some machine is running.
-  `opentunnel_acme_dns_records_total{event}` counts `created`, `deleted`,
-  `delete_failed` and `swept`.
-
+- **Links.** A challenge and response proves both sides hold
   `INTERNAL_TOKEN` without sending it (`peer_auth.rs`): the dialer sends
   `OPENTUNNEL-MESH/2 <machine> <nonce>\n`, the acceptor answers
   `OPENTUNNEL-MESH/2 <machine> <nonce> <proof>\n`, and the dialer, once that
@@ -651,7 +671,7 @@ client ─▶ Cloudflare ─▶ machine A (iad) ─ bridge attached ─▶ "atta
   certificate updates read the record again (one query); routing re-reads a
   cached record only while it is missing or its certificate is not ready, and
   then only when told (an event, a new link), when the mesh is not complete (a
-  peer starting, unreachable or of the previous version: then after 30 s for
+  peer starting or unreachable: then after 30 s for
   missing, 5 s for not ready, as before), or after a 10-minute safety TTL. Idle
   entries without bridges are dropped after 30 s. During a database outage
   the cached copy is used.
@@ -743,7 +763,7 @@ fly scale vm shared-cpu-1x --memory 1024 --app opentunnel   # if existing machin
 for region in ord sjc gru lhr fra cdg jnb sin nrt syd; do
   fly scale count 1 --region $region --app opentunnel --yes
 done                                         # or: fly machine clone <iad machine> --region <region>
-fly status --app opentunnel                  # eleven machines, all passing checks
+fly status --app opentunnel                  # every machine passing checks
 curl -s -X POST https://opentunnel.xyz/api/admin/stats -H "authorization: Bearer $ADMIN_TOKEN" | jq .cluster
 ```
 
@@ -752,21 +772,13 @@ curl -s -X POST https://opentunnel.xyz/api/admin/stats -H "authorization: Bearer
 by itself. Every machine must have `INTERNAL_TOKEN` before it runs with
 `INTERNAL_LISTEN` (staged secrets apply on the next deploy).
 
-The deploy that replaced sending `INTERNAL_TOKEN` (October 2026) runs next
-to machines that greet with `OPENTUNNEL-MESH/1 <secret>`, forward with
-`OPENTUNNEL-FORWARD/1 <secret> ...` and ask with a bearer secret, and answer
-anything else with HTTP 400. New machines never send the secret to anyone who
-did not send it first: they greet with the challenge, which an old machine
-answers with HTTP (`legacy` in the peer states for up to a minute), but they
-accept an old machine's own greeting when its secret is right and answer it
-with the line it sent, which tells it nothing new (`MESH_ACCEPT_V1`). Such a
-link is marked, and only to a machine marked that way do new machines forward
-and send route checks in the old format. So links come up as soon as the old
-machine dials (within its next discovery, 5 s), forwarding keeps working both
-ways, and nothing breaks unless an old machine never dials a new one (then
-the pair is not linked until the old machine stops: visitors on one side for
-bridges on the other are closed, as in a partition). Once no machine of that
-version runs, set `MESH_ACCEPT_V1=false` and remove the TEMPORARY code.
+During a blue-green deploy the new machines link with the previous version's
+for a minute or so, so the mesh, forward and route-check formats must stay
+compatible with the version in production: frames and fields may be added
+(unknown ones are ignored), but a handshake change needs a release that
+accepts both first. The current handshakes (`OPENTUNNEL-MESH/2`,
+`OPENTUNNEL-FORWARD/2`, `x-opentunnel-auth`) replaced ones that sent
+`INTERNAL_TOKEN` itself in October 2026; those are refused now.
 
 ## Capacity
 
@@ -913,7 +925,7 @@ docker rm -f ot-mysql    # when done; it holds the test databases
   certificate-ready tunnels routable at once, signed requests, deletions the
   database does not confirm ignored, and jobs running once), the mesh alone (`tests/mesh.rs`: one link
   per pair, replication, newer claims, leaving, events, bad tokens, the
-  challenge never revealing the secret, the previous versions, and 20,000
+  challenge never revealing the secret, the old handshake refused, and 20,000
   bridges with 100 changes a second), signed forwards and route checks
   (`tests/cluster.rs`: replayed, stale, misaddressed and badly signed requests
   refused), the limits (`tests/limits.rs`: per client address, a spoofed

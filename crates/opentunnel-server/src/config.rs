@@ -195,12 +195,6 @@ pub struct Config {
     #[arg(long, env = "MESH_DEAD_MS", default_value_t = 5_000)]
     pub mesh_dead_ms: u64,
 
-    /// TEMPORARY (the deploy that replaced sending the secret with a challenge): accept mesh links, forwards and
-    /// control requests from machines of the previous version, which send `INTERNAL_TOKEN` itself, when it is
-    /// right. Nothing here sends it to a machine that did not send it first. Turn off once none are left.
-    #[arg(long, env = "MESH_ACCEPT_V1", default_value_t = true, action = clap::ArgAction::Set)]
-    pub mesh_accept_v1: bool,
-
     /// A peer's mesh address must be the one its connection comes from (and, on Fly, what
     /// `<machine>.vm.<app>.internal` resolves to). Only for unusual networks; forwards go to that address.
     #[arg(long, env = "MESH_VERIFY_ADDRESS", default_value_t = true, action = clap::ArgAction::Set)]
@@ -318,7 +312,6 @@ impl Config {
             discovery: ms(self.mesh_discovery_ms),
             ping: ms(self.mesh_ping_ms),
             dead: ms(self.mesh_dead_ms),
-            accept_v1: self.mesh_accept_v1,
             machine_dns,
             verify_address: self.mesh_verify_address,
             ..crate::mesh::MeshConfig::default()

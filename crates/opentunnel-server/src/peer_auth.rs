@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use ring::hmac;
 
-use crate::crypto::{hash_token, hex, random_bytes, token_matches};
+use crate::crypto::{hex, random_bytes};
 
 /// How far a signed request's timestamp may be from the receiver's clock.
 pub const MAX_SKEW_MS: u64 = 30_000;
@@ -20,7 +20,6 @@ const MAX_NONCES: usize = 100_000;
 
 pub struct Secret {
     key: hmac::Key,
-    token_hash: String,
 }
 
 /// A fresh random nonce, 32 hex characters.
@@ -42,7 +41,6 @@ impl Secret {
     pub fn new(token: &str) -> Self {
         Self {
             key: hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes()),
-            token_hash: hash_token(token),
         }
     }
 
@@ -57,11 +55,6 @@ impl Secret {
             return false;
         };
         hmac::verify(&self.key, &message(parts), &tag).is_ok()
-    }
-
-    /// TEMPORARY (deploys from servers that sent the secret itself): whether `token` is the secret.
-    pub fn matches(&self, token: &str) -> bool {
-        !token.is_empty() && token_matches(token, &self.token_hash)
     }
 }
 
@@ -126,9 +119,6 @@ mod tests {
         assert!(!Secret::new("other").verify(&["mesh/2 accept", "a", "b", "n1", "n2"], &proof));
         assert!(!secret.verify(&["mesh/2 accept", "a", "b", "n1", "n2"], "zz"));
         assert!(!secret.verify(&["mesh/2 accept", "a", "b", "n1", "n2"], ""));
-        assert!(secret.matches("secret"));
-        assert!(!secret.matches("Secret"));
-        assert!(!secret.matches(""));
     }
 
     #[test]
