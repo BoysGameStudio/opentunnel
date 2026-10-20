@@ -508,11 +508,9 @@ impl Server {
             }
         };
         let internal_listener = self.bind_internal().await?;
-        let metrics_listener = crate::metrics::bind(&private_only(
-            &self.config.metrics_listen,
-            self.config.private_ip,
-        ))
-        .await?;
+        // Bound as configured (every interface on Fly): Fly's scraper does not reach the 6PN address. Nothing in
+        // the metrics is secret or per tenant.
+        let metrics_listener = crate::metrics::bind(&self.config.metrics_listen).await?;
         self.start_background().await?;
         if let Some(listener) = metrics_listener {
             tokio::spawn(crate::metrics::serve(listener, self.metrics_sampler()));
@@ -564,18 +562,6 @@ impl Server {
         }
         info!("shut down");
         Ok(())
-    }
-}
-
-/// `address` with an unspecified IP (`[::]`, `0.0.0.0`) narrowed to the machine's private network address, when
-/// it has one: on Fly the 6PN address, so nothing listens on every interface.
-fn private_only(address: &str, private: Option<std::net::IpAddr>) -> String {
-    match (address.parse::<SocketAddr>(), private) {
-        (Ok(mut parsed), Some(private)) if parsed.ip().is_unspecified() => {
-            parsed.set_ip(private);
-            parsed.to_string()
-        }
-        _ => address.to_owned(),
     }
 }
 

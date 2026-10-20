@@ -250,7 +250,7 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `MESH_PING_MS` / `MESH_DEAD_MS` | `1000` / `5000` | an idle link pings this often; a peer silent this long is down |
 | `CONNECTION_IDLE_TIMEOUT_MS` | `900000` | a tunnel connection with no traffic either way for this long is reset |
 | `HALF_CLOSE_TIMEOUT_MS` | `60000` | once either direction of a tunnel connection has ended, the other is reset after this long without traffic |
-| `METRICS_LISTEN` | `off` | Prometheus metrics at `/metrics` (`[::]:9091` on Fly, bound to `FLY_PRIVATE_IP` like the internal listener, unauthenticated, not in `[[services]]`); see [Observability](#observability) |
+| `METRICS_LISTEN` | `off` | Prometheus metrics at `/metrics` (`[::]:9091` on Fly: every interface, as Fly's scraper does not reach the 6PN address; unauthenticated, not in `[[services]]`); see [Observability](#observability) |
 | `SHUTDOWN_DRAIN_MS` | `10000` | after SIGTERM, how long the server keeps accepting and serving while bridges move elsewhere |
 | `LOG_FORMAT` | `text` | `json` writes one JSON object per line (`json` on Fly) |
 | `LEGACY_WORKER_URL`, `RELAY_TOKEN`, `LEGACY_EXPORT_TOKEN` | | TEMPORARY, migration only ([cutover.md](cutover.md)) |
@@ -353,12 +353,13 @@ clients share one budget).
 ### Metrics
 
 Every machine serves Prometheus metrics (OpenMetrics text) at `GET /metrics` on
-`METRICS_LISTEN` (`[::]:9091`, bound to the machine's 6PN address
-`FLY_PRIVATE_IP`, where Fly's scraper reaches it). It needs no token: no
-`[[services]]` entry exposes the port, so only Fly's scraper and the private
-network reach it, which is the whole `anomaly-807` organization, so nothing in
-it may be secret or per tenant: no tunnel IDs, hostnames or client addresses,
-only machine IDs and fixed label values. `fly.toml`'s `[metrics]` section has Fly scrape it
+`METRICS_LISTEN` (`[::]:9091`). It binds every interface: bound to the 6PN
+address (`FLY_PRIVATE_IP`) like the internal listener, Fly's scraper no
+longer reached it (October 2026). It needs no token: no `[[services]]` entry
+exposes the port, so only Fly's scraper and the private network reach it,
+which is the whole `anomaly-807` organization, so nothing in it may be secret
+or per tenant: no tunnel IDs, hostnames or client addresses, only machine IDs
+and fixed label values. `fly.toml`'s `[metrics]` section has Fly scrape it
 every 15 s into its managed Prometheus, which adds `app`, `region`, `host` and
 `instance` labels. No metric has a per-tunnel label.
 
