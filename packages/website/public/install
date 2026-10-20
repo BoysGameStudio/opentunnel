@@ -22,9 +22,19 @@ case "$(uname -m)" in
 esac
 
 if [ -n "${OPENTUNNEL_VERSION:-}" ]; then
-  url="https://github.com/$repo/releases/download/v${OPENTUNNEL_VERSION#v}/opentunnel-$os-$arch.tar.gz"
+  base="https://github.com/$repo/releases/download/v${OPENTUNNEL_VERSION#v}"
 else
-  url="https://github.com/$repo/releases/latest/download/opentunnel-$os-$arch.tar.gz"
+  base="https://github.com/$repo/releases/latest/download"
+fi
+file="opentunnel-$os-$arch.tar.gz"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+else
+  echo "opentunnel: sha256sum or shasum is required to verify the download" >&2
+  exit 1
 fi
 
 dir="${OPENTUNNEL_INSTALL:-$HOME/.local/bin}"
@@ -32,7 +42,15 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 echo "Downloading opentunnel for $os-$arch..."
-curl -fsSL "$url" | tar -xz -C "$tmp"
+curl -fsSL -o "$tmp/$file" "$base/$file"
+curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+expected="$(awk -v file="$file" '$2 == file { print $1 }' "$tmp/SHA256SUMS")"
+actual="$(sha256 "$tmp/$file")"
+if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+  echo "opentunnel: checksum verification failed for $file" >&2
+  exit 1
+fi
+tar -xzf "$tmp/$file" -C "$tmp" opentunnel
 mkdir -p "$dir"
 mv "$tmp/opentunnel" "$dir/opentunnel"
 chmod 755 "$dir/opentunnel"
