@@ -6,6 +6,7 @@ import { BridgeProtocol } from "@opentunnel/protocol/bridge-protocol";
 import { Names } from "@opentunnel/protocol/names";
 import { ProxyProtocol } from "@opentunnel/protocol/proxy-protocol";
 import { USER_AGENT } from "./api.js";
+import { isValidRouteName, publicUrls } from "./routes.js";
 
 /** Bun's WebSocket also takes options with request headers, which the DOM typings don't know about. */
 const BunWebSocket = WebSocket as unknown as new (
@@ -18,6 +19,7 @@ import type {
   OpenTunnelProxyProtocol,
   OpenTunnelRoutes,
   OpenTunnelStatus,
+  OpenTunnelUrls,
 } from "./types.js";
 
 const VERSION = "0.1.0";
@@ -44,7 +46,11 @@ type SessionEnd =
 
 export class OpenTunnelAttachError extends Error {
   constructor(readonly code: string) {
-    super(`Bridge attach failed: ${code}`);
+    super(
+      code === BridgeProtocol.BridgeErrorCode.ROUTE_CONFLICT
+        ? `Bridge attach failed: ${code} (another client holds a route)`
+        : `Bridge attach failed: ${code}`,
+    );
   }
 }
 
@@ -63,7 +69,7 @@ const ROUTE_KEYS = new Set(["target", "proxyProtocol"]);
 
 /** Validates one route value, a `host:port` string or `{ target, proxyProtocol? }`. */
 export const resolveRoute = (name: string, value: unknown): ResolvedRoute => {
-  if (!Names.isValidRoute(name)) throw new Error(`Invalid route name '${name}'`);
+  if (!isValidRouteName(name)) throw new Error(`Invalid route name '${name}'`);
   let target: unknown = value;
   let proxyProtocol: OpenTunnelProxyProtocol | undefined;
   if (typeof value === "object" && value !== null && !Array.isArray(value)) {
@@ -123,6 +129,8 @@ export interface TunnelOptions {
   readonly onEvent: (event: OpenTunnelClientEvent) => void;
   /** Called with the identity after the server renews its certificate. */
   readonly onRenewed?: (identity: OpenTunnelIdentity) => void;
+  /** `"fail"` makes `route_conflict` fatal instead of retrying it. */
+  readonly onRouteConflict?: "retry" | "fail";
 }
 
 /**
@@ -135,6 +143,7 @@ export class Tunnel {
   private identity: OpenTunnelIdentity;
   private secureContext: Tls.SecureContext;
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly refreshAbort = new AbortController();
   private session: Session | undefined;
   private shutdown = false;
   private wake: (() => void) | undefined;
@@ -183,7 +192,10 @@ export class Tunnel {
         `/api/tunnel/${encodeURIComponent(this.identity.id)}/certificate`,
         this.options.api,
       );
-      const response = await fetch(url, { headers: { authorization: `Bearer ${this.identity.token}` } });
+      const response = await fetch(url, {
+        headers: { authorization: `Bearer ${this.identity.token}` },
+        signal: this.refreshAbort.signal,
+      });
       const body = response.ok
         ? ((await response.json()) as {
             state?: { type?: string; certificate?: string; chain?: string; expiry?: string };
@@ -223,6 +235,10 @@ export class Tunnel {
     return { ...this.status, routes: { ...this.status.routes } };
   }
 
+  getUrls(): OpenTunnelUrls {
+    return publicUrls(this.routes, this.identity.hostname);
+  }
+
   /**
    * Replaces the routes. Changing only targets applies to new connections
    * immediately; adding or removing names re-attaches the bridge.
@@ -240,6 +256,7 @@ export class Tunnel {
   close(): Promise<void> {
     this.shutdown = true;
     clearTimeout(this.refreshTimer);
+    this.refreshAbort.abort();
     this.session?.end({ type: "shutdown" });
     this.wake?.();
     return this.closed.catch(() => undefined);
@@ -417,8 +434,10 @@ class Session {
         this.hooks.attached(message.session);
         this.hooks.emit({ type: "connected", session: message.session, routes: [...message.routes] });
       } else if (message.type === "attach_error") {
+        const conflict = message.code === BridgeProtocol.BridgeErrorCode.ROUTE_CONFLICT;
+        if (conflict) this.hooks.emit({ type: "route-conflict", routes: Object.keys(this.routes).sort() });
         this.end(
-          fatalAttachCodes.has(message.code)
+          fatalAttachCodes.has(message.code) || (conflict && this.options.onRouteConflict === "fail")
             ? { type: "fatal", error: new OpenTunnelAttachError(message.code) }
             : { type: "retry", error: `attach failed: ${message.code}`, attached: false },
         );

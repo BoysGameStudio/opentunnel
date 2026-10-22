@@ -1,6 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type * as Tls from "node:tls";
-import { create, OpenTunnelStorage, type OpenTunnelClientEvent, type OpenTunnelPromiseClient } from "../src/promise/index.js";
+import { Effect, Exit, Fiber, ManagedRuntime, Scope } from "effect";
+import { OpenTunnelClient, OpenTunnelStorage as EffectStorage } from "../src/effect/index.js";
+import {
+  create,
+  isValidRouteName,
+  OpenTunnelClientError,
+  OpenTunnelStorage,
+  publicUrl,
+  ROOT_ROUTE,
+  ROUTE_LABEL_PATTERN,
+  type OpenTunnelClientEvent,
+  type OpenTunnelPromiseClient,
+} from "../src/promise/index.js";
 import { X509Certificate } from "node:crypto";
 import {
   echoServer,
@@ -227,5 +239,198 @@ describe("tunnel", () => {
     const presented = new X509Certificate(socket.getPeerCertificate().raw);
     expect(presented.fingerprint256).toBe(new X509Certificate(renewed).fingerprint256);
     await connection.close();
+  });
+});
+
+const waitFor = async (condition: () => boolean, timeoutMs = 5_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting");
+    await Bun.sleep(10);
+  }
+};
+
+describe("connect signal", () => {
+  test("an aborted signal rejects before connecting", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      client.tunnel.connect({ routes: { api: echo.target }, signal: controller.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(relay.sockets.opened).toBe(0);
+    expect(relay.certificateRequests).toEqual([]);
+  });
+
+  test("aborts an attach the server never answers", async () => {
+    relay.silent = true;
+    const controller = new AbortController();
+    const events: OpenTunnelClientEvent[] = [];
+    const connecting = client.tunnel.connect({
+      routes: { api: echo.target },
+      signal: controller.signal,
+      onEvent: (event) => events.push(event),
+    });
+    await waitFor(() => relay.sockets.opened === 1);
+    const reason = new Error("gave up");
+    controller.abort(reason);
+    const started = Date.now();
+    await expect(connecting).rejects.toBe(reason);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    await waitFor(() => relay.sockets.closed === 1);
+    expect(events.at(-1)).toEqual({ type: "stopped" });
+    // Nothing reconnects after the abort.
+    await Bun.sleep(300);
+    expect(relay.sockets.opened).toBe(1);
+  });
+
+  test("aborts certificate work started by connect", async () => {
+    relay.hangCertificate = true;
+    const controller = new AbortController();
+    const connecting = client.tunnel.connect({ routes: { api: echo.target }, signal: controller.signal });
+    await waitFor(() => relay.certificateRequests.length === 1);
+    controller.abort();
+    await expect(connecting).rejects.toMatchObject({ name: "AbortError" });
+    expect(relay.sockets.opened).toBe(0);
+  });
+
+  test("closes the connection when aborted after connecting", async () => {
+    const controller = new AbortController();
+    const connection = await client.tunnel.connect({ routes: { api: echo.target }, signal: controller.signal });
+    controller.abort();
+    await connection.closed;
+    expect(connection.status().state).toBe("stopped");
+  });
+});
+
+describe("route conflicts", () => {
+  test("retry by default and report each conflict", async () => {
+    relay.attachError = "route_conflict";
+    const events: OpenTunnelClientEvent[] = [];
+    const connecting = client.tunnel.connect({
+      routes: { web: echo.target, api: echo.target },
+      onEvent: (event) => events.push(event),
+    });
+    await waitFor(() => events.filter((event) => event.type === "route-conflict").length >= 2);
+    expect(events.find((event) => event.type === "route-conflict")).toEqual({
+      type: "route-conflict",
+      routes: ["api", "web"],
+    });
+    relay.attachError = undefined;
+    const connection = await connecting;
+    expect(connection.status().state).toBe("connected");
+    await connection.close();
+  });
+
+  test("fail connect with code route_conflict when asked to", async () => {
+    relay.attachError = "route_conflict";
+    const events: OpenTunnelClientEvent[] = [];
+    const error = await client.tunnel
+      .connect({ routes: { api: echo.target }, onRouteConflict: "fail", onEvent: (event) => events.push(event) })
+      .catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(OpenTunnelClientError);
+    expect(error).toMatchObject({ code: "route_conflict" });
+    expect((error as Error).message).toContain("route_conflict");
+    expect(relay.sockets.opened).toBe(1);
+    expect(events.map((event) => event.type)).toEqual(["connecting", "route-conflict", "stopped"]);
+  });
+
+  test("stop the tunnel on a later conflict when asked to fail", async () => {
+    const connection = await client.tunnel.connect({ routes: { api: echo.target }, onRouteConflict: "fail" });
+    await relay.next();
+    relay.attachError = "route_conflict";
+    await connection.setRoutes({ api: echo.target, web: echo.target });
+    await expect(connection.closed).rejects.toMatchObject({ code: "route_conflict" });
+  });
+
+  test("other fatal attach errors carry their code", async () => {
+    relay.attachError = "bad_token";
+    await expect(client.tunnel.connect({ routes: { api: echo.target } })).rejects.toMatchObject({
+      code: "bad_token",
+    });
+  });
+});
+
+describe("urls", () => {
+  test("map each route to its public URL and follow setRoutes", async () => {
+    const connection = await client.tunnel.connect({ routes: { api: echo.target, "@": echo.target } });
+    expect(connection.urls).toEqual({ api: `https://api.${HOSTNAME}`, "@": `https://${HOSTNAME}` });
+    await connection.setRoutes({ web: echo.target });
+    expect(connection.urls).toEqual({ web: `https://web.${HOSTNAME}` });
+    await connection.close();
+  });
+
+  test("publicUrl builds the same URLs", () => {
+    expect(publicUrl("api", HOSTNAME)).toBe(`https://api.${HOSTNAME}`);
+    expect(publicUrl(ROOT_ROUTE, HOSTNAME)).toBe(`https://${HOSTNAME}`);
+  });
+});
+
+describe("route name validation", () => {
+  test("is exported and matches the shared vectors", async () => {
+    const vectors = await Bun.file(new URL("../../../spec/vectors/names.json", import.meta.url)).json();
+    for (const { value, valid } of vectors.route as Array<{ value: string; valid: boolean }>) {
+      expect([value, isValidRouteName(value)]).toEqual([value, valid]);
+      if (value !== ROOT_ROUTE) expect([value, ROUTE_LABEL_PATTERN.test(value)]).toEqual([value, valid]);
+    }
+  });
+
+  test("is the rule connect enforces", async () => {
+    expect(isValidRouteName("Api")).toBe(false);
+    await expect(client.tunnel.connect({ routes: { Api: echo.target } })).rejects.toThrow("Invalid route name 'Api'");
+  });
+});
+
+describe("ensure progress", () => {
+  test("reports checking then ready for a tunnel with a current certificate", async () => {
+    const stages: string[] = [];
+    await client.tunnel.ensure({ onProgress: (stage) => stages.push(stage) });
+    expect(stages).toEqual(["checking-certificate", "ready"]);
+  });
+
+  test("reports saving a certificate the server renewed", async () => {
+    relay.served = { certificate: await renewedCertificate(identity.privateKey), chain: "" };
+    const stages: string[] = [];
+    await client.tunnel.ensure({ onProgress: (stage) => stages.push(stage) });
+    expect(stages).toEqual(["checking-certificate", "saving-identity", "ready"]);
+  });
+
+  test("reports issuing a new certificate after a failed one", async () => {
+    relay.states.push({ type: "failed", reason: "test" });
+    const stages: string[] = [];
+    const ensured = await client.tunnel.ensure({ onProgress: (stage) => stages.push(stage) });
+    expect(stages).toEqual([
+      "checking-certificate",
+      "generating-key",
+      "generating-csr",
+      "requesting-certificate",
+      "waiting-certificate",
+      "saving-identity",
+      "ready",
+    ]);
+    expect(relay.certificateRequests).toEqual(["GET", "POST", "GET"]);
+    expect(ensured.privateKey).not.toBe(identity.privateKey);
+  });
+});
+
+describe("effect connect", () => {
+  test("interrupting it while it attaches stops the tunnel before the scope closes", async () => {
+    relay.silent = true;
+    const storage = EffectStorage.memory();
+    await Effect.runPromise(storage.save("default", identity));
+    const runtime = ManagedRuntime.make(OpenTunnelClient.layer({ api: relay.url, storage }));
+    try {
+      const scope = await runtime.runPromise(Scope.make());
+      const fiber = runtime.runFork(
+        Effect.flatMap(OpenTunnelClient, (client) => client.tunnel.connect({ routes: { api: echo.target } })).pipe(
+          Effect.provideService(Scope.Scope, scope),
+        ),
+      );
+      await waitFor(() => relay.sockets.opened === 1);
+      await runtime.runPromise(Fiber.interrupt(fiber));
+      await waitFor(() => relay.sockets.closed === 1);
+      await runtime.runPromise(Scope.close(scope, Exit.void));
+    } finally {
+      await runtime.dispose();
+    }
   });
 });

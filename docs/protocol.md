@@ -236,7 +236,9 @@ its own bridge with the same token and attaches with the routes it handles.
 - A route belongs to one bridge at a time. A bridge that claims a route
   already held by another is rejected with `route_conflict` and retries with
   backoff, so it takes over once the other bridge goes away (for example when
-  an app restarts).
+  an app restarts). `attach_error` does not say which route is held. A client
+  may let its user stop on the first conflict instead (the SDK's
+  `onRouteConflict: "fail"`).
 - The server treats a bridge it has not heard from for `idle_timeout_ms` plus
   `heartbeat_ms` as gone, even if its socket never closed: it stops routing
   connections to it, resets the connections it had, closes it with `1001`, and

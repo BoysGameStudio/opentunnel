@@ -56,6 +56,14 @@ describe("spec vectors", async () => {
     for (const { value, valid } of names.target) {
       expect([value, Names.parseTarget(value) !== undefined]).toEqual([value, valid]);
     }
+    for (const { value, valid } of names.route) {
+      if (value !== Names.ROOT_ROUTE) expect([value, Names.LABEL_PATTERN.test(value)]).toEqual([value, valid]);
+    }
+  });
+
+  test("public hostnames", () => {
+    expect(Names.publicHostname("api", "abc.opentunnel.xyz")).toBe("api.abc.opentunnel.xyz");
+    expect(Names.publicHostname("@", "abc.opentunnel.xyz")).toBe("abc.opentunnel.xyz");
   });
 
   test("PROXY protocol peers", () => {

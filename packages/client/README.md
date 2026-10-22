@@ -19,14 +19,25 @@ const client = create()
 const connection = await client.tunnel.connect({
   routes: { api: "127.0.0.1:3000" },
 })
-console.log(`https://api.${connection.tunnel.hostname}`)
+console.log(connection.urls.api) // https://api.<hostname>
 
 for await (const event of connection.events) console.log(event)
 ```
 
 `connect` creates the profile's tunnel if it has none, resolves once the bridge
 first attaches, and reconnects with backoff until you call `close()`. It
-rejects on fatal errors such as an invalid token.
+rejects on fatal errors such as an invalid token, with an
+`OpenTunnelClientError` whose `code` is the bridge's error code (`bad_token`,
+`cert_not_ready`, `route_conflict`).
+
+Pass `signal` to cancel: aborting it while `connect` is still creating the
+tunnel, waiting for its certificate, or attaching stops that work and rejects
+with the signal's reason (an already aborted signal rejects at once). Aborting
+after `connect` resolved closes the connection. In the Effect interface,
+interrupting `connect` does the same.
+
+`events` is only available once `connect` resolves; pass `onEvent` to see
+every event as it happens, including those while it is still attaching.
 
 The Effect interface exposes the same capabilities, with scoped connections and
 events as a `Stream`:
@@ -46,6 +57,34 @@ await connection.setRoutes({ api: "127.0.0.1:4000", "@": "127.0.0.1:8080" })
 
 Changing only targets applies to new connections immediately. Adding or
 removing names re-attaches the bridge.
+
+`connection.urls` maps each current route to its public URL
+(`https://api.<hostname>`, and `https://<hostname>` for `@`) and follows
+`setRoutes`. `publicUrl(route, hostname)` builds one without a connection.
+
+Route names are checked with `isValidRouteName(name)`, the rule `connect` and
+`setRoutes` apply: `ROOT_ROUTE` (`@`) or one lowercase DNS label
+(`ROUTE_LABEL_PATTERN`). Validate names up front with it rather than copying
+the pattern.
+
+### Route conflicts
+
+A route belongs to one bridge at a time, so a route another client (the CLI,
+or another process) already serves is refused with `route_conflict`. By
+default `connect` keeps retrying with backoff and takes the route over once the
+other client goes away. Each refusal emits a `route-conflict` event with the
+routes the attach claimed (the server does not say which one is taken):
+
+```ts
+const connection = await client.tunnel.connect({
+  routes: { api: "127.0.0.1:3000" },
+  onRouteConflict: "fail",
+})
+```
+
+With `onRouteConflict: "fail"`, the first conflict stops the tunnel instead:
+`connect` rejects with `code === "route_conflict"`, or, if the conflict happens
+on a later re-attach, `closed` does.
 
 A route can also be an object with options:
 
@@ -80,9 +119,15 @@ interface Client {
     pending(options?): Promise<{ id: string; hostname: string } | undefined>
     create(options?: { profile?: string; onProgress?(stage): void }): Promise<Identity>
     resume(options?): Promise<Identity | undefined>
-    ensure(options?: { profile?: string }): Promise<Identity>
+    ensure(options?: { profile?: string; onProgress?(stage): void }): Promise<Identity>
     remove(options?: { profile?: string }): Promise<void>
-    connect(options: { profile?: string; routes: Routes; signal?: AbortSignal }): Promise<Connection>
+    connect(options: {
+      profile?: string
+      routes: Routes
+      signal?: AbortSignal
+      onRouteConflict?: "retry" | "fail"
+      onEvent?(event: ClientEvent): void
+    }): Promise<Connection>
   }
   dispose(): Promise<void>
 }
@@ -90,6 +135,7 @@ interface Client {
 interface Connection {
   tunnel: Identity
   events: AsyncIterable<ClientEvent>
+  urls: Record<string, string>
   status(): Status
   setRoutes(routes: Routes): Promise<void>
   closed: Promise<void>
@@ -98,7 +144,14 @@ interface Connection {
 ```
 
 Events are `connecting`, `connected`, `disconnected`, `reconnecting`,
-`connection-opened`, `connection-closed`, and `stopped`.
+`route-conflict`, `connection-opened`, `connection-closed`,
+`certificate-renewed`, and `stopped`.
+
+`onProgress` stages are `creating-tunnel`, `generating-key`, `generating-csr`,
+`resuming-certificate`, `requesting-certificate`, `waiting-certificate`,
+`saving-identity`, and `ready`. `ensure` reports `checking-certificate` first
+when the profile already has a tunnel, then `ready` if its certificate is
+current; only a tunnel that needs a certificate reports the stages in between.
 
 ## Storage
 

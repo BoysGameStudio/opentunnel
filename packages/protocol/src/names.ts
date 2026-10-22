@@ -3,9 +3,17 @@ export * as Names from "./names.js";
 /** The route name for the tunnel hostname itself. */
 export const ROOT_ROUTE = "@";
 
-const label = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+/** A route name other than `@`, and a profile name: one lowercase DNS label. */
+export const LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
+const label = LABEL_PATTERN;
+
+/** Whether `value` is a route name: `@` or one lowercase DNS label. */
 export const isValidRoute = (value: string): boolean => value === ROOT_ROUTE || label.test(value);
+
+/** The public hostname of a route: `<route>.<hostname>`, or `<hostname>` for `@`. */
+export const publicHostname = (route: string, hostname: string): string =>
+  route === ROOT_ROUTE ? hostname : `${route}.${hostname}`;
 
 export const isValidProfile = (value: string): boolean => label.test(value);
 

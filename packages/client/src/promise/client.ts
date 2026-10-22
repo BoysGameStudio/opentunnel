@@ -9,10 +9,12 @@ import type {
   OpenTunnelIdentity,
   OpenTunnelPendingIdentity,
   OpenTunnelProfileOptions,
+  OpenTunnelProgressOptions,
   OpenTunnelProvisionStage,
   OpenTunnelRoutes,
   OpenTunnelStatus,
   OpenTunnelStoredTunnel,
+  OpenTunnelUrls,
 } from "../effect/types.js";
 import { toEffectStorage, type OpenTunnelStorage } from "./storage.js";
 
@@ -25,6 +27,11 @@ export interface OpenTunnelConnection {
   readonly tunnel: OpenTunnelIdentity;
   readonly events: AsyncIterable<OpenTunnelClientEvent>;
   readonly status: () => OpenTunnelStatus;
+  /**
+   * The public URL of each current route, such as
+   * `{ api: "https://api.<hostname>", "@": "https://<hostname>" }`. Follows `setRoutes`.
+   */
+  readonly urls: OpenTunnelUrls;
   /**
    * Replaces the routes. Changing only targets applies immediately; adding or
    * removing names re-attaches the bridge.
@@ -56,12 +63,15 @@ export interface OpenTunnelPromiseClient {
       },
     ) => Promise<OpenTunnelIdentity>;
     readonly ensure: (
-      options?: OpenTunnelProfileOptions,
+      options?: OpenTunnelProfileOptions & OpenTunnelProgressOptions,
     ) => Promise<OpenTunnelIdentity>;
     readonly remove: (options?: OpenTunnelProfileOptions) => Promise<void>;
     /**
      * Starts forwarding routes for the profile's tunnel, creating it if
      * needed. Resolves once the bridge first attaches; reconnects until closed.
+     * Aborting `signal` while it attaches rejects with the signal's reason and
+     * stops the attach and any certificate work; aborting later closes the
+     * connection.
      */
     readonly connect: (
       options: OpenTunnelConnectOptions & { readonly signal?: AbortSignal },
@@ -91,6 +101,8 @@ export function create(options: OpenTunnelClientOptions = {}): OpenTunnelPromise
       ensure: (input) => withClient((client) => client.tunnel.ensure(input)),
       remove: (input) => withClient((client) => client.tunnel.remove(input)),
       connect: async (input) => {
+        const signal = input.signal;
+        signal?.throwIfAborted();
         const scope = await runtime.runPromise(Scope.make());
         const closeScope = () => runtime.runPromise(Scope.close(scope, Exit.void));
         const connection = await runtime
@@ -98,17 +110,26 @@ export function create(options: OpenTunnelClientOptions = {}): OpenTunnelPromise
             Effect.flatMap(OpenTunnelClient, (client) => client.tunnel.connect(input)).pipe(
               Effect.provideService(Scope.Scope, scope),
             ),
+            signal ? { signal } : undefined,
           )
           .catch(async (error) => {
             await closeScope();
+            if (signal?.aborted) throw signal.reason;
             throw error;
           });
         const close = () => runtime.runPromise(connection.close).finally(closeScope);
-        input.signal?.addEventListener("abort", () => void close(), { once: true });
+        if (signal?.aborted) {
+          await close();
+          throw signal.reason;
+        }
+        signal?.addEventListener("abort", () => void close(), { once: true });
         return {
           tunnel: connection.tunnel,
           events: Stream.toAsyncIterable(connection.events),
           status: () => runtime.runSync(connection.status),
+          get urls() {
+            return runtime.runSync(connection.urls);
+          },
           setRoutes: (routes) => runtime.runPromise(connection.setRoutes(routes)),
           closed: runtime.runPromise(connection.closed).finally(closeScope),
           close,

@@ -15,9 +15,10 @@ import type {
   OpenTunnelIdentity,
   OpenTunnelPendingIdentity,
   OpenTunnelProfileOptions,
+  OpenTunnelProgressOptions,
   OpenTunnelProvisionStage,
 } from "./types.js";
-import { Tunnel as RunningTunnel, validateRoutes } from "./tunnel.js";
+import { OpenTunnelAttachError, Tunnel as RunningTunnel, validateRoutes } from "./tunnel.js";
 
 const profileName = (options?: OpenTunnelProfileOptions) => options?.profile ?? "default";
 /** What went wrong with an API call: the HTTP status (and what Cloudflare means by it), the API's error, or the network failure. */
@@ -38,6 +39,16 @@ export const describeApiError = (cause: unknown): string | undefined => {
 const clientError = (message: string, cause: unknown) => {
   const detail = describeApiError(cause);
   return new OpenTunnelClientError({ message: detail ? `${message}: ${detail}` : message, cause });
+};
+
+/** A failure of the running tunnel, carrying the bridge's attach error code when there is one. */
+const tunnelError = (message: string, cause: unknown) => {
+  const detail = describeApiError(cause);
+  return new OpenTunnelClientError({
+    message: detail ? `${message}: ${detail}` : message,
+    ...(cause instanceof OpenTunnelAttachError ? { code: cause.code } : {}),
+    cause,
+  });
 };
 
 /** A failure that may pass on its own: the API unreachable, rate limited, or failing on the server side. */
@@ -198,10 +209,12 @@ export class OpenTunnelClient extends Context.Service<
         });
 
         const ensure = Effect.fn("OpenTunnelClient.tunnel.ensure")(function* (
-          input?: OpenTunnelProfileOptions,
+          input?: OpenTunnelProfileOptions & OpenTunnelProgressOptions,
         ) {
           const existing = yield* get(input);
           if (!existing) return yield* create(input);
+          const progress = (stage: OpenTunnelProvisionStage) => Effect.sync(() => input?.onProgress?.(stage));
+          yield* progress("checking-certificate");
           const authorized = yield* api.authorized(Tunnel.Token.make(existing.token));
           const certificate = yield* authorized.tunnel["tunnel.getCertificate"]({
             params: { id: Tunnel.ID.make(existing.id) },
@@ -214,7 +227,10 @@ export class OpenTunnelClient extends Context.Service<
             ),
             Effect.mapError((cause) => clientError("Failed to read certificate", cause)),
           );
-          if (!certificate) return existing;
+          if (!certificate) {
+            yield* progress("ready");
+            return existing;
+          }
           const state = certificate.state;
           // The server renewed the certificate while this machine was offline.
           if (state.type === "ready" && state.certificate !== existing.certificate) {
@@ -224,15 +240,21 @@ export class OpenTunnelClient extends Context.Service<
               chain: state.chain,
               certificateExpiry: new Date(state.expiry),
             };
+            yield* progress("saving-identity");
             yield* storage.save(profileName(input), renewed);
+            yield* progress("ready");
             return renewed;
           }
-          if (state.type !== "failed") return existing;
+          if (state.type !== "failed") {
+            yield* progress("ready");
+            return existing;
+          }
           return yield* provision({
             profile: profileName(input),
             id: Tunnel.ID.make(existing.id),
             hostname: existing.hostname,
             token: Tunnel.Token.make(existing.token),
+            onProgress: input?.onProgress,
           });
         });
 
@@ -281,7 +303,7 @@ export class OpenTunnelClient extends Context.Service<
                 try: () => validateRoutes(input.routes),
                 catch: (cause) => clientError(cause instanceof Error ? cause.message : "Invalid routes", cause),
               });
-              const identity = yield* ensure(input);
+              const identity = yield* ensure({ profile: input.profile });
               const events = yield* Queue.unbounded<OpenTunnelClientEvent, Cause.Done>();
               const tunnel = yield* Effect.acquireRelease(
                 Effect.sync(() =>
@@ -289,7 +311,9 @@ export class OpenTunnelClient extends Context.Service<
                     api: apiUrl,
                     identity,
                     routes: input.routes,
+                    onRouteConflict: input.onRouteConflict,
                     onEvent: (event) => {
+                      input.onEvent?.(event);
                       Queue.offerUnsafe(events, event);
                       if (event.type === "stopped") Queue.endUnsafe(events);
                     },
@@ -303,12 +327,16 @@ export class OpenTunnelClient extends Context.Service<
               );
               yield* Effect.tryPromise({
                 try: () => tunnel.ready,
-                catch: (cause) => clientError("Failed to connect tunnel", cause),
-              });
+                catch: (cause) => tunnelError("Failed to connect tunnel", cause),
+              }).pipe(
+                // Stop attaching now rather than when the caller's scope closes.
+                Effect.onInterrupt(() => Effect.promise(() => tunnel.close())),
+              );
               return {
                 tunnel: identity,
                 events: Stream.fromQueue(events),
                 status: Effect.sync(() => tunnel.getStatus()),
+                urls: Effect.sync(() => tunnel.getUrls()),
                 setRoutes: (routes) =>
                   Effect.try({
                     try: () => tunnel.setRoutes(routes),
@@ -317,7 +345,7 @@ export class OpenTunnelClient extends Context.Service<
                   }),
                 closed: Effect.tryPromise({
                   try: () => tunnel.closed,
-                  catch: (cause) => clientError("Tunnel stopped", cause),
+                  catch: (cause) => tunnelError("Tunnel stopped", cause),
                 }),
                 close: Effect.promise(() => tunnel.close()),
               } satisfies OpenTunnelConnection;

@@ -137,8 +137,18 @@ export interface FakeRelay {
   readonly url: URL;
   readonly next: () => Promise<RelaySession>;
   attachError: string | undefined;
+  /** Accept the WebSocket but never answer `attach`. */
+  silent: boolean;
+  /** Never answer certificate requests. */
+  hangCertificate: boolean;
+  /** Certificate states the API reports first, one per GET, before the ready certificate. */
+  readonly states: Array<Record<string, unknown>>;
   /** The certificate the API reports; defaults to the identity's. */
   served: { certificate: string; chain: string } | undefined;
+  /** Bridge WebSockets opened and closed so far. */
+  readonly sockets: { opened: number; closed: number };
+  /** Requests to the certificate endpoint, as `METHOD`. */
+  readonly certificateRequests: string[];
   readonly stop: () => void;
 }
 
@@ -149,7 +159,12 @@ export function fakeRelay(identity: { certificate: string; chain: string }): Fak
   const relay: FakeRelay = {
     url: new URL("http://127.0.0.1"),
     attachError: undefined,
+    silent: false,
+    hangCertificate: false,
+    states: [],
     served: undefined,
+    sockets: { opened: 0, closed: 0 },
+    certificateRequests: [],
     next: () => {
       const session = sessions.shift();
       if (session) return Promise.resolve(session);
@@ -163,6 +178,11 @@ export function fakeRelay(identity: { certificate: string; chain: string }): Fak
     fetch(request, server) {
       const url = new URL(request.url);
       if (url.pathname === "/api/tunnel/demo/certificate") {
+        relay.certificateRequests.push(request.method);
+        if (relay.hangCertificate) return new Promise<Response>(() => undefined);
+        if (request.method === "POST") return Response.json({ id: "cert", state: { type: "issuing" } }, { status: 202 });
+        const state = relay.states.shift();
+        if (state) return Response.json({ id: "cert", state });
         return Response.json({
           id: "cert",
           state: {
@@ -183,8 +203,15 @@ export function fakeRelay(identity: { certificate: string; chain: string }): Fak
       return new Response("not found", { status: 404 });
     },
     websocket: {
+      open() {
+        relay.sockets.opened++;
+      },
+      close() {
+        relay.sockets.closed++;
+      },
       message(socket, message) {
         if (socket.data.session) return socket.data.session.onMessage(message);
+        if (relay.silent) return;
         const attach = JSON.parse(String(message)) as { token: string; routes: string[] };
         if (attach.token !== TOKEN || relay.attachError) {
           socket.send(JSON.stringify({ type: "attach_error", code: relay.attachError ?? "bad_token" }));
