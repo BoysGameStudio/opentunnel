@@ -1132,6 +1132,7 @@ dependencies = [
  "futures-util",
  "hex",
  "humantime",
+ "hyper-util",
  "rand",
  "rcgen",
  "reqwest",
