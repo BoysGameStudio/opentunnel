@@ -26,7 +26,7 @@
 - Never terminate tenant TLS in the server: only the API domain is terminated there, everything else is routed by SNI and passed through.
 - Storage (`crates/opentunnel-server/src/store.rs`) must stay Vitess-compatible: every table has a primary key, no foreign keys, triggers or stored procedures, schema changes are idempotent `CREATE TABLE IF NOT EXISTS` migrations behind `SCHEMA_VERSION`, and nothing assumes a single writer (revisions on tunnel rows, conditional updates for alarms, leases on jobs).
 - Server tests need MySQL 8: set `TEST_DATABASE_URL` (see `docs/server.md`); without it they skip.
-- DNS stays on Cloudflare; DNS-01 challenges go through the provider in `crates/opentunnel-server/src/dns.rs`.
+- DNS stays at the configured authoritative provider; DNS-01 challenges go through `crates/opentunnel-server/src/dns.rs` (Cloudflare, Tencent Cloud DNSPod, or the local challenge test server).
 - `packages/website` is built with plain Vite (`bun run ready`, output `dist/website`) and served by the server.
 - The server replaced a Cloudflare Worker (October 2026); nothing of the Worker remains but the export file format (`migration.rs`, for backups and restores, with strict import checks) and the recorded HTTP contract.
 - Deploys are blue-green, so a new version briefly runs next to the previous one on the mesh and the database: changes to the mesh, forward and internal API handshakes must interoperate with the version in production, and schema changes must not break it (it refuses a newer `SCHEMA_VERSION` at startup, so add or drop tables it does not depend on without a version bump).

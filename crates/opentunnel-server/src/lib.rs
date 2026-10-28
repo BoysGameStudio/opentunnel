@@ -12,6 +12,7 @@ pub mod config;
 pub mod crypto;
 pub mod csr;
 pub mod dns;
+mod dnspod;
 pub mod http;
 pub mod issuer;
 pub mod jobs;

@@ -136,6 +136,24 @@ impl Server {
                             zone_id: config.cloudflare_zone_id.clone(),
                             token,
                         }),
+                    DnsKind::Dnspod => Some(DnsProvider::DnsPod(crate::dnspod::DnsPod::new(
+                        http.clone(),
+                        &config.dnspod_api_url,
+                        config
+                            .dnspod_domain
+                            .as_deref()
+                            .context("DNSPOD_DOMAIN is required with DNS_PROVIDER=dnspod")?,
+                        config
+                            .dnspod_secret_id
+                            .clone()
+                            .filter(|value| !value.is_empty())
+                            .context("DNSPOD_SECRET_ID is required with DNS_PROVIDER=dnspod")?,
+                        config
+                            .dnspod_secret_key
+                            .clone()
+                            .filter(|value| !value.is_empty())
+                            .context("DNSPOD_SECRET_KEY is required with DNS_PROVIDER=dnspod")?,
+                    )?)),
                     DnsKind::Challtestsrv => Some(DnsProvider::ChallTestSrv {
                         http: http.clone(),
                         url: config.challtestsrv_url.trim_end_matches('/').to_owned(),

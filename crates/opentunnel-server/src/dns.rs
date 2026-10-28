@@ -1,5 +1,4 @@
-//! DNS-01 challenge records. DNS for the domain stays on Cloudflare; the provider is an enum so another can be
-//! added without touching issuance.
+//! DNS-01 challenge records. The zone remains at its authoritative provider; only scoped TXT records change.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -11,6 +10,8 @@ use tracing::warn;
 
 #[derive(Clone)]
 pub enum DnsProvider {
+    /// Tencent Cloud DNSPod, scoped to the configured zone and ACME challenge names.
+    DnsPod(crate::dnspod::DnsPod),
     /// The Cloudflare DNS API, with a token that can edit the zone.
     Cloudflare {
         http: reqwest::Client,
@@ -91,6 +92,11 @@ impl DnsProvider {
     /// like a created one.
     pub async fn create_txt(&self, name: &str, value: &str) -> Result<TxtRecord> {
         match self {
+            Self::DnsPod(provider) => {
+                let record = provider.create_txt(name, value).await?;
+                crate::metrics::dns_record("created");
+                Ok(record)
+            }
             Self::Cloudflare {
                 http,
                 api,
@@ -206,6 +212,7 @@ impl DnsProvider {
     /// is gone.
     pub async fn delete_txt(&self, record: &TxtRecord) -> bool {
         let deleted = match self {
+            Self::DnsPod(provider) => provider.delete_txt(record).await,
             Self::Cloudflare { .. } => {
                 let id = match &record.id {
                     Some(id) => Some(id.clone()),
@@ -405,6 +412,19 @@ pub async fn wait_for_propagation(
     records: &[TxtRecord],
     timeout: Duration,
 ) {
+    const RESOLVERS: &[&str] = &[
+        "https://cloudflare-dns.com/dns-query",
+        "https://dns.google/resolve",
+    ];
+    wait_for_propagation_with(http, records, timeout, RESOLVERS).await;
+}
+
+async fn wait_for_propagation_with(
+    http: &reqwest::Client,
+    records: &[TxtRecord],
+    timeout: Duration,
+    resolvers: &[&str],
+) {
     if timeout.is_zero() || records.is_empty() {
         return;
     }
@@ -412,7 +432,7 @@ pub async fn wait_for_propagation(
     loop {
         let mut visible = true;
         for record in records {
-            if !resolvers_see(http, record).await {
+            if !resolvers_see(http, record, resolvers).await {
                 visible = false;
                 break;
             }
@@ -420,19 +440,17 @@ pub async fn wait_for_propagation(
         if visible {
             return;
         }
-        if tokio::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             warn!("DNS challenge records were not visible before the propagation timeout");
             return;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(remaining.min(Duration::from_millis(500))).await;
     }
 }
 
-async fn resolvers_see(http: &reqwest::Client, record: &TxtRecord) -> bool {
-    for resolver in [
-        "https://cloudflare-dns.com/dns-query",
-        "https://dns.google/resolve",
-    ] {
+async fn resolvers_see(http: &reqwest::Client, record: &TxtRecord, resolvers: &[&str]) -> bool {
+    for resolver in resolvers {
         let Ok(mut url) = url::Url::parse(resolver) else {
             continue;
         };
@@ -462,4 +480,69 @@ async fn resolvers_see(http: &reqwest::Client, record: &TxtRecord) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod propagation_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    async fn resolver(body: &'static str) -> String {
+        crate::install_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/dns-json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        url
+    }
+
+    fn record() -> TxtRecord {
+        TxtRecord {
+            name: "_acme-challenge.demo.example.test".into(),
+            value: "wanted".into(),
+            id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn propagation_accepts_the_matching_txt_among_other_values() {
+        let resolver = resolver(
+            r#"{"Status":0,"Answer":[{"type":16,"data":"other"},{"type":16,"data":"wanted"}]}"#,
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        wait_for_propagation_with(
+            &reqwest::Client::new(),
+            &[record()],
+            Duration::from_secs(1),
+            &[&resolver],
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn propagation_timeout_returns_without_retrying_forever() {
+        let resolver = resolver(r#"{"Status":0,"Answer":[{"type":16,"data":"other"}]}"#).await;
+        let started = tokio::time::Instant::now();
+        wait_for_propagation_with(
+            &reqwest::Client::new(),
+            &[record()],
+            Duration::from_millis(10),
+            &[&resolver],
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
 }

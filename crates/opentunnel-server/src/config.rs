@@ -71,7 +71,7 @@ pub struct Config {
     )]
     pub acme_url: String,
 
-    #[arg(long, env = "ACME_EMAIL", default_value = "acme@opentunnel.xyz")]
+    #[arg(long, env = "ACME_EMAIL", default_value = "")]
     pub acme_email: String,
 
     #[arg(long, env = "ACME_EAB_KID", hide_env_values = true)]
@@ -101,11 +101,7 @@ pub struct Config {
     #[arg(long, env = "DNS_PROVIDER", value_enum, default_value = "cloudflare")]
     pub dns_provider: DnsKind,
 
-    #[arg(
-        long,
-        env = "CLOUDFLARE_ZONE_ID",
-        default_value = "43d8e5cf1c0ccc8c3868125be74a5e68"
-    )]
+    #[arg(long, env = "CLOUDFLARE_ZONE_ID", default_value = "")]
     pub cloudflare_zone_id: String,
 
     /// DNS edit on the zone, only for DNS-01 challenges.
@@ -118,6 +114,24 @@ pub struct Config {
         default_value = "https://api.cloudflare.com/client/v4"
     )]
     pub cloudflare_api_url: String,
+
+    /// Tencent Cloud DNSPod credentials, scoped to DNS-01 records on DNSPOD_DOMAIN.
+    #[arg(long, env = "DNSPOD_SECRET_ID", hide_env_values = true)]
+    pub dnspod_secret_id: Option<String>,
+
+    #[arg(long, env = "DNSPOD_SECRET_KEY", hide_env_values = true)]
+    pub dnspod_secret_key: Option<String>,
+
+    /// The registered DNSPod zone (not the international dnspod.com service).
+    #[arg(long, env = "DNSPOD_DOMAIN")]
+    pub dnspod_domain: Option<String>,
+
+    #[arg(
+        long,
+        env = "DNSPOD_API_URL",
+        default_value = "https://dnspod.tencentcloudapi.com"
+    )]
+    pub dnspod_api_url: String,
 
     /// pebble-challtestsrv's management API, with `--dns-provider challtestsrv`.
     #[arg(
@@ -281,6 +295,7 @@ pub enum IssuerKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DnsKind {
     Cloudflare,
+    Dnspod,
     Challtestsrv,
 }
 
