@@ -235,6 +235,7 @@ async fn setup(dir: &std::path::Path) -> Option<(TestServer, Identity)> {
     let server = TestServer::start(dir, &[]).await?;
     let client = Client::new(ClientOptions {
         api: Some(server.api.parse().unwrap()),
+        owner_token: Some(common::OWNER_TOKEN.into()),
         storage: Some(Storage::at(dir.join("client"))),
         ..Default::default()
     });
@@ -587,6 +588,7 @@ async fn real_client_survives_a_stalled_uploading_visitor() {
     };
     let client = Client::new(ClientOptions {
         api: Some(server.api.parse().unwrap()),
+        owner_token: Some(common::OWNER_TOKEN.into()),
         storage: Some(Storage::at(dir.path().join("client"))),
         ..Default::default()
     });

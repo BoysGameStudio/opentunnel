@@ -20,6 +20,8 @@ import { toEffectStorage, type OpenTunnelStorage } from "./storage.js";
 
 export interface OpenTunnelClientOptions {
   readonly api?: URL | string;
+  /** Independent owner credential sent only to the create-tunnel control-plane request. */
+  readonly ownerToken?: string;
   readonly store?: OpenTunnelStorage;
   /**
    * An `http://` or `https://` proxy URL (credentials as userinfo) for the API
@@ -90,6 +92,7 @@ export interface OpenTunnelPromiseClient {
 export function create(options: OpenTunnelClientOptions = {}): OpenTunnelPromiseClient {
   const effectOptions: EffectClientOptions = {
     api: options.api,
+    ...(options.ownerToken === undefined ? {} : { ownerToken: options.ownerToken }),
     ...(options.proxy === undefined ? {} : { proxy: options.proxy }),
     ...(options.store ? { storage: toEffectStorage(options.store) } : {}),
   };

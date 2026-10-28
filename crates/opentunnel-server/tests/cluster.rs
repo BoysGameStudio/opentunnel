@@ -47,6 +47,7 @@ async fn machine(dir: &std::path::Path, name: &str, region: &str) -> Option<Test
 fn client(server: &TestServer, storage: &std::path::Path) -> Client {
     Client::new(ClientOptions {
         api: Some(server.api.parse().unwrap()),
+        owner_token: Some(common::OWNER_TOKEN.into()),
         storage: Some(Storage::at(storage)),
         ..Default::default()
     })

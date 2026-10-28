@@ -12,6 +12,7 @@ use opentunnel::{Client, ClientOptions, Identity, Routes, State, Storage};
 fn client(server: &TestServer, storage: &std::path::Path) -> Client {
     Client::new(ClientOptions {
         api: Some(server.api.parse().unwrap()),
+        owner_token: Some(common::OWNER_TOKEN.into()),
         storage: Some(Storage::at(storage)),
         ..Default::default()
     })
@@ -226,6 +227,7 @@ async fn keeps_live_tunnels_working_while_the_database_is_down() {
     let http = reqwest::Client::new();
     let created = http
         .post(format!("{}/api/tunnel", server.api))
+        .bearer_auth(common::OWNER_TOKEN)
         .json(&serde_json::json!({}))
         .send()
         .await
@@ -238,6 +240,7 @@ async fn keeps_live_tunnels_working_while_the_database_is_down() {
     proxy.restore();
     eventually("the database to come back", || async {
         http.post(format!("{}/api/tunnel", server.api))
+            .bearer_auth(common::OWNER_TOKEN)
             .json(&serde_json::json!({}))
             .send()
             .await

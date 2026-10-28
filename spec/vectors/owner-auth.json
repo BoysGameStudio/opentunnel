@@ -1,0 +1,11 @@
+{
+  "description": "The independent owner bearer is required only for tunnel creation; tunnel bearer, bridge, and visitor requests never inherit it.",
+  "requests": [
+    { "method": "POST", "path": "/api/tunnel", "ownerAuthorization": true },
+    { "method": "GET", "path": "/api/tunnel/:id", "ownerAuthorization": false },
+    { "method": "POST", "path": "/api/tunnel/:id/certificate", "ownerAuthorization": false },
+    { "method": "GET", "path": "/api/tunnel/:id/certificate", "ownerAuthorization": false },
+    { "method": "DELETE", "path": "/api/tunnel/:id", "ownerAuthorization": false },
+    { "method": "GET", "path": "/api/tunnel/:id/connect", "ownerAuthorization": false }
+  ]
+}

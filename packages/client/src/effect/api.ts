@@ -79,7 +79,12 @@ export class OpenTunnelApiClient extends Context.Service<OpenTunnelApiClient, Op
   "@opentunnel/client/OpenTunnelApiClient",
 ) {
   /** `fetch` replaces the runtime's for API calls, as a proxy needs on some runtimes. */
-  static layer(options: { readonly api: URL | string; readonly fetch?: typeof globalThis.fetch }) {
+  static layer(options: {
+    readonly api: URL | string;
+    readonly fetch?: typeof globalThis.fetch;
+    /** Independent creation credential; never applied to tunnel bearer requests or bridge URLs. */
+    readonly ownerToken?: string;
+  }) {
     return Layer.effect(
       OpenTunnelApiClient,
       Effect.gen(function* () {
@@ -87,9 +92,14 @@ export class OpenTunnelApiClient extends Context.Service<OpenTunnelApiClient, Op
           HttpClient.mapRequest(HttpClientRequest.setHeader("user-agent", USER_AGENT)),
           withRetries,
         );
+        // This generated client is used only for tunnel.create. The authorized client below
+        // carries the per-tunnel bearer instead; no client combines the two credentials.
+        const creationClient = options.ownerToken
+          ? httpClient.pipe(HttpClient.mapRequest(HttpClientRequest.bearerToken(options.ownerToken)))
+          : httpClient;
         const client = yield* HttpApiClient.makeWith(Api, {
           baseUrl: options.api,
-          httpClient,
+          httpClient: creationClient,
         });
         return {
           client,

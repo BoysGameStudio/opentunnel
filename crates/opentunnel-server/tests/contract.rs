@@ -116,7 +116,15 @@ async fn matches_the_worker() {
         let expected = &case["response"];
         let method: reqwest::Method = request["method"].as_str().unwrap().parse().unwrap();
         let path = substitute(request["path"].as_str().unwrap(), &values);
+        let create = method == reqwest::Method::POST
+            && path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .eq(["api", "tunnel"]);
         let mut builder = http.request(method, format!("{}{path}", server.api));
+        if create {
+            builder = builder.bearer_auth(common::OWNER_TOKEN);
+        }
         let headers: HashMap<String, String> =
             serde_json::from_value(request["headers"].clone()).unwrap();
         for (header, value) in headers {

@@ -17,6 +17,7 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
 
 pub const DOMAIN: &str = "opentunnel.test";
+pub const OWNER_TOKEN: &str = "owner-secret";
 
 #[derive(Parser)]
 struct Args {
@@ -49,6 +50,7 @@ pub fn config(dir: &Path, database_url: &str, extra: &[&str]) -> Config {
         "--issuer=local".into(),
         "--http-mode=serve".into(),
         "--admin-token=admin-secret".into(),
+        format!("--owner-token={OWNER_TOKEN}"),
         "--issuance-retry-delay-ms=10".into(),
     ];
     args.extend(extra.iter().map(|arg| (*arg).to_owned()));

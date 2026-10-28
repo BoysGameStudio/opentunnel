@@ -163,6 +163,7 @@ fn fds() -> usize {
 async fn provision(server: &TestServer, dir: &std::path::Path) -> (String, String, String) {
     let client = Client::new(ClientOptions {
         api: Some(server.api.parse().unwrap()),
+        owner_token: Some(common::OWNER_TOKEN.into()),
         storage: Some(Storage::at(dir.join("client"))),
         ..Default::default()
     });

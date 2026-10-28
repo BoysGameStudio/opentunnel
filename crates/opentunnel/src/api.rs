@@ -17,6 +17,7 @@ pub struct Api {
     pub(crate) http: reqwest::Client,
     trust: Trust,
     proxies: Proxies,
+    owner_token: Option<String>,
     /// Divides the retry delays, so tests need not wait for them.
     pub(crate) retry_scale: u64,
 }
@@ -39,6 +40,7 @@ impl Api {
             http,
             trust,
             proxies: Proxies::from_env(),
+            owner_token: None,
             retry_scale: 1,
         }
     }
@@ -55,6 +57,12 @@ impl Api {
 
     pub fn base(&self) -> &Url {
         &self.base
+    }
+
+    /// Sets the independent creation credential. It is never reused as a tunnel bearer or bridge credential.
+    pub fn with_owner_token(mut self, token: Option<String>) -> Self {
+        self.owner_token = token.filter(|token| !token.is_empty());
+        self
     }
 
     fn request(&self, method: Method, path: &str, token: Option<&str>) -> RequestBuilder {
@@ -106,7 +114,7 @@ impl Api {
     pub async fn create(&self) -> Result<CreateTunnelResponse> {
         let response = self
             .send(Repeat::Once, || {
-                self.request(Method::POST, "/api/tunnel", None)
+                self.request(Method::POST, "/api/tunnel", self.owner_token.as_deref())
                     .json(&serde_json::json!({}))
             })
             .await?;
@@ -274,6 +282,62 @@ mod tests {
             Err(Error::Api { status: 404, .. })
         ));
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_credential_is_sent_only_to_creation() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../../../spec/vectors/owner-auth.json")).unwrap();
+        let requests = vector["requests"].as_array().unwrap();
+        assert!(requests.iter().any(|request| {
+            request["path"] == "/api/tunnel" && request["ownerAuthorization"] == true
+        }));
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request["path"] != "/api/tunnel")
+                .all(|request| { request["ownerAuthorization"] == false })
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = requests.clone();
+        let task = tokio::spawn(async move {
+            for body in [
+                r#"{"tunnel":{"id":"abc","hostname":"abc.opentunnel.xyz","state":"offline"},"token":"tunnel-token"}"#,
+                r#"{"id":"abc","hostname":"abc.opentunnel.xyz","state":"offline"}"#,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0u8; 8192];
+                let read = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                capture.lock().unwrap().push(request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let api = Api::new(Url::parse(&url).unwrap()).with_owner_token(Some("owner-secret".into()));
+        api.create().await.unwrap();
+        api.get("tunnel-token", "abc").await.unwrap();
+        task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].starts_with("POST /api/tunnel "));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer owner-secret")
+        );
+        assert!(requests[1].starts_with("GET /api/tunnel/abc "));
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer tunnel-token")
+        );
+        assert!(!requests[1].contains("owner-secret"));
+        assert!(api.connect_url("abc").query().is_none());
     }
 
     #[tokio::test]

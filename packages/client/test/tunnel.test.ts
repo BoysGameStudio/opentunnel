@@ -39,7 +39,7 @@ beforeEach(async () => {
   echo = echoServer();
   store = OpenTunnelStorage.memory();
   await store.save("default", identity);
-  client = create({ api: relay.url, store });
+  client = create({ api: relay.url, store, ownerToken: "owner-secret" });
 });
 
 afterEach(async () => {
@@ -70,6 +70,16 @@ const collect = (events: AsyncIterable<OpenTunnelClientEvent>) => {
 };
 
 describe("tunnel", () => {
+  test("owner token is absent from tunnel API, bridge, and visitor URLs", async () => {
+    const connection = await client.tunnel.connect({ routes: { api: echo.target } });
+    await relay.next();
+    expect(relay.requestAuthorizations.length).toBeGreaterThan(0);
+    expect(relay.requestAuthorizations.every((request) => request.value !== "Bearer owner-secret")).toBe(true);
+    expect(connection.urls.api).not.toContain("owner-secret");
+    expect(publicUrl("api", HOSTNAME)).not.toContain("owner-secret");
+    await connection.close();
+  });
+
   test("forwards TLS to the route target", async () => {
     const connection = await client.tunnel.connect({ routes: { api: echo.target } });
     const session = await relay.next();

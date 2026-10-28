@@ -243,6 +243,7 @@ impl Server {
             service,
             website,
             admin,
+            owner: http::OwnerGate::new(config.owner_token.as_deref()),
             stats,
             shutdown: http::Shutdown::default(),
         });

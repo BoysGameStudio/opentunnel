@@ -80,6 +80,7 @@ async fn malformed_control_messages_close_cleanly() {
     };
     let client = Client::new(ClientOptions {
         api: Some(server.api.parse().unwrap()),
+        owner_token: Some(common::OWNER_TOKEN.into()),
         storage: Some(Storage::at(dir.path().join("client"))),
         ..Default::default()
     });

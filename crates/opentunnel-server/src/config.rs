@@ -158,6 +158,10 @@ pub struct Config {
     #[arg(long, env = "ADMIN_TOKEN", hide_env_values = true)]
     pub admin_token: Option<String>,
 
+    /// Independent bearer secret required only to create tunnels. Creation is denied when unset or empty.
+    #[arg(long, env = "OWNER_TOKEN", hide_env_values = true)]
+    pub owner_token: Option<String>,
+
     /// Running as one of many machines: the internal listener for forwarded visitors and control between
     /// machines, e.g. `[::]:9000` (bound to `FLY_PRIVATE_IP` on Fly, so only the private network reaches it).
     /// `off` (the default) runs a single machine without the mesh.

@@ -68,6 +68,8 @@ const privateKeyPem = (buffer: ArrayBuffer): string => {
 
 export interface OpenTunnelClientOptions {
   readonly api?: URL | string;
+  /** Independent owner credential sent only to the create-tunnel control-plane request. */
+  readonly ownerToken?: string;
   readonly storage?: Storage;
   /**
    * An `http://` or `https://` proxy URL (credentials as userinfo) for the API
@@ -376,6 +378,7 @@ export class OpenTunnelClient extends Context.Service<
       Layer.provide(
         OpenTunnelApiClient.layer({
           api: options.api ?? "https://opentunnel.xyz",
+          ...(options.ownerToken === undefined ? {} : { ownerToken: options.ownerToken }),
           ...(transport.fetch ? { fetch: transport.fetch } : {}),
         }),
       ),

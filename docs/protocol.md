@@ -12,12 +12,20 @@ Base URL: `https://opentunnel.xyz`. Authenticated endpoints use
 
 | Method | Path | Auth | Request | Success |
 | --- | --- | --- | --- | --- |
-| `POST` | `/api/tunnel` | none | `{}` | `201 { "tunnel": TunnelInfo, "token": string }` |
+| `POST` | `/api/tunnel` | owner bearer | `{}` | `201 { "tunnel": TunnelInfo, "token": string }` |
 | `GET` | `/api/tunnel/:id` | bearer | | `200 TunnelInfo` |
 | `POST` | `/api/tunnel/:id/certificate` | bearer | `{ "csr": string }` | `202 CertificateInfo` |
 | `GET` | `/api/tunnel/:id/certificate` | bearer | | `200 CertificateInfo` |
 | `DELETE` | `/api/tunnel/:id` | bearer | | `204` |
 | `GET` | `/api/tunnel/:id/connect` | in-band | WebSocket upgrade | `101` |
+
+The owner bearer is an independent creation credential, not a tunnel token or
+admin token. The server rejects creation with `401 UnauthorizedError` when its
+owner credential is unconfigured, missing from the request, or wrong. Clients
+send it only on `POST /api/tunnel`; tunnel API calls keep using the tunnel token,
+and the WebSocket bridge and public visitor URLs never carry the owner secret.
+This admission change does not alter bridge framing, stored identities, retry
+behavior, or the shared vectors.
 
 ```ts
 type TunnelInfo = {

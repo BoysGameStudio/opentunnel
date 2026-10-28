@@ -21,7 +21,7 @@ use tokio_util::task::TaskTracker;
 use tracing::debug;
 
 use crate::analytics;
-use crate::crypto::{hash_token, slug, token};
+use crate::crypto::{hash_token, slug, token, token_matches};
 use crate::service::{Bind, CertificateLookup, Lookup, Service};
 use crate::website::{Resolved, Website};
 use crate::websocket;
@@ -58,8 +58,30 @@ pub struct App {
     pub service: Service,
     pub website: Website,
     pub admin: Option<Arc<dyn Admin>>,
+    pub owner: OwnerGate,
     pub stats: Arc<Stats>,
     pub shutdown: Shutdown,
+}
+
+/// Independent admission control for tunnel creation. It is deliberately not a tunnel or admin credential.
+#[derive(Clone, Debug, Default)]
+pub struct OwnerGate {
+    token_hash: Option<String>,
+}
+
+impl OwnerGate {
+    pub fn new(token: Option<&str>) -> Self {
+        Self {
+            token_hash: token.filter(|token| !token.is_empty()).map(hash_token),
+        }
+    }
+
+    /// Missing configuration fails closed; the digest comparison is constant time.
+    pub fn authorized(&self, token: &str) -> bool {
+        self.token_hash
+            .as_deref()
+            .is_some_and(|hash| token_matches(token, hash))
+    }
 }
 
 /// Ends HTTP connections without cutting off requests when the server shuts down.
@@ -303,6 +325,20 @@ async fn payload(request: Request<Incoming>) -> Result<Value, Response<Body>> {
     serde_json::from_slice(&body).map_err(|_| response(StatusCode::BAD_REQUEST))
 }
 
+fn api_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(percent_decode)
+        .collect()
+}
+
+fn is_create_request<T: AsRef<str>>(method: &Method, segments: &[T]) -> bool {
+    method == Method::POST
+        && segments.len() == 2
+        && segments[0].as_ref() == "api"
+        && segments[1].as_ref() == "tunnel"
+}
+
 impl App {
     pub async fn handle(self: Arc<Self>, request: Request<Incoming>) -> Response<Body> {
         let path = request.uri().path().to_owned();
@@ -406,16 +442,14 @@ impl App {
             };
         }
         // The Worker's router ignored empty segments, so `/api//tunnel/x/` is `/api/tunnel/x`.
-        let segments: Vec<String> = path
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .map(percent_decode)
-            .collect();
+        let segments = api_segments(&path);
         let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
         let method = request.method().clone();
         let get = method == Method::GET || method == Method::HEAD;
         match segments.as_slice() {
-            ["api", "tunnel"] if method == Method::POST => self.create(request).await,
+            ["api", "tunnel"] if is_create_request(&method, &segments) => {
+                self.create(request).await
+            }
             ["api", "tunnel", id] if get => {
                 let token = bearer(request.headers());
                 match self.service.info(id, &token).await {
@@ -462,6 +496,9 @@ impl App {
     }
 
     async fn create(&self, request: Request<Incoming>) -> Response<Body> {
+        if !self.owner.authorized(&bearer(request.headers())) {
+            return unauthorized();
+        }
         let client = analytics::client(user_agent(request.headers()));
         let source = request.extensions().get::<Source>().copied();
         let address = match (self.service.limits(), source) {
@@ -756,4 +793,67 @@ where
 
 pub fn count(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod owner_gate_tests {
+    use super::*;
+
+    #[test]
+    fn missing_empty_wrong_and_correct_owner_credentials() {
+        assert!(!OwnerGate::new(None).authorized(""));
+        assert!(!OwnerGate::new(Some("")).authorized(""));
+        let gate = OwnerGate::new(Some("owner-secret"));
+        assert!(!gate.authorized(""));
+        assert!(!gate.authorized("wrong"));
+        assert!(!gate.authorized("tunnel-bearer"));
+        assert!(gate.authorized("owner-secret"));
+    }
+
+    #[test]
+    fn create_route_ignores_empty_segments_and_decodes_names() {
+        for path in [
+            "/api/tunnel",
+            "/api//tunnel/",
+            "//api///tunnel//",
+            "/%61pi/%74unnel",
+        ] {
+            let segments = api_segments(path);
+            assert!(is_create_request(&Method::POST, &segments), "{path}");
+        }
+    }
+
+    #[test]
+    fn create_route_does_not_cover_other_methods_or_tunnel_operations() {
+        for method in [Method::GET, Method::HEAD, Method::PUT, Method::DELETE] {
+            assert!(!is_create_request(&method, &api_segments("/api/tunnel")));
+        }
+        for path in [
+            "/api/tunnel/id",
+            "/api/tunnel/id/certificate",
+            "/api/tunnel/id/connect",
+            "/api/tunnelled",
+            "/api",
+        ] {
+            assert!(
+                !is_create_request(&Method::POST, &api_segments(path)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_does_not_accept_other_schemes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("BeArEr secret"),
+        );
+        assert_eq!(bearer(&headers), "secret");
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic secret"),
+        );
+        assert_eq!(bearer(&headers), "");
+    }
 }

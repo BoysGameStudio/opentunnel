@@ -144,6 +144,8 @@ async fn run(cli: Cli) -> Result<()> {
             .transpose()?,
         storage: None,
         ca_cert,
+        // Environment only: owner credentials must not leak through process arguments or service arguments.
+        owner_token: std::env::var("OPENTUNNEL_OWNER_TOKEN").ok(),
     });
     let profile = cli.profile.as_str();
 

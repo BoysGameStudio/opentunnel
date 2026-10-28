@@ -43,6 +43,8 @@ pub struct ClientOptions {
     /// bridge, besides the bundled and OS roots. Defaults to
     /// `OPENTUNNEL_CA_CERT`.
     pub ca_cert: Option<PathBuf>,
+    /// Independent bearer credential sent only with the tunnel-creation API request.
+    pub owner_token: Option<String>,
 }
 
 /// Creates, stores, and connects tunnels. Each profile owns one tunnel.
@@ -67,7 +69,8 @@ impl Client {
             api: Api::with_trust(
                 api,
                 Trust::new(crate::tls::roots(options.ca_cert.as_deref())),
-            ),
+            )
+            .with_owner_token(options.owner_token),
             storage: options.storage.unwrap_or_default(),
         }
     }

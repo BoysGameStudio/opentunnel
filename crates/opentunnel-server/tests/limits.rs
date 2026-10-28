@@ -28,6 +28,7 @@ struct Answer {
 async fn create(server: &TestServer, client_ip: Option<&str>) -> Answer {
     let mut request = reqwest::Client::new()
         .post(format!("{}/api/tunnel", server.api))
+        .bearer_auth(common::OWNER_TOKEN)
         .json(&serde_json::json!({}));
     if let Some(ip) = client_ip {
         request = request.header("CF-Connecting-IP", ip);

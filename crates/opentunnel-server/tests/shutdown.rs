@@ -52,6 +52,7 @@ async fn keeps_serving_while_draining() {
     };
     let client = Client::new(ClientOptions {
         api: Some(server.api.parse().unwrap()),
+        owner_token: Some(common::OWNER_TOKEN.into()),
         storage: Some(Storage::at(dir.path().join("client"))),
         ..Default::default()
     });

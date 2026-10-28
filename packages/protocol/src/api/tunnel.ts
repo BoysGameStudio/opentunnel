@@ -30,7 +30,7 @@ export const TunnelGroup = HttpApiGroup.make("tunnel")
       payload: CreateTunnelRequest,
       success: CreateTunnelResponse,
       error: [InvalidRequestError, HostnameUnavailableError, ServiceUnavailableError],
-    }),
+    }).middleware(OpenTunnelAuthorization),
   )
   .add(
     HttpApiEndpoint.get("tunnel.get", "/api/tunnel/:id", {

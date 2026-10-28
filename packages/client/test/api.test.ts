@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { ApiRetry } from "@opentunnel/protocol/api-retry";
 import { create, OpenTunnelStorage, type OpenTunnelPromiseClient } from "../src/promise/index.js";
 import { testIdentity } from "./fake-relay.js";
+import ownerAuthVector from "../../../spec/vectors/owner-auth.json" with { type: "json" };
 
 /** Answers each request with the next status (an error page, `Retry-After: 0`), then with the identity's certificate. */
 const flakyApi = (statuses: number[], certificate: () => string) => {
   const seen: string[] = [];
+  const authorizations: Array<string | null> = [];
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
@@ -13,6 +15,7 @@ const flakyApi = (statuses: number[], certificate: () => string) => {
       const url = new URL(request.url);
       const status = statuses[seen.length];
       seen.push(`${request.method} ${url.pathname}`);
+      authorizations.push(request.headers.get("authorization"));
       if (status !== undefined) {
         return new Response(`<html>error code: ${status}</html>`, {
           status,
@@ -30,7 +33,7 @@ const flakyApi = (statuses: number[], certificate: () => string) => {
       });
     },
   });
-  return { url: `http://127.0.0.1:${server.port}`, seen, stop: () => server.stop(true) };
+  return { url: `http://127.0.0.1:${server.port}`, seen, authorizations, stop: () => server.stop(true) };
 };
 
 let identity: Awaited<ReturnType<typeof testIdentity>>;
@@ -40,7 +43,7 @@ let client: OpenTunnelPromiseClient | undefined;
 
 const start = (statuses: number[]) => {
   api = flakyApi(statuses, () => identity.certificate);
-  client = create({ api: api.url, store });
+  client = create({ api: api.url, store, ownerToken: "owner-secret" });
   return { api, client };
 };
 
@@ -82,6 +85,22 @@ describe("API requests", () => {
     await expect(client.tunnel.ensure()).rejects.toThrow(
       "Failed to read certificate: Cloudflare 525: the SSL handshake with the server failed (HTTP 525)",
     );
+  });
+
+  test("sends the owner credential only to creation, not tunnel bearer requests", async () => {
+    expect(
+      ownerAuthVector.requests.find((request) => request.path === "/api/tunnel")?.ownerAuthorization,
+    ).toBe(true);
+    expect(
+      ownerAuthVector.requests.filter((request) => request.path !== "/api/tunnel").every((request) => !request.ownerAuthorization),
+    ).toBe(true);
+    const { api, client } = start([]);
+    await client.tunnel.ensure();
+    expect(api.authorizations).toEqual([`Bearer ${identity.token}`]);
+
+    await store.remove("default");
+    await expect(client.tunnel.create()).rejects.toThrow("Failed to create tunnel");
+    expect(api.authorizations).toEqual([`Bearer ${identity.token}`, "Bearer owner-secret"]);
   });
 
   test("create a tunnel again only when the first attempt cannot have arrived", async () => {

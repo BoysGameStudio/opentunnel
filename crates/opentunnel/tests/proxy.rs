@@ -97,6 +97,7 @@ fn reaches(
             api: Some(base.parse().unwrap()),
             storage: Some(storage.clone()),
             ca_cert: Some(ca.to_owned()),
+            ..Default::default()
         });
         let api = tokio::time::timeout(Duration::from_secs(1), client.api().get(TOKEN, "demo"))
             .await
@@ -173,6 +174,7 @@ fn api_and_bridge_share_the_environment_proxy() {
             api: Some(base.parse().unwrap()),
             storage: Some(storage.clone()),
             ca_cert: Some(ca.clone()),
+            ..Default::default()
         });
         let routes = [("app".to_owned(), Route::new("127.0.0.1:9"))].into();
         let mut tunnel = client.connect("default", routes).unwrap();

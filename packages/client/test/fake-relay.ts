@@ -149,6 +149,8 @@ export interface FakeRelay {
   readonly sockets: { opened: number; closed: number };
   /** Requests to the certificate endpoint, as `METHOD`. */
   readonly certificateRequests: string[];
+  /** Authorization seen for each control-plane/bridge request; null means no header. */
+  readonly requestAuthorizations: Array<{ path: string; value: string | null }>;
   readonly stop: () => void;
 }
 
@@ -165,6 +167,7 @@ export function fakeRelay(identity: { certificate: string; chain: string }): Fak
     served: undefined,
     sockets: { opened: 0, closed: 0 },
     certificateRequests: [],
+    requestAuthorizations: [],
     next: () => {
       const session = sessions.shift();
       if (session) return Promise.resolve(session);
@@ -177,6 +180,7 @@ export function fakeRelay(identity: { certificate: string; chain: string }): Fak
     hostname: "127.0.0.1",
     fetch(request, server) {
       const url = new URL(request.url);
+      relay.requestAuthorizations.push({ path: url.pathname, value: request.headers.get("authorization") });
       if (url.pathname === "/api/tunnel/demo/certificate") {
         relay.certificateRequests.push(request.method);
         if (relay.hangCertificate) return new Promise<Response>(() => undefined);
