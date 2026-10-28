@@ -31,6 +31,12 @@ opentunnel serve                         # run in the foreground (containers, de
 opentunnel delete --yes                  # delete the tunnel for good, losing its hostname
 ```
 
+If the server requires owner-only creation, set `OPENTUNNEL_OWNER_TOKEN` in the
+environment before `up` or `route add`. There is deliberately no token CLI
+argument, which could expose it in the process list. The token is sent only to
+the creation API request, not to visitor URLs or the bridge. Existing profiles
+continue to use their own tunnel token.
+
 Every command takes `--profile <name>` (or `OPENTUNNEL_PROFILE`) and defaults to
 the `default` profile. A profile is one tunnel, so one URL per device is the
 norm; apps using `@opentunnel/client` add their own routes to the same tunnel.

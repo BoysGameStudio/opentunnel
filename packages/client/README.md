@@ -24,6 +24,10 @@ console.log(connection.urls.api) // https://api.<hostname>
 for await (const event of connection.events) console.log(event)
 ```
 
+For an owner-protected server, pass `ownerToken` to `create`. It is used only
+for the creation control-plane request: generated visitor URLs, bridge
+WebSockets, and tunnel-token API calls never include it.
+
 `connect` creates the profile's tunnel if it has none, resolves once the bridge
 first attaches, and reconnects with backoff until you call `close()`. It
 rejects on fatal errors such as an invalid token, with an
@@ -114,6 +118,7 @@ See `docs/trust-boundary.md` in the repository for what a target can trust.
 function create(options?: {
   api?: string | URL // defaults to https://opentunnel.xyz
   store?: Storage
+  ownerToken?: string // independent credential sent only to POST /api/tunnel
   proxy?: string // see "HTTP proxies"
 }): Client
 

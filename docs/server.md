@@ -190,7 +190,8 @@ Nothing assumes a single writer, so two servers on one database stay correct:
   clients keep polling. Within an attempt, nonce requests and POST-as-GET reads
   are repeated a few times, valid authorizations and already finalized orders
   of a reused order are skipped, and a challenge record that already exists in
-  Cloudflare is used and deleted like a created one.
+  Cloudflare is used and deleted like a created one. DNSPod never adopts an
+  existing identical record, because another process may still own it.
 - The CA hands a pending authorization to every new order for its identifier.
   ZeroSSL's validation sometimes never finishes (the challenge stays
   `processing`), and such an authorization came back to every attempt for a
@@ -296,14 +297,17 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `ISSUER` | `acme` | `local` is an insecure built-in CA for development and tests |
 | `LOCAL_CA_FILE` | | with `ISSUER=local`, write the CA certificate here for clients to trust |
 | `ACME_URL` | ZeroSSL DV90 | |
-| `ACME_EMAIL` | `acme@opentunnel.xyz` | |
+| `ACME_EMAIL` | empty (required for ACME registration) | no upstream example address is used as production configuration |
 | `ACME_EAB_KID`, `ACME_EAB_HMAC_KEY` | | secrets: ZeroSSL external account binding |
 | `ACME_ACCOUNT_KEY_JWK` | | secret: the account's P-256 private JWK (`opentunnel-server account-key` makes one) |
 | `ACME_CA_BUNDLE` | | extra roots for the ACME server (Pebble) |
 | `ACME_DNS_PROPAGATION_TIMEOUT_MS` | `10000` | wait for public resolvers to see the TXT records; 0 skips |
-| `DNS_PROVIDER` | `cloudflare` | or `challtestsrv` (Pebble's test DNS) |
-| `CLOUDFLARE_ZONE_ID` | the opentunnel.xyz zone | |
+| `DNS_PROVIDER` | `cloudflare` | `dnspod` (Tencent Cloud DNSPod) or `challtestsrv` (Pebble's test DNS) |
+| `CLOUDFLARE_ZONE_ID` | empty | required with `cloudflare`; no upstream zone ID is assumed |
 | `CLOUDFLARE_API_TOKEN` | | secret: DNS edit on the zone, only for DNS-01 |
+| `DNSPOD_DOMAIN` | | registered zone, required with `dnspod`; scopes all record operations |
+| `DNSPOD_SECRET_ID`, `DNSPOD_SECRET_KEY` | | secrets: scoped Tencent Cloud API credentials, required with `dnspod`; TC3-HMAC-SHA256 using `dnspod.tencentcloudapi.com`, service `dnspod`, version `2021-03-23` |
+| `DNSPOD_API_URL` | `https://dnspod.tencentcloudapi.com` | API origin override for loopback mock tests; never the international dnspod.com API |
 | `ISSUANCE_CONCURRENCY` | `4` | ACME orders at once per machine; one of them is kept for renewals |
 | `CREATE_RATE_PER_HOUR` / `CREATE_RATE_BURST` | `30` / `10` | tunnels one client address (IPv6: its /64) may create, cluster-wide: this many an hour on average, the burst at once; `0` disables ([Limits](#limits)) |
 | `ISSUANCE_RATE_PER_DAY` / `ISSUANCE_RATE_BURST` | `5` / `5` | new certificates (a bind with a new CSR) one tunnel may request a day on average, and at once; `0` disables |
@@ -311,6 +315,7 @@ Every flag also reads an environment variable (`opentunnel-server --help`).
 | `TRUSTED_PROXY_RANGES` | Cloudflare's ranges | CIDRs (comma-separated) whose `CF-Connecting-IP` names the client; `off` trusts none |
 | `ANALYTICS_URL`, `ANALYTICS_TOKEN` | | the platform event stream's HTTP endpoint and bearer token; analytics are off without the URL |
 | `ADMIN_TOKEN` | | secret: enables `POST /api/admin/{import,export,stats}` |
+| `OWNER_TOKEN` | empty | independent secret required only by `POST /api/tunnel`; missing/empty configuration fails closed and denies creation. Rust CLI reads `OPENTUNNEL_OWNER_TOKEN` from the environment, never process arguments |
 | `INTERNAL_LISTEN` | `off` | the internal listener for other machines: mesh links, forwarded visitors, route checks (`[::]:9000` on Fly, bound to `FLY_PRIVATE_IP`); `off` runs a single machine without the mesh |
 | `INTERNAL_TOKEN` | | secret shared by all machines, required with `INTERNAL_LISTEN`; never sent, only proven ([Multiple regions](#multiple-regions)) |
 | `INTERNAL_ADDRESS` | `[FLY_PRIVATE_IP]:<port>` | where other machines reach this one |
@@ -417,8 +422,20 @@ against the same budget.
   abandons), and new certificates per tunnel and the backlog are limited as
   above, so records in the zone are bounded by the attempts running.
 - **Challenge record cleanup**: an attempt deletes its records when it ends
-  (deletes that Cloudflare rate limits or fails with 5xx are retried; one
-  already gone counts as deleted), unless an authorization it answered could
+  (deletes that the DNS provider rate limits or fails with 5xx are retried; one
+  already gone counts as deleted). DNSPod cleanup first lists the scoped
+  challenge name, then deletes only the ID returned by that attempt's own
+  CreateRecord whose current value still matches. Same-name TXT records,
+  including identical values with distinct IDs, are never shared or adopted;
+  if DNSPod rejects a completely identical create as a duplicate, that attempt
+  fails without touching the existing record. Because DNSPod's record index can
+  lag creation by about 30 seconds, cleanup polls it for a bounded 30 seconds;
+  a visible ID with a changed value is never deleted. Create has no idempotency
+  key and is not blindly retried, while deterministic authentication,
+  permission and domain errors fail immediately. Its interrupted-attempt sweeper is disabled because the API
+  has no conditional delete and the sweeper cannot prove provider ownership.
+  A crashed attempt leaves its record rather than re-adopting a shared ID on a
+  later attempt. An attempt deletes its records when it ends unless an authorization it answered could
   not be deactivated, when the CA might still check them. At shutdown every
   attempt in progress is ended and cleans up first (the job is resumed
   elsewhere): until October 2026 a machine stopped by a deploy (or a failed
@@ -957,6 +974,7 @@ docker rm -f ot-mysql    # when done; it holds the test databases
   ISSUER=acme ACME_URL=https://localhost:14000/dir ACME_CA_BUNDLE=pebble.minica.pem \
     ACME_EAB_KID=kid-1 ACME_EAB_HMAC_KEY=zWNDZM6eQGHWpSRTPal5eIUYFTu7EajVIoguysqZ9wG44nMEtx3MUAsUDkMTQ12W \
     ACME_ACCOUNT_KEY_JWK="$(opentunnel-server account-key)" DNS_PROVIDER=challtestsrv \
+    OWNER_TOKEN=development-owner-token OPENTUNNEL_OWNER_TOKEN=development-owner-token \
     ACME_DNS_PROPAGATION_TIMEOUT_MS=0 ACME_POLL_INTERVAL_MS=500 opentunnel-server
   ```
 

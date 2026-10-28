@@ -68,7 +68,8 @@ The hosted service is one Rust binary, `crates/opentunnel-server`, on Fly.io
 - Tunnel records, certificate state, and durable issuance jobs live in MySQL
   (PlanetScale).
 - Certificates come from ZeroSSL over ACME with DNS-01 challenges in the
-  Cloudflare-hosted zone, and renew 30 days before expiry.
+  configured authoritative DNS provider (Cloudflare or Tencent Cloud DNSPod),
+  and renew 30 days before expiry.
 - The local client owns the certificate private key, terminates TLS, and
   forwards decrypted traffic to the local application unchanged. The
   application sees a loopback peer and the visitor's own headers, so it must
@@ -118,6 +119,7 @@ mkdir -p .local
 DATABASE_URL=mysql://root:opentunnel@127.0.0.1:3306/opentunnel \
   ISSUER=local LOCAL_CA_FILE=.local/local-ca.pem OPENTUNNEL_DOMAIN=localhost \
   WEBSITE_DIR=dist/website TLS_LISTEN='[::]:8443' HTTP_LISTEN='[::]:8080' HTTP_MODE=serve \
+  OWNER_TOKEN=development-owner-token \
   cargo run -p opentunnel-server
 ```
 
@@ -131,6 +133,7 @@ a local HTTP application on port 4096:
 
 ```bash
 export OPENTUNNEL_API=http://localhost:8080
+export OPENTUNNEL_OWNER_TOKEN=development-owner-token
 bun run opentunnel route add 4096
 ```
 
