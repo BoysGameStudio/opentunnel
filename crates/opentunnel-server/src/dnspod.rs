@@ -364,7 +364,7 @@ impl DnsPod {
             }
             // The ID may be missing because creation is not indexed yet, or because it is already gone.
             if !index_wait(deadline, self.index_poll).await {
-                return Ok(false);
+                bail!("DNSPod record ownership unresolved after indexing timeout");
             }
         }
     }
@@ -374,30 +374,34 @@ impl DnsPod {
         let Some(id) = record.id.as_deref().and_then(|id| id.parse::<u64>().ok()) else {
             return Ok(());
         };
-        if !self.owns(record, id).await? {
-            return Ok(());
-        }
         let mut pause = self.retry_pause;
         let mut last = None;
         for attempt in 1..=DELETE_TRIES {
-            match self
-                .call(
+            // Retain this attempt's exact record across retries. A missing index entry is
+            // inconclusive, and every retry must recheck ownership before deleting.
+            let deletion = async {
+                if !self.owns(record, id).await? {
+                    return Ok(());
+                }
+                self.call(
                     "DeleteRecord",
                     json!({ "Domain": self.domain, "RecordId": id }),
                 )
                 .await
-            {
-                Ok(_) => return Ok(()),
-                Err(error) if error.code == "InvalidParameter.RecordIdInvalid" => {
-                    if !self.owns(record, id).await? {
-                        return Ok(());
-                    }
-                    last = Some(error);
-                }
+                .map(drop)
+                .map_err(anyhow::Error::from)
+            }
+            .await;
+            match deletion {
+                Ok(()) => return Ok(()),
                 Err(error) => {
-                    let retryable = error.retryable;
-                    if let Some(wait) = error.retry_after {
-                        pause = pause.max(wait);
+                    let mut retryable = true;
+                    if let Some(failure) = error.downcast_ref::<Failure>() {
+                        retryable =
+                            failure.retryable || failure.code == "InvalidParameter.RecordIdInvalid";
+                        if let Some(wait) = failure.retry_after {
+                            pause = pause.max(wait);
+                        }
                     }
                     last = Some(error);
                     if !retryable {
@@ -410,14 +414,7 @@ impl DnsPod {
                 pause *= 2;
             }
         }
-        Err(last
-            .unwrap_or_else(|| Failure {
-                message: "DNSPod DeleteRecord failed".into(),
-                code: String::new(),
-                retryable: false,
-                retry_after: None,
-            })
-            .into())
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("DNSPod DeleteRecord failed")))
     }
 }
 
@@ -645,6 +642,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_retries_after_index_timeout() {
+        let (mut provider, seen) = mock(vec![
+            response(r#"{"Response":{"RecordList":[]}}"#),
+            response(r#"{"Response":{"RecordList":[{"RecordId":1,"Name":"_acme-challenge.demo","Value":"wanted","Type":"TXT","Line":"默认"},{"RecordId":2,"Name":"_acme-challenge.demo","Value":"other","Type":"TXT","Line":"默认"}]}}"#),
+            response(r#"{"Response":{}}"#),
+        ]).await;
+        provider.index_timeout = Duration::ZERO;
+        provider
+            .delete_txt(&crate::dns::TxtRecord {
+                name: "_acme-challenge.demo.example.test".into(),
+                value: "wanted".into(),
+                id: Some("1".into()),
+            })
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].action, "DescribeRecordList");
+        assert_eq!(seen[1].action, "DescribeRecordList");
+        assert_eq!(seen[2].action, "DeleteRecord");
+        assert_eq!(seen[2].body["RecordId"], 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_lookup_failure_is_reported() {
+        let (provider, seen) = mock(
+            (0..DELETE_TRIES)
+                .map(|_| response(r#"{"Response":{"Error":{"Code":"InternalError"}}}"#))
+                .collect(),
+        )
+        .await;
+        assert!(
+            provider
+                .delete_txt(&crate::dns::TxtRecord {
+                    name: "_acme-challenge.demo.example.test".into(),
+                    value: "wanted".into(),
+                    id: Some("1".into()),
+                })
+                .await
+                .is_err()
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), DELETE_TRIES as usize);
+        assert!(
+            seen.iter()
+                .all(|request| request.action == "DescribeRecordList")
+        );
+    }
+
+    #[tokio::test]
     async fn missing_record_index_wait_is_bounded() {
         let (mut provider, seen) = mock(
             (0..20)
@@ -656,7 +703,7 @@ mod tests {
                 .collect(),
         )
         .await;
-        provider.index_timeout = Duration::from_millis(10);
+        provider.index_timeout = Duration::ZERO;
         provider.index_poll = Duration::from_millis(2);
         provider
             .delete_txt(&crate::dns::TxtRecord {
@@ -665,9 +712,9 @@ mod tests {
                 id: Some("1".into()),
             })
             .await
-            .unwrap();
+            .unwrap_err();
         let calls = seen.lock().unwrap().len();
-        assert!((1..=20).contains(&calls));
+        assert_eq!(calls, DELETE_TRIES as usize);
     }
 
     #[tokio::test]
@@ -756,6 +803,7 @@ mod tests {
         let (provider, seen) = mock(vec![
             response(r#"{"Response":{"RecordList":[{"RecordId":1,"Name":"_acme-challenge.demo","Value":"value-a","Type":"TXT","Line":"默认"}],"RequestId":"r1"}}"#),
             (429, r#"{"Response":{"Error":{"Code":"RequestLimitExceeded"},"RequestId":"r2"}}"#.into()),
+            response(r#"{"Response":{"RecordList":[{"RecordId":1,"Name":"_acme-challenge.demo","Value":"value-a","Type":"TXT","Line":"默认"}],"RequestId":"recheck"}}"#),
             response(r#"{"Response":{"RequestId":"r3"}}"#),
         ])
         .await;
@@ -767,7 +815,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(seen.lock().unwrap().len(), 4);
     }
 
     #[tokio::test]

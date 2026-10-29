@@ -429,7 +429,9 @@ against the same budget.
   including identical values with distinct IDs, are never shared or adopted;
   if DNSPod rejects a completely identical create as a duplicate, that attempt
   fails without touching the existing record. Because DNSPod's record index can
-  lag creation by about 30 seconds, cleanup polls it for a bounded 30 seconds;
+  lag creation by about 30 seconds, cleanup polls it for 30 seconds per attempt, with at most four attempts.
+  An unresolved index lookup is retried with the original record ID and reported
+  as a cleanup failure if retries are exhausted;
   a visible ID with a changed value is never deleted. Create has no idempotency
   key and is not blindly retried, while deterministic authentication,
   permission and domain errors fail immediately. Its interrupted-attempt sweeper is disabled because the API
